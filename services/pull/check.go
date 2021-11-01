@@ -8,7 +8,6 @@ package pull
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -28,21 +27,19 @@ var prQueue queue.UniqueQueue
 
 // AddToTaskQueue adds itself to pull request test task queue.
 func AddToTaskQueue(pr *models.PullRequest) {
-	go func() {
-		err := prQueue.PushFunc(strconv.FormatInt(pr.ID, 10), func() error {
-			pr.Status = models.PullRequestStatusChecking
-			err := pr.UpdateColsIfNotMerged("status")
-			if err != nil {
-				log.Error("AddToTaskQueue.UpdateCols[%d].(add to queue): %v", pr.ID, err)
-			} else {
-				log.Trace("Adding PR ID: %d to the test pull requests queue", pr.ID)
-			}
-			return err
-		})
-		if err != nil && err != queue.ErrAlreadyInQueue {
-			log.Error("Error adding prID %d to the test pull requests queue: %v", pr.ID, err)
+	err := prQueue.PushFunc(strconv.FormatInt(pr.ID, 10), func() error {
+		pr.Status = models.PullRequestStatusChecking
+		err := pr.UpdateColsIfNotMerged("status")
+		if err != nil {
+			log.Error("AddToTaskQueue.UpdateCols[%d].(add to queue): %v", pr.ID, err)
+		} else {
+			log.Trace("Adding PR ID: %d to the test pull requests queue", pr.ID)
 		}
-	}()
+		return err
+	})
+	if err != nil && err != queue.ErrAlreadyInQueue {
+		log.Error("Error adding prID %d to the test pull requests queue: %v", pr.ID, err)
+	}
 }
 
 // checkAndUpdateStatus checks if pull request is possible to leaving checking status,
@@ -77,7 +74,7 @@ func getMergeCommit(pr *models.PullRequest) (*git.Commit, error) {
 		}
 	}
 
-	indexTmpPath, err := ioutil.TempDir(os.TempDir(), "gitea-"+pr.BaseRepo.Name)
+	indexTmpPath, err := os.MkdirTemp(os.TempDir(), "gitea-"+pr.BaseRepo.Name)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create temp dir for repository %s: %v", pr.BaseRepo.RepoPath(), err)
 	}
@@ -100,7 +97,7 @@ func getMergeCommit(pr *models.PullRequest) (*git.Commit, error) {
 		return nil, fmt.Errorf("git merge-base --is-ancestor: %v", err)
 	}
 
-	commitIDBytes, err := ioutil.ReadFile(pr.BaseRepo.RepoPath() + "/" + headFile)
+	commitIDBytes, err := os.ReadFile(pr.BaseRepo.RepoPath() + "/" + headFile)
 	if err != nil {
 		return nil, fmt.Errorf("ReadFile(%s): %v", headFile, err)
 	}
@@ -128,7 +125,7 @@ func getMergeCommit(pr *models.PullRequest) (*git.Commit, error) {
 
 	commit, err := gitRepo.GetCommit(mergeCommit[:40])
 	if err != nil {
-		return nil, fmt.Errorf("GetCommit: %v", err)
+		return nil, fmt.Errorf("GetMergeCommit[%v]: %v", mergeCommit[:40], err)
 	}
 
 	return commit, nil
@@ -256,7 +253,7 @@ func CheckPrsForBaseBranch(baseRepo *models.Repository, baseBranchName string) e
 
 // Init runs the task queue to test all the checking status pull requests
 func Init() error {
-	prQueue = queue.CreateUniqueQueue("pr_patch_checker", handle, "").(queue.UniqueQueue)
+	prQueue = queue.CreateUniqueQueue("pr_patch_checker", handle, "")
 
 	if prQueue == nil {
 		return fmt.Errorf("Unable to create pr_patch_checker Queue")

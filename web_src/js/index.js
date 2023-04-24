@@ -4,6 +4,7 @@ import './bootstrap.js';
 import $ from 'jquery';
 import {initVueEnv} from './components/VueComponentLoader.js';
 import {initRepoActivityTopAuthorsChart} from './components/RepoActivityTopAuthors.vue';
+import {initRepoWikiActivityTopAuthorsChart} from './components/RepoWikiActivityTopAuthors.vue';
 import {initDashboardRepoList} from './components/DashboardRepoList.js';
 
 import {attachTribute} from './features/tribute.js';
@@ -153,6 +154,7 @@ $(document).ready(() => {
   initOrgTeamSettings();
 
   initRepoActivityTopAuthorsChart();
+  initRepoWikiActivityTopAuthorsChart();
   initRepoArchiveLinks();
   initRepoBranchButton();
   initRepoCodeView();

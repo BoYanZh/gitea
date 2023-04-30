@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/db"
+	"code.gitea.io/gitea/models/organization"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/auth/password"
 	"code.gitea.io/gitea/modules/base"
@@ -781,4 +783,49 @@ func updateSession(ctx *context.Context, deletes []string, updates map[string]in
 		return fmt.Errorf("store session[%s]: %w", sessID, err)
 	}
 	return nil
+}
+
+func Pretend(ctx *context.Context) {
+	m, _ := url.ParseQuery(ctx.Req.URL.RawQuery)
+	log.Info("org_id: %+v", m["org_id"])
+	org, err := organization.GetOrgByID(ctx, ctx.FormInt64("org_id"))
+	if err != nil {
+		ctx.ServerError("GetOrgByID", err)
+		return
+	}
+
+	u, err := user_model.GetUserByID(ctx, ctx.ParamsInt64((":userid")))
+	if err != nil {
+		ctx.ServerError("GetUserByID", err)
+		return
+	}
+
+	companyTeam, err := org.GetCompanyTeam(u)
+	if err != nil {
+		ctx.ServerError("GetCompanyTeam", err)
+		return
+	}
+
+	memberExists := false
+	selfExists := false
+	for _, member := range companyTeam.Members {
+		if member.ID == u.ID {
+			memberExists = true
+		}
+		if member.ID == ctx.Doer.ID {
+			selfExists = true
+		}
+		if memberExists && selfExists {
+			break
+		}
+	}
+
+	if !memberExists {
+		ctx.NotFound("Pretend", err)
+		return
+	}
+
+	handleSignInFull(ctx, u, true, false)
+	middleware.DeleteRedirectToCookie(ctx.Resp)
+	ctx.RedirectToFirst(ctx.FormString("redirect_to"), u.HomeLink())
 }

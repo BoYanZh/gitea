@@ -149,28 +149,30 @@
 				</span>
 			</a>
 
-			<div class="ui dropdown jump item tooltip gt-mx-0" data-content="{{.locale.Tr "create_new"}}">
-				<span class="text">
-					<span class="fitted">{{svg "octicon-plus"}}</span>
-					<span class="sr-mobile-only">{{.locale.Tr "create_new"}}</span>
-					<span class="fitted not-mobile">{{svg "octicon-triangle-down"}}</span>
-				</span>
-				<div class="menu">
-					<a class="item" href="{{AppSubUrl}}/repo/create">
-						<span class="fitted">{{svg "octicon-plus"}}</span> {{.locale.Tr "new_repo"}}
-					</a>
-					{{if not .DisableMigrations}}
-						<a class="item" href="{{AppSubUrl}}/repo/migrate">
-							<span class="fitted">{{svg "octicon-repo-push"}}</span> {{.locale.Tr "new_migrate"}}
+			{{if or .IsAdmin .SignedUser.CanCreateOrganization}}
+				<div class="ui dropdown jump item tooltip gt-mx-0" data-content="{{.locale.Tr "create_new"}}">
+					<span class="text">
+						<span class="fitted">{{svg "octicon-plus"}}</span>
+						<span class="sr-mobile-only">{{.locale.Tr "create_new"}}</span>
+						<span class="fitted not-mobile">{{svg "octicon-triangle-down"}}</span>
+					</span>
+					<div class="menu">
+						<a class="item" href="{{AppSubUrl}}/repo/create">
+							<span class="fitted">{{svg "octicon-plus"}}</span> {{.locale.Tr "new_repo"}}
 						</a>
-					{{end}}
-					{{if .SignedUser.CanCreateOrganization}}
-					<a class="item" href="{{AppSubUrl}}/org/create">
-						<span class="fitted">{{svg "octicon-organization"}}</span> {{.locale.Tr "new_org"}}
-					</a>
-					{{end}}
-				</div><!-- end content create new menu -->
-			</div><!-- end dropdown menu create new -->
+						{{if not .DisableMigrations}}
+							<a class="item" href="{{AppSubUrl}}/repo/migrate">
+								<span class="fitted">{{svg "octicon-repo-push"}}</span> {{.locale.Tr "new_migrate"}}
+							</a>
+						{{end}}
+						{{if .SignedUser.CanCreateOrganization}}
+						<a class="item" href="{{AppSubUrl}}/org/create">
+							<span class="fitted">{{svg "octicon-organization"}}</span> {{.locale.Tr "new_org"}}
+						</a>
+						{{end}}
+					</div><!-- end content create new menu -->
+				</div><!-- end dropdown menu create new -->
+			{{end}}
 
 			<div class="ui dropdown jump item tooltip gt-mx-0" data-content="{{.locale.Tr "user_profile_and_more"}}">
 				<span class="text">

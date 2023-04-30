@@ -182,6 +182,11 @@ func CreateRepository(doer, u *user_model.User, opts CreateRepoOptions) (*repo_m
 			Limit: u.MaxRepoCreation,
 		}
 	}
+	if !doer.IsAdmin && !u.IsOrganization() {
+		return nil, repo_model.ErrReachLimitOfRepo{
+			Limit: 0,
+		}
+	}
 
 	if len(opts.DefaultBranch) == 0 {
 		opts.DefaultBranch = setting.Repository.DefaultBranch

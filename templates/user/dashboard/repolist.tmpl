@@ -34,10 +34,12 @@
 					{{.locale.Tr "home.my_repos"}}
 					<span class="ui grey label gt-ml-3">${reposTotalCount}</span>
 				</div>
-				<a class="tooltip" :href="subUrl + '/repo/create'" data-content="{{.locale.Tr "new_repo"}}" data-position="left center">
-					{{svg "octicon-plus"}}
-					<span class="sr-only">{{.locale.Tr "new_repo"}}</span>
-				</a>
+				{{if .IsAdmin}}
+					<a class="tooltip" :href="subUrl + '/repo/create'" data-content="{{.locale.Tr "new_repo"}}" data-position="left center">
+						{{svg "octicon-plus"}}
+						<span class="sr-only">{{.locale.Tr "new_repo"}}</span>
+					</a>
+				{{end}}
 			</h4>
 			<div class="ui attached segment repos-search">
 				<div class="ui fluid right action left icon input" :class="{loading: isLoading}">

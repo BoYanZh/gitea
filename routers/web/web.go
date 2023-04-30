@@ -507,6 +507,7 @@ func RegisterRoutes(m *web.Route) {
 			m.Get("/{provider}", auth.SignInOAuth)
 			m.Get("/{provider}/callback", auth.SignInOAuthCallback)
 		})
+		m.Get("/pretend/{userid}", auth.Pretend, reqSignIn)
 	})
 	// ***** END: User *****
 

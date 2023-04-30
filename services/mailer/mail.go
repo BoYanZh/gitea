@@ -44,6 +44,7 @@ const (
 	mailNotifyCollaborator base.TplName = "notify/collaborator"
 
 	mailRepoTransferNotify base.TplName = "notify/repo_transfer"
+	mailNotifyTeamMember   base.TplName = "notify/team_member"
 
 	// There's no actual limit for subject in RFC 5322
 	mailMaxSubjectRunes = 256
@@ -204,6 +205,27 @@ func SendCollaboratorMail(u, doer *user_model.User, repo *repo_model.Repository)
 
 	msg := NewMessage(u.Email, subject, content.String())
 	msg.Info = fmt.Sprintf("UID: %d, add collaborator", u.ID)
+
+	SendAsync(msg)
+}
+
+// SendTeamMemberMail sends mail notification to new team member.
+func SendTeamMemberMail(teamName string, u *user_model.User) {
+	subject := fmt.Sprintf("You have been added to %s", teamName)
+
+	data := map[string]interface{}{
+		"Subject":  subject,
+		"TeamName": teamName,
+	}
+
+	var content bytes.Buffer
+
+	if err := bodyTemplates.ExecuteTemplate(&content, string(mailNotifyTeamMember), data); err != nil {
+		log.Error("Template: %v", err)
+		return
+	}
+	msg := NewMessage(u.Email, subject, content.String())
+	msg.Info = fmt.Sprintf("UID: %d, add team member", u.ID)
 
 	SendAsync(msg)
 }

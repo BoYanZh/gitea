@@ -10,6 +10,7 @@ var (
 	ShowFooterTemplateLoadTime bool
 	EnableFeed                 bool
 	EnableSitemap              bool
+	CompanyTeamName            string
 )
 
 func loadOtherFrom(rootCfg ConfigProvider) {
@@ -19,4 +20,5 @@ func loadOtherFrom(rootCfg ConfigProvider) {
 	ShowFooterTemplateLoadTime = sec.Key("SHOW_FOOTER_TEMPLATE_LOAD_TIME").MustBool(true)
 	EnableSitemap = sec.Key("ENABLE_SITEMAP").MustBool(true)
 	EnableFeed = sec.Key("ENABLE_FEED").MustBool(true)
+	CompanyTeamName = sec.Key("COMPANY_TEAM_NAME").MustString("CompanyStaff")
 }

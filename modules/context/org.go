@@ -118,6 +118,7 @@ func HandleOrgAssignment(ctx *Context, args ...bool) {
 
 	ctx.ContextUser = org.AsUser()
 	ctx.Data["Org"] = org
+	ctx.Data["CompanyTeam"], _ = org.GetCompanyTeam(ctx.Doer)
 
 	// Admin has super access.
 	if ctx.IsSigned && ctx.Doer.IsAdmin {

@@ -44,18 +44,18 @@ func UpdateUserSettings(ctx *context.APIContext) {
 
 	form := web.GetForm(ctx).(*api.UserSettingsOptions)
 
-	if form.FullName != nil {
-		ctx.Doer.FullName = *form.FullName
-	}
+	// if form.FullName != nil {
+	// 	ctx.Doer.FullName = *form.FullName
+	// }
 	if form.Description != nil {
 		ctx.Doer.Description = *form.Description
 	}
 	if form.Website != nil {
 		ctx.Doer.Website = *form.Website
 	}
-	if form.Location != nil {
-		ctx.Doer.Location = *form.Location
-	}
+	// if form.Location != nil {
+	// 	ctx.Doer.Location = *form.Location
+	// }
 	if form.Language != nil {
 		ctx.Doer.Language = *form.Language
 	}
@@ -66,9 +66,9 @@ func UpdateUserSettings(ctx *context.APIContext) {
 		ctx.Doer.DiffViewStyle = *form.DiffViewStyle
 	}
 
-	if form.HideEmail != nil {
-		ctx.Doer.KeepEmailPrivate = *form.HideEmail
-	}
+	// if form.HideEmail != nil {
+	// 	ctx.Doer.KeepEmailPrivate = *form.HideEmail
+	// }
 	if form.HideActivity != nil {
 		ctx.Doer.KeepActivityPrivate = *form.HideActivity
 	}

@@ -120,10 +120,10 @@ func ProfilePost(ctx *context.Context) {
 		ctx.Doer.LowerName = strings.ToLower(form.Name)
 	}
 
-	ctx.Doer.FullName = form.FullName
-	ctx.Doer.KeepEmailPrivate = form.KeepEmailPrivate
+	// ctx.Doer.FullName = form.FullName
+	// ctx.Doer.KeepEmailPrivate = form.KeepEmailPrivate
 	ctx.Doer.Website = form.Website
-	ctx.Doer.Location = form.Location
+	// ctx.Doer.Location = form.Location
 	ctx.Doer.Description = form.Description
 	ctx.Doer.KeepActivityPrivate = form.KeepActivityPrivate
 	ctx.Doer.Visibility = form.Visibility

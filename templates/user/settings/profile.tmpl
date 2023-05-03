@@ -22,7 +22,7 @@
 				</div>
 				<div class="field {{if .Err_FullName}}error{{end}}">
 					<label for="full_name">{{.locale.Tr "settings.full_name"}}</label>
-					<input id="full_name" name="full_name" value="{{.SignedUser.FullName}}">
+					<input id="full_name" name="full_name" value="{{.SignedUser.FullName}}" disabled>
 				</div>
 				<div class="field {{if .Err_Email}}error{{end}}">
 					<label for="email">{{.locale.Tr "email"}}</label>
@@ -31,7 +31,7 @@
 				<div class="inline field">
 					<div class="ui checkbox" id="keep-email-private">
 						<label class="tooltip" data-content="{{.locale.Tr "settings.keep_email_private_popup"}}"><strong>{{.locale.Tr "settings.keep_email_private"}}</strong></label>
-						<input name="keep_email_private" type="checkbox" {{if .SignedUser.KeepEmailPrivate}}checked{{end}}>
+						<input name="keep_email_private" type="checkbox" {{if .SignedUser.KeepEmailPrivate}}checked{{end}} disabled>
 					</div>
 				</div>
 				<div class="field {{if .Err_Description}}error{{end}}">
@@ -44,7 +44,7 @@
 				</div>
 				<div class="field">
 					<label for="location">{{.locale.Tr "settings.location"}}</label>
-					<input id="location" name="location"  value="{{.SignedUser.Location}}">
+					<input id="location" name="location"  value="{{.SignedUser.Location}}" disabled>
 				</div>
 
 				<div class="ui divider"></div>

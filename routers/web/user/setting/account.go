@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"code.gitea.io/gitea/models"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/auth/password"
 	"code.gitea.io/gitea/modules/base"
@@ -18,10 +17,8 @@ import (
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/auth"
 	"code.gitea.io/gitea/services/forms"
 	"code.gitea.io/gitea/services/mailer"
-	"code.gitea.io/gitea/services/user"
 )
 
 const (
@@ -237,35 +234,39 @@ func DeleteAccount(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("settings")
 	ctx.Data["PageIsSettingsAccount"] = true
 
-	if _, _, err := auth.UserSignIn(ctx.Doer.Name, ctx.FormString("password")); err != nil {
-		if user_model.IsErrUserNotExist(err) {
-			loadAccountData(ctx)
+	// prevents users from deleting the account
+	ctx.Flash.Error(ctx.Tr("form.unknown_error"))
+	ctx.Redirect(setting.AppSubURL + "/user/settings/account")
 
-			ctx.RenderWithErr(ctx.Tr("form.enterred_invalid_password"), tplSettingsAccount, nil)
-		} else {
-			ctx.ServerError("UserSignIn", err)
-		}
-		return
-	}
+	// if _, _, err := auth.UserSignIn(ctx.Doer.Name, ctx.FormString("password")); err != nil {
+	// 	if user_model.IsErrUserNotExist(err) {
+	// 		loadAccountData(ctx)
 
-	if err := user.DeleteUser(ctx, ctx.Doer, false); err != nil {
-		switch {
-		case models.IsErrUserOwnRepos(err):
-			ctx.Flash.Error(ctx.Tr("form.still_own_repo"))
-			ctx.Redirect(setting.AppSubURL + "/user/settings/account")
-		case models.IsErrUserHasOrgs(err):
-			ctx.Flash.Error(ctx.Tr("form.still_has_org"))
-			ctx.Redirect(setting.AppSubURL + "/user/settings/account")
-		case models.IsErrUserOwnPackages(err):
-			ctx.Flash.Error(ctx.Tr("form.still_own_packages"))
-			ctx.Redirect(setting.AppSubURL + "/user/settings/account")
-		default:
-			ctx.ServerError("DeleteUser", err)
-		}
-	} else {
-		log.Trace("Account deleted: %s", ctx.Doer.Name)
-		ctx.Redirect(setting.AppSubURL + "/")
-	}
+	// 		ctx.RenderWithErr(ctx.Tr("form.enterred_invalid_password"), tplSettingsAccount, nil)
+	// 	} else {
+	// 		ctx.ServerError("UserSignIn", err)
+	// 	}
+	// 	return
+	// }
+
+	// if err := user.DeleteUser(ctx, ctx.Doer, false); err != nil {
+	// 	switch {
+	// 	case models.IsErrUserOwnRepos(err):
+	// 		ctx.Flash.Error(ctx.Tr("form.still_own_repo"))
+	// 		ctx.Redirect(setting.AppSubURL + "/user/settings/account")
+	// 	case models.IsErrUserHasOrgs(err):
+	// 		ctx.Flash.Error(ctx.Tr("form.still_has_org"))
+	// 		ctx.Redirect(setting.AppSubURL + "/user/settings/account")
+	// 	case models.IsErrUserOwnPackages(err):
+	// 		ctx.Flash.Error(ctx.Tr("form.still_own_packages"))
+	// 		ctx.Redirect(setting.AppSubURL + "/user/settings/account")
+	// 	default:
+	// 		ctx.ServerError("DeleteUser", err)
+	// 	}
+	// } else {
+	// 	log.Trace("Account deleted: %s", ctx.Doer.Name)
+	// 	ctx.Redirect(setting.AppSubURL + "/")
+	// }
 }
 
 func loadAccountData(ctx *context.Context) {

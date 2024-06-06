@@ -5,6 +5,7 @@ package oauth2
 
 import (
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/services/auth/source/oauth2/providers/jaccount"
 
 	"github.com/markbates/goth"
 	"github.com/markbates/goth/providers/azureadv2"
@@ -120,4 +121,14 @@ func init() {
 			}), nil
 		},
 	))
+
+	RegisterGothProvider(NewCustomProvider(
+		"jaccount", "jAccount", &CustomURLSettings{
+			AuthURL:    requiredAttribute(jaccount.AuthURL),
+			TokenURL:   requiredAttribute(jaccount.TokenURL),
+			ProfileURL: requiredAttribute(jaccount.ProfileURL),
+		},
+		func(clientID, secret, callbackURL string, custom *CustomURLMapping, scopes []string) (goth.Provider, error) {
+			return jaccount.NewCustomisedURL(clientID, secret, callbackURL, custom.AuthURL, custom.TokenURL, custom.ProfileURL, scopes...), nil
+		}))
 }

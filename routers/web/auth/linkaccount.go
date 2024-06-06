@@ -292,6 +292,8 @@ func LinkAccountPostRegister(ctx *context.Context) {
 		LoginType:   auth.OAuth2,
 		LoginSource: authSource.ID,
 		LoginName:   gothUser.UserID,
+		Location:    gothUser.Location,
+		FullName:    gothUser.Name + gothUser.Location,
 	}
 
 	if !createAndHandleCreatedUser(ctx, tplLinkAccount, form, u, nil, &gothUser, false) {

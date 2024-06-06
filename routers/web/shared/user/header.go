@@ -21,6 +21,7 @@ import (
 	"code.gitea.io/gitea/modules/optional"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/services/context"
+	user_service "code.gitea.io/gitea/services/user"
 )
 
 // prepareContextForCommonProfile store some common data into context data for user's profile related pages (including the nav menu)
@@ -93,6 +94,12 @@ func PrepareContextForProfileBigAvatar(ctx *context.Context) {
 		} else {
 			ctx.Data["UserBlocking"] = block
 		}
+	}
+	ctx.Data["CanBlockUser"] = func(blocker, blockee *user_model.User) bool {
+		return user_service.CanBlockUser(ctx, ctx.Doer, blocker, blockee)
+	}
+	ctx.Data["CanUnblockUser"] = func(blocker, blockee *user_model.User) bool {
+		return user_service.CanUnblockUser(ctx, ctx.Doer, blocker, blockee)
 	}
 }
 

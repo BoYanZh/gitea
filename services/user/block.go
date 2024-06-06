@@ -41,6 +41,8 @@ func CanBlockUser(ctx context.Context, doer, blocker, blockee *user_model.User) 
 		}
 	} else if !doer.IsAdmin && doer.ID != blocker.ID {
 		return false
+	} else if !doer.IsAdmin {
+		return false
 	}
 
 	return true

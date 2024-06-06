@@ -6,6 +6,7 @@ package organization
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -728,6 +729,47 @@ func (org *Organization) AccessibleTeamReposEnv(ctx context.Context, team *Team)
 		ctx:     ctx,
 		orderBy: db.SearchOrderByRecentUpdated,
 	}
+}
+
+func (org *Organization) GetCompanyTeam(ctx context.Context, user *user_model.User) (*Team, error) {
+	if user == nil {
+		return nil, nil
+	}
+
+	teams, err := org.LoadTeams(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	teamName := setting.Other.CompanyTeamName
+	var companyTeam *Team = nil
+	for _, team := range teams {
+		if team.LowerName == strings.ToLower(teamName) {
+			companyTeam = team
+			break
+		}
+	}
+
+	if companyTeam == nil {
+		return nil, errors.New("company team not found")
+	}
+
+	if err := companyTeam.LoadMembers(db.DefaultContext); err != nil {
+		return nil, err
+	}
+
+	if companyTeam.IsMember(ctx, user.ID) {
+		return companyTeam, nil
+	}
+	isOwner, err := org.IsOwnedBy(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
+	if isOwner {
+		return companyTeam, nil
+	}
+
+	return nil, errors.New("user not in company team")
 }
 
 func (env *accessibleReposEnv) cond() builder.Cond {

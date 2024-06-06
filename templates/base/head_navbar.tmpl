@@ -98,6 +98,28 @@
 				</div>
 			</a>
 
+			{{if .CompanyTeam}}
+				<div class="ui dropdown jump item poping up" data-content="Pretend..." data-variation="tiny inverted">
+					<span class="text">
+						<span class="fitted">{{svg "octicon-people"}}</span>
+						<span class="sr-mobile-only">Pretend...</span>
+						<span class="fitted not-mobile">{{svg "octicon-triangle-down"}}</span>
+					</span>
+					<div class="menu">
+						<div class="ui header">
+							PRETEND TO BE
+						</div>
+						<div class="divider"></div>
+						{{range .CompanyTeam.Members}}
+							<a class="item" href="{{AppSubUrl}}/user/pretend/{{.ID}}?redirect_to={{$.CurrentURL}}&org_id={{$.Org.ID}}">
+								<span class="fitted">{{ctx.AvatarUtils.Avatar . 24 "tw-mr-1"}}</span>
+								{{.Name}}
+							</a>
+						{{end}}
+					</div><!-- end content pretend menu -->
+				</div><!-- end dropdown menu pretend -->
+			{{end}}
+
 			<div class="ui dropdown jump item tw-mx-0 tw-pr-2" data-tooltip-content="{{ctx.Locale.Tr "create_new"}}">
 				<span class="text">
 					{{svg "octicon-plus"}}

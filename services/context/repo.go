@@ -18,6 +18,7 @@ import (
 	"code.gitea.io/gitea/models/db"
 	git_model "code.gitea.io/gitea/models/git"
 	issues_model "code.gitea.io/gitea/models/issues"
+	"code.gitea.io/gitea/models/organization"
 	access_model "code.gitea.io/gitea/models/perm/access"
 	repo_model "code.gitea.io/gitea/models/repo"
 	unit_model "code.gitea.io/gitea/models/unit"
@@ -551,6 +552,15 @@ func RepoAssignment(ctx *Context) context.CancelFunc {
 	ctx.Data["CanWriteIssues"] = ctx.Repo.CanWrite(unit_model.TypeIssues)
 	ctx.Data["CanWritePulls"] = ctx.Repo.CanWrite(unit_model.TypePullRequests)
 	ctx.Data["CanWriteActions"] = ctx.Repo.CanWrite(unit_model.TypeActions)
+	if repo.Owner.IsOrganization() {
+		org, err := organization.GetOrgByName(ctx, repo.OwnerName)
+		if err != nil {
+			ctx.ServerError("GetOrgByName", err)
+			return nil
+		}
+		ctx.Data["Org"] = org
+		ctx.Data["CompanyTeam"], _ = org.GetCompanyTeam(ctx, ctx.Doer)
+	}
 
 	canSignedUserFork, err := repo_module.CanUserForkRepo(ctx, ctx.Doer, ctx.Repo.Repository)
 	if err != nil {

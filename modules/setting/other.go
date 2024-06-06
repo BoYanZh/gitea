@@ -11,6 +11,7 @@ type OtherConfig struct {
 	ShowFooterPoweredBy        bool
 	EnableFeed                 bool
 	EnableSitemap              bool
+	CompanyTeamName            string
 }
 
 var Other = OtherConfig{
@@ -19,6 +20,7 @@ var Other = OtherConfig{
 	ShowFooterPoweredBy:        true,
 	EnableSitemap:              true,
 	EnableFeed:                 true,
+	CompanyTeamName:            "CompanyStaff",
 }
 
 func loadOtherFrom(rootCfg ConfigProvider) {

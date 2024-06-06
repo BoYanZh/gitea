@@ -42,27 +42,27 @@ type UpdateOptions struct {
 func UpdateUser(ctx context.Context, u *user_model.User, opts *UpdateOptions) error {
 	cols := make([]string, 0, 20)
 
-	if opts.KeepEmailPrivate.Has() {
-		u.KeepEmailPrivate = opts.KeepEmailPrivate.Value()
+	// if opts.KeepEmailPrivate.Has() {
+	// 	u.KeepEmailPrivate = opts.KeepEmailPrivate.Value()
 
-		cols = append(cols, "keep_email_private")
-	}
+	// 	cols = append(cols, "keep_email_private")
+	// }
 
-	if opts.FullName.Has() {
-		u.FullName = opts.FullName.Value()
+	// if opts.FullName.Has() {
+	// 	u.FullName = opts.FullName.Value()
 
-		cols = append(cols, "full_name")
-	}
+	// 	cols = append(cols, "full_name")
+	// }
 	if opts.Website.Has() {
 		u.Website = opts.Website.Value()
 
 		cols = append(cols, "website")
 	}
-	if opts.Location.Has() {
-		u.Location = opts.Location.Value()
+	// if opts.Location.Has() {
+	// 	u.Location = opts.Location.Value()
 
-		cols = append(cols, "location")
-	}
+	// 	cols = append(cols, "location")
+	// }
 	if opts.Description.Has() {
 		u.Description = opts.Description.Value()
 

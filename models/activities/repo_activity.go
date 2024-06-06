@@ -45,7 +45,7 @@ type ActivityStats struct {
 }
 
 // GetActivityStats return stats for repository at given time range
-func GetActivityStats(ctx context.Context, repo *repo_model.Repository, timeFrom time.Time, releases, issues, prs, code bool) (*ActivityStats, error) {
+func GetActivityStats(ctx context.Context, repo *repo_model.Repository, timeFrom time.Time, releases, issues, prs, code, isWiki bool) (*ActivityStats, error) {
 	stats := &ActivityStats{Code: &git.CodeActivityStats{}}
 	if releases {
 		if err := stats.FillReleases(ctx, repo.ID, timeFrom); err != nil {
@@ -66,13 +66,19 @@ func GetActivityStats(ctx context.Context, repo *repo_model.Repository, timeFrom
 		return nil, fmt.Errorf("FillUnresolvedIssues: %w", err)
 	}
 	if code {
-		gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)
+		repoPath := repo.RepoPath()
+		branch := repo.DefaultBranch
+		if isWiki {
+			repoPath = repo.WikiPath()
+			branch = repo.DefaultWikiBranch
+		}
+		gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpenPath(ctx, repoPath)
 		if err != nil {
 			return nil, fmt.Errorf("OpenRepository: %w", err)
 		}
 		defer closer.Close()
 
-		code, err := gitRepo.GetCodeActivityStats(timeFrom, repo.DefaultBranch)
+		code, err := gitRepo.GetCodeActivityStats(timeFrom, branch)
 		if err != nil {
 			return nil, fmt.Errorf("FillFromGit: %w", err)
 		}
@@ -81,9 +87,9 @@ func GetActivityStats(ctx context.Context, repo *repo_model.Repository, timeFrom
 	return stats, nil
 }
 
-// GetActivityStatsTopAuthors returns top author stats for git commits for all branches
-func GetActivityStatsTopAuthors(ctx context.Context, repo *repo_model.Repository, timeFrom time.Time, count int) ([]*ActivityAuthorData, error) {
-	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)
+// GetActivityStatsTopAuthorsByRepoPath returns top author stats for git commits for all branches
+func GetActivityStatsTopAuthorsByRepoPath(ctx context.Context, repoPath string, timeFrom time.Time, count int) ([]*ActivityAuthorData, error) {
+	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpenPath(ctx, repoPath)
 	if err != nil {
 		return nil, fmt.Errorf("OpenRepository: %w", err)
 	}
@@ -143,6 +149,11 @@ func GetActivityStatsTopAuthors(ctx context.Context, repo *repo_model.Repository
 	}
 
 	return v[:cnt], nil
+}
+
+// GetActivityStatsTopAuthors returns top author stats for git commits for all branches
+func GetActivityStatsTopAuthors(ctx context.Context, repo *repo_model.Repository, timeFrom time.Time, count int) ([]*ActivityAuthorData, error) {
+	return GetActivityStatsTopAuthorsByRepoPath(ctx, repo.RepoPath(), timeFrom, count)
 }
 
 // ActivePRCount returns total active pull request count

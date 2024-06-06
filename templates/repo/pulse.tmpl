@@ -109,6 +109,37 @@
 			</div>
 		</div>
 	{{end}}
+	{{if .HasWiki}}
+		<h4 class="ui top attached header">Wiki {{ctx.Locale.Tr "repo.activity.overview"}}</h4>
+		{{if eq .WikiActivity.Code.CommitCountInAllBranches 0}}
+			<div class="ui center aligned segment">
+			<h4 class="ui header">{{ctx.Locale.Tr "repo.activity.no_git_activity"}}</h4>
+			</div>
+		{{end}}
+		{{if gt .WikiActivity.Code.CommitCountInAllBranches 0}}
+			<div class="ui attached segment horizontal segments">
+				<div class="ui attached segment text">
+					{{ctx.Locale.Tr "repo.activity.git_stats_exclude_merges"}}
+					<strong>{{ctx.Locale.TrN .WikiActivity.Code.AuthorCount "repo.activity.git_stats_author_1" "repo.activity.git_stats_author_n" .WikiActivity.Code.AuthorCount}}</strong>
+					{{ctx.Locale.TrN .WikiActivity.Code.AuthorCount "repo.activity.git_stats_pushed_1" "repo.activity.git_stats_pushed_n"}}
+					<strong>{{ctx.Locale.TrN .WikiActivity.Code.CommitCount "repo.activity.git_stats_commit_1" "repo.activity.git_stats_commit_n" .WikiActivity.Code.CommitCount}}</strong>
+					{{ctx.Locale.Tr "repo.activity.git_stats_push_to_branch" .Repository.DefaultBranch}}
+					<strong>{{ctx.Locale.TrN .WikiActivity.Code.CommitCountInAllBranches "repo.activity.git_stats_commit_1" "repo.activity.git_stats_commit_n" .WikiActivity.Code.CommitCountInAllBranches}}</strong>
+					{{ctx.Locale.Tr "repo.activity.git_stats_push_to_all_branches"}}
+					{{ctx.Locale.Tr "repo.activity.git_stats_on_default_branch" .Repository.DefaultBranch}}
+					<strong>{{ctx.Locale.TrN .WikiActivity.Code.ChangedFiles "repo.activity.git_stats_file_1" "repo.activity.git_stats_file_n" .WikiActivity.Code.ChangedFiles}}</strong>
+					{{ctx.Locale.TrN .WikiActivity.Code.ChangedFiles "repo.activity.git_stats_files_changed_1" "repo.activity.git_stats_files_changed_n"}}
+					{{ctx.Locale.Tr "repo.activity.git_stats_additions"}}
+					<strong class="text green">{{ctx.Locale.TrN .WikiActivity.Code.Additions "repo.activity.git_stats_addition_1" "repo.activity.git_stats_addition_n" .WikiActivity.Code.Additions}}</strong>
+					{{ctx.Locale.Tr "repo.activity.git_stats_and_deletions"}}
+					<strong class="text red">{{ctx.Locale.TrN .WikiActivity.Code.Deletions "repo.activity.git_stats_deletion_1" "repo.activity.git_stats_deletion_n" .WikiActivity.Code.Deletions}}</strong>.
+				</div>
+				<div class="ui attached segment">
+					<div id="repo-wiki-activity-top-authors-chart"></div>
+				</div>
+			</div>
+		{{end}}
+	{{end}}
 {{end}}
 
 {{if gt .Activity.PublishedReleaseCount 0}}

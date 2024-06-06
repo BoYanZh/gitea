@@ -57,7 +57,8 @@ func Activity(ctx *context.Context) {
 		ctx.Repo.CanRead(unit.TypeReleases),
 		ctx.Repo.CanRead(unit.TypeIssues),
 		ctx.Repo.CanRead(unit.TypePullRequests),
-		ctx.Repo.CanRead(unit.TypeCode)); err != nil {
+		ctx.Repo.CanRead(unit.TypeCode),
+		false); err != nil {
 		ctx.ServerError("GetActivityStats", err)
 		return
 	}
@@ -65,6 +66,20 @@ func Activity(ctx *context.Context) {
 	if ctx.PageData["repoActivityTopAuthors"], err = activities_model.GetActivityStatsTopAuthors(ctx, ctx.Repo.Repository, timeFrom, 10); err != nil {
 		ctx.ServerError("GetActivityStatsTopAuthors", err)
 		return
+	}
+
+	ctx.Data["HasWiki"] = false
+	if ctx.Repo.Repository.HasWiki() {
+		ctx.Data["HasWiki"] = true
+		if ctx.Data["WikiActivity"], err = activities_model.GetActivityStats(ctx, ctx.Repo.Repository, timeFrom,
+			false, false, false, true, true); err != nil {
+			ctx.ServerError("GetActivityStats(wiki)", err)
+			return
+		}
+		if ctx.PageData["repoWikiActivityTopAuthors"], err = activities_model.GetActivityStatsTopAuthorsByRepoPath(ctx, ctx.Repo.Repository.WikiPath(), timeFrom, 10); err != nil {
+			ctx.ServerError("GetActivityStatsTopAuthors(wiki)", err)
+			return
+		}
 	}
 
 	ctx.HTML(http.StatusOK, tplActivity)

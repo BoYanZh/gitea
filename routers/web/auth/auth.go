@@ -915,6 +915,8 @@ func Pretend(ctx *context.Context) {
 	}
 
 	handleSignInFull(ctx, u, true, false)
-	middleware.DeleteRedirectToCookie(ctx.Resp)
+	if ctx.Written() {
+		return
+	}
 	ctx.RedirectToCurrentSite(ctx.FormString("redirect_to"), u.HomeLink())
 }

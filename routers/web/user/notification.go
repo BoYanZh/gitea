@@ -277,6 +277,7 @@ func NotificationSubscriptions(ctx *context.Context) {
 		IsClosed:     showClosed,
 		IsPull:       issueTypeBool,
 		LabelIDs:     labelIDs,
+		IsArchived:   optional.Some(false),
 	})
 	if err != nil {
 		ctx.ServerError("CountIssues", err)
@@ -292,6 +293,7 @@ func NotificationSubscriptions(ctx *context.Context) {
 		IsClosed:     showClosed,
 		IsPull:       issueTypeBool,
 		LabelIDs:     labelIDs,
+		IsArchived:   optional.Some(false),
 	})
 	if err != nil {
 		ctx.ServerError("Issues", err)

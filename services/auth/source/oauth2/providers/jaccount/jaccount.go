@@ -4,11 +4,12 @@ package jaccount
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+
+	"code.gitea.io/gitea/modules/json"
 
 	"github.com/markbates/goth"
 	"golang.org/x/oauth2"

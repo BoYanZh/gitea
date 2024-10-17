@@ -1,11 +1,11 @@
 package jaccount
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
 	"time"
 
+	"code.gitea.io/gitea/modules/json"
 	"github.com/markbates/goth"
 )
 

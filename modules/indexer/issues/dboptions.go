@@ -68,11 +68,11 @@ func ToSearchOptions(keyword string, opts *issues_model.IssuesOptions) *SearchOp
 	searchOpt.Paginator = opts.Paginator
 
 	switch opts.SortType {
-	case "", "latest":
+	case "latest":
 		searchOpt.SortBy = SortByCreatedDesc
 	case "oldest":
 		searchOpt.SortBy = SortByCreatedAsc
-	case "recentupdate":
+	case "", "recentupdate":
 		searchOpt.SortBy = SortByUpdatedDesc
 	case "leastupdate":
 		searchOpt.SortBy = SortByUpdatedAsc

@@ -34,7 +34,7 @@ func ToDBOptions(ctx context.Context, options *internal.SearchOptions) (*issue_m
 	case internal.SortByDeadlineAsc:
 		sortType = "nearduedate"
 	default:
-		sortType = "newest"
+		sortType = "recentupdate"
 	}
 
 	// See the comment of issues_model.SearchOptions for the reason why we need to convert

@@ -95,7 +95,7 @@ func applySorts(sess *xorm.Session, sortType string, priorityRepoID int64) {
 	case "project-column-sorting":
 		sess.Asc("project_issue.sorting").Desc("issue.created_unix").Desc("issue.id")
 	default:
-		sess.Desc("issue.created_unix").Desc("issue.id")
+		sess.Desc("issue.updated_unix").Desc("issue.created_unix").Desc("issue.id")
 	}
 }
 

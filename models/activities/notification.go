@@ -18,6 +18,7 @@ import (
 	"code.gitea.io/gitea/modules/timeutil"
 
 	"xorm.io/builder"
+	"xorm.io/xorm/schemas"
 )
 
 type (
@@ -69,6 +70,15 @@ type Notification struct {
 
 	CreatedUnix timeutil.TimeStamp `xorm:"created INDEX NOT NULL"`
 	UpdatedUnix timeutil.TimeStamp `xorm:"updated INDEX NOT NULL"`
+}
+
+// TableIndices implements xorm's TableIndices interface
+func (n *Notification) TableIndices() []*schemas.Index {
+	usuuIndex := schemas.NewIndex("u_s_uu", schemas.IndexType)
+	usuuIndex.AddColumn("user_id", "status", "updated_unix")
+	indices := []*schemas.Index{usuuIndex}
+
+	return indices
 }
 
 func init() {

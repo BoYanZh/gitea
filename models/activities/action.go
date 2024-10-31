@@ -168,10 +168,13 @@ func (a *Action) TableIndices() []*schemas.Index {
 	actUserIndex := schemas.NewIndex("au_r_c_u_d", schemas.IndexType)
 	actUserIndex.AddColumn("act_user_id", "repo_id", "created_unix", "user_id", "is_deleted")
 
+	actUserIndex2 := schemas.NewIndex("au_u_r_d_c", schemas.IndexType)
+	actUserIndex2.AddColumn("act_user_id", "user_id", "repo_id", "is_deleted", "created_unix")
+
 	cudIndex := schemas.NewIndex("c_u_d", schemas.IndexType)
 	cudIndex.AddColumn("created_unix", "user_id", "is_deleted")
 
-	indices := []*schemas.Index{actUserIndex, repoIndex, cudIndex}
+	indices := []*schemas.Index{actUserIndex, actUserIndex2, repoIndex, cudIndex}
 
 	return indices
 }

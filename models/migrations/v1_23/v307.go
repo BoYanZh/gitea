@@ -12,20 +12,20 @@ import (
 
 type improveNotificationTableIndicesAction struct {
 	ID     int64 `xorm:"pk autoincr"`
-	UserID int64 `xorm:"INDEX NOT NULL"`
-	RepoID int64 `xorm:"INDEX NOT NULL"`
+	UserID int64 `xorm:"NOT NULL"`
+	RepoID int64 `xorm:"NOT NULL"`
 
-	Status uint8 `xorm:"SMALLINT INDEX NOT NULL"`
-	Source uint8 `xorm:"SMALLINT INDEX NOT NULL"`
+	Status uint8 `xorm:"SMALLINT NOT NULL"`
+	Source uint8 `xorm:"SMALLINT NOT NULL"`
 
-	IssueID   int64  `xorm:"INDEX NOT NULL"`
-	CommitID  string `xorm:"INDEX"`
+	IssueID   int64 `xorm:"NOT NULL"`
+	CommitID  string
 	CommentID int64
 
-	UpdatedBy int64 `xorm:"INDEX NOT NULL"`
+	UpdatedBy int64 `xorm:"NOT NULL"`
 
-	CreatedUnix timeutil.TimeStamp `xorm:"created INDEX NOT NULL"`
-	UpdatedUnix timeutil.TimeStamp `xorm:"updated INDEX NOT NULL"`
+	CreatedUnix timeutil.TimeStamp `xorm:"created NOT NULL"`
+	UpdatedUnix timeutil.TimeStamp `xorm:"updated NOT NULL"`
 }
 
 // TableName sets the name of this table

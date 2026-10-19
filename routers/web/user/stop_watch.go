@@ -6,10 +6,10 @@ package user
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // GetStopwatches get all stopwatches
@@ -19,19 +19,19 @@ func GetStopwatches(ctx *context.Context) {
 		PageSize: convert.ToCorrectPageSize(ctx.FormInt("limit")),
 	})
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, err.Error())
+		ctx.HTTPError(http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	count, err := issues_model.CountUserStopwatches(ctx, ctx.Doer.ID)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, err.Error())
+		ctx.HTTPError(http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	apiSWs, err := convert.ToStopWatches(ctx, sws)
+	apiSWs, err := convert.ToStopWatches(ctx, ctx.Doer, sws)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, err.Error())
+		ctx.HTTPError(http.StatusInternalServerError, err.Error())
 		return
 	}
 

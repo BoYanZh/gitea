@@ -5,13 +5,8 @@
 package forms
 
 import (
-	"net/http"
-
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web/middleware"
-	"code.gitea.io/gitea/services/context"
-
-	"gitea.com/go-chi/binding"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/web/middleware"
 )
 
 // ________                            .__                __  .__
@@ -23,34 +18,28 @@ import (
 
 // CreateOrgForm form for creating organization
 type CreateOrgForm struct {
+	middleware.FormDefaultValidator
 	OrgName                   string `binding:"Required;Username;MaxSize(40)" locale:"org.org_name_holder"`
 	Visibility                structs.VisibleType
 	RepoAdminChangeTeamAccess bool
 }
 
-// Validate validates the fields
-func (f *CreateOrgForm) Validate(req *http.Request, errs binding.Errors) binding.Errors {
-	ctx := context.GetValidateContext(req)
-	return middleware.Validate(errs, ctx.Data, f, ctx.Locale)
-}
-
 // UpdateOrgSettingForm form for updating organization settings
 type UpdateOrgSettingForm struct {
-	Name                      string `binding:"Required;Username;MaxSize(40)" locale:"org.org_name_holder"`
-	FullName                  string `binding:"MaxSize(100)"`
-	Email                     string `binding:"MaxSize(255)"`
-	Description               string `binding:"MaxSize(255)"`
-	Website                   string `binding:"ValidUrl;MaxSize(255)"`
-	Location                  string `binding:"MaxSize(50)"`
-	Visibility                structs.VisibleType
-	MaxRepoCreation           int
-	RepoAdminChangeTeamAccess bool
+	middleware.FormDefaultValidator
+	FullName                  *string `binding:"MaxSize(100)"`
+	Email                     *string `binding:"MaxSize(255)"`
+	Description               *string `binding:"MaxSize(255)"`
+	Website                   *string `binding:"ValidUrl;MaxSize(255)"`
+	Location                  *string `binding:"MaxSize(50)"`
+	MaxRepoCreation           *int
+	RepoAdminChangeTeamAccess *bool
 }
 
-// Validate validates the fields
-func (f *UpdateOrgSettingForm) Validate(req *http.Request, errs binding.Errors) binding.Errors {
-	ctx := context.GetValidateContext(req)
-	return middleware.Validate(errs, ctx.Data, f, ctx.Locale)
+type RenameOrgForm struct {
+	middleware.FormDefaultValidator
+	OrgName    string `binding:"Required"`
+	NewOrgName string `binding:"Required;Username;MaxSize(40)" locale:"org.org_name_holder"`
 }
 
 // ___________
@@ -62,15 +51,11 @@ func (f *UpdateOrgSettingForm) Validate(req *http.Request, errs binding.Errors) 
 
 // CreateTeamForm form for creating team
 type CreateTeamForm struct {
+	middleware.FormDefaultValidator
 	TeamName         string `binding:"Required;AlphaDashDot;MaxSize(255)"`
 	Description      string `binding:"MaxSize(255)"`
 	Permission       string
 	RepoAccess       string
 	CanCreateOrgRepo bool
-}
-
-// Validate validates the fields
-func (f *CreateTeamForm) Validate(req *http.Request, errs binding.Errors) binding.Errors {
-	ctx := context.GetValidateContext(req)
-	return middleware.Validate(errs, ctx.Data, f, ctx.Locale)
+	Visibility       string `binding:"In(public,limited,private)"`
 }

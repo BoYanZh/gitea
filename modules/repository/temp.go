@@ -4,42 +4,21 @@
 package repository
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"path"
-	"path/filepath"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitrepo"
+	"gitea.dev/modules/setting"
 )
 
-// LocalCopyPath returns the local repository temporary copy path.
-func LocalCopyPath() string {
-	if filepath.IsAbs(setting.Repository.Local.LocalCopyPath) {
-		return setting.Repository.Local.LocalCopyPath
-	}
-	return path.Join(setting.AppDataPath, setting.Repository.Local.LocalCopyPath)
-}
-
-// CreateTemporaryPath creates a temporary path
-func CreateTemporaryPath(prefix string) (string, error) {
-	if err := os.MkdirAll(LocalCopyPath(), os.ModePerm); err != nil {
-		log.Error("Unable to create localcopypath directory: %s (%v)", LocalCopyPath(), err)
-		return "", fmt.Errorf("Failed to create localcopypath directory %s: %w", LocalCopyPath(), err)
-	}
-	basePath, err := os.MkdirTemp(LocalCopyPath(), prefix+".git")
+// CreateTemporaryGitRepo creates a temporary Git repository empty directory (not initialized)
+func CreateTemporaryGitRepo(prefix string) (tmpPath string, tmpRepo git.RepositoryFacade, cancel context.CancelFunc, err error) {
+	tmpNamePrefix := prefix + ".git"
+	tmpPath, cancel, err = setting.AppDataTempDir("local-repo").MkdirTempRandom(tmpNamePrefix)
 	if err != nil {
-		log.Error("Unable to create temporary directory: %s-*.git (%v)", prefix, err)
-		return "", fmt.Errorf("Failed to create dir %s-*.git: %w", prefix, err)
+		return "", nil, nil, fmt.Errorf("failed to create temp dir with prefix %s: %w", tmpNamePrefix, err)
 	}
-	return basePath, nil
-}
-
-// RemoveTemporaryPath removes the temporary path
-func RemoveTemporaryPath(basePath string) error {
-	if _, err := os.Stat(basePath); !os.IsNotExist(err) {
-		return util.RemoveAll(basePath)
-	}
-	return nil
+	tmpRepo = gitrepo.RepositoryUnmanaged(tmpPath)
+	return tmpPath, tmpRepo, cancel, nil
 }

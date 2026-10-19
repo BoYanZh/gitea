@@ -5,12 +5,13 @@ package markdown
 
 import (
 	"fmt"
-	"regexp"
-	"strings"
 
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/markup"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/highlight"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/markup/internal"
+	"gitea.dev/modules/markup/markdown/math"
 
 	"github.com/yuin/goldmark/ast"
 	east "github.com/yuin/goldmark/extension/ast"
@@ -23,35 +24,39 @@ import (
 
 // ASTTransformer is a default transformer of the goldmark tree.
 type ASTTransformer struct {
+	renderInternal *internal.RenderInternal
 	attentionTypes container.Set[string]
 }
 
-func NewASTTransformer() *ASTTransformer {
+func NewASTTransformer(renderInternal *internal.RenderInternal) *ASTTransformer {
 	return &ASTTransformer{
+		renderInternal: renderInternal,
 		attentionTypes: container.SetOf("note", "tip", "important", "warning", "caution"),
 	}
 }
 
 func (g *ASTTransformer) applyElementDir(n ast.Node) {
-	if markup.DefaultProcessorHelper.ElementDir != "" {
-		n.SetAttributeString("dir", []byte(markup.DefaultProcessorHelper.ElementDir))
+	if !markup.RenderBehaviorForTesting.DisableAdditionalAttributes {
+		n.SetAttributeString("dir", "auto")
 	}
 }
 
 // Transform transforms the given AST tree.
 func (g *ASTTransformer) Transform(node *ast.Document, reader text.Reader, pc parser.Context) {
 	firstChild := node.FirstChild()
-	tocMode := ""
-	ctx := pc.Get(renderContextKey).(*markup.RenderContext)
-	rc := pc.Get(renderConfigKey).(*RenderConfig)
+	ctx := pc.Get(renderContextKey).(*markup.RenderContext) //nolint:forcetypeassert // the renderer always seeds this key before parsing
+	rc := pc.Get(renderConfigKey).(*RenderConfig)           //nolint:forcetypeassert // the renderer always seeds this key before parsing
 
-	tocList := make([]markup.Header, 0, 20)
+	tocMode := ""
 	if rc.yamlNode != nil {
-		metaNode := rc.toMetaNode()
+		metaNode := rc.toMetaNode(g)
 		if metaNode != nil {
 			node.InsertBefore(node, firstChild, metaNode)
 		}
 		tocMode = rc.TOC
+	}
+	if ctx.RenderOptions.FeedExcerpt {
+		filterFeedExcerpt(node)
 	}
 
 	_ = ast.Walk(node, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -60,55 +65,65 @@ func (g *ASTTransformer) Transform(node *ast.Document, reader text.Reader, pc pa
 		}
 
 		switch v := n.(type) {
-		case *ast.Heading:
-			g.transformHeading(ctx, v, reader, &tocList)
 		case *ast.Paragraph:
 			g.applyElementDir(v)
-		case *ast.Image:
-			g.transformImage(ctx, v)
-		case *ast.Link:
-			g.transformLink(ctx, v)
 		case *ast.List:
 			g.transformList(ctx, v, rc)
 		case *ast.Text:
 			if v.SoftLineBreak() && !v.HardLineBreak() {
-				if ctx.Metas["mode"] != "document" {
-					v.SetHardLineBreak(setting.Markdown.EnableHardLineBreakInComments)
-				} else {
-					v.SetHardLineBreak(setting.Markdown.EnableHardLineBreakInDocuments)
-				}
+				newLineHardBreak := ctx.RenderOptions.Metas["markdownNewLineHardBreak"] == "true"
+				v.SetHardLineBreak(newLineHardBreak)
 			}
 		case *ast.CodeSpan:
 			g.transformCodeSpan(ctx, v, reader)
+		case *ast.FencedCodeBlock:
+			g.transformFencedCodeblock(v, reader)
 		case *ast.Blockquote:
 			return g.transformBlockquote(v, reader)
 		}
 		return ast.WalkContinue, nil
 	})
 
-	showTocInMain := tocMode == "true" /* old behavior, in main view */ || tocMode == "main"
-	showTocInSidebar := !showTocInMain && tocMode != "false" // not hidden, not main, then show it in sidebar
-	if len(tocList) > 0 && (showTocInMain || showTocInSidebar) {
-		if showTocInMain {
-			tocNode := createTOCNode(tocList, rc.Lang, nil)
-			node.InsertBefore(node, firstChild, tocNode)
-		} else {
-			tocNode := createTOCNode(tocList, rc.Lang, map[string]string{"open": "open"})
-			ctx.SidebarTocNode = tocNode
+	if ctx.RenderOptions.EnableHeadingIDGeneration {
+		showTocInMain := tocMode == "true" /* old behavior, in main view */ || tocMode == "main"
+		showTocInSidebar := !showTocInMain && tocMode != "false" // not hidden, not main, then show it in sidebar
+		switch {
+		case showTocInMain:
+			ctx.TocShowInSection = markup.TocShowInMain
+		case showTocInSidebar:
+			ctx.TocShowInSection = markup.TocShowInSidebar
 		}
 	}
 
-	if len(rc.Lang) > 0 {
+	if rc.Lang != "" {
 		node.SetAttributeString("lang", []byte(rc.Lang))
 	}
 }
 
-// NewHTMLRenderer creates a HTMLRenderer to render
-// in the gitea form.
-func NewHTMLRenderer(opts ...html.Option) renderer.NodeRenderer {
+func filterFeedExcerpt(parent ast.Node) {
+	for node := parent.FirstChild(); node != nil; {
+		next := node.NextSibling()
+		switch node.Kind() {
+		case ast.KindText, ast.KindAutoLink, math.KindInline:
+		case ast.KindParagraph, ast.KindHeading, ast.KindTextBlock, ast.KindBlockquote, ast.KindList, ast.KindListItem,
+			ast.KindEmphasis, ast.KindCodeSpan, ast.KindLink,
+			east.KindStrikethrough, east.KindDefinitionList, east.KindDefinitionTerm, east.KindDefinitionDescription:
+			filterFeedExcerpt(node)
+			if !node.HasChildren() {
+				parent.RemoveChild(parent, node)
+			}
+		default:
+			parent.RemoveChild(parent, node)
+		}
+		node = next
+	}
+}
+
+// NewHTMLRenderer creates a HTMLRenderer to render in the gitea form.
+func NewHTMLRenderer(renderInternal *internal.RenderInternal, opts ...html.Option) renderer.NodeRenderer {
 	r := &HTMLRenderer{
-		Config:      html.NewConfig(),
-		reValidName: regexp.MustCompile("^[a-z ]+$"),
+		renderInternal: renderInternal,
+		Config:         html.NewConfig(),
 	}
 	for _, opt := range opts {
 		opt.SetHTMLOption(&r.Config)
@@ -120,7 +135,7 @@ func NewHTMLRenderer(opts ...html.Option) renderer.NodeRenderer {
 // renders gitea specific features.
 type HTMLRenderer struct {
 	html.Config
-	reValidName *regexp.Regexp
+	renderInternal *internal.RenderInternal
 }
 
 // RegisterFuncs implements renderer.NodeRenderer.RegisterFuncs.
@@ -128,22 +143,42 @@ func (r *HTMLRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
 	reg.Register(ast.KindDocument, r.renderDocument)
 	reg.Register(KindDetails, r.renderDetails)
 	reg.Register(KindSummary, r.renderSummary)
-	reg.Register(KindIcon, r.renderIcon)
 	reg.Register(ast.KindCodeSpan, r.renderCodeSpan)
+	reg.Register(ast.KindCodeBlock, r.renderCodeBlock)
 	reg.Register(KindAttention, r.renderAttention)
 	reg.Register(KindTaskCheckBoxListItem, r.renderTaskCheckBoxListItem)
 	reg.Register(east.KindTaskCheckBox, r.renderTaskCheckBox)
+	reg.Register(KindRawHTML, r.renderRawHTML)
+}
+
+// renderCodeBlock wraps indented code blocks like the fenced renderer
+func (r *HTMLRenderer) renderCodeBlock(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if entering {
+		preAttrs, codeAttrs := highlight.CodeBlockAttributes("") // no language
+		opening := r.renderInternal.ProtectSafeAttrs(htmlutil.HTMLFormat(`<div class="code-block-container code-overflow-scroll"><pre %s><code %s>`, preAttrs, codeAttrs))
+		if _, err := w.WriteString(string(opening)); err != nil {
+			return ast.WalkStop, err
+		}
+		lines := n.Lines()
+		for i := 0; i < lines.Len(); i++ {
+			line := lines.At(i)
+			r.Writer.RawWrite(w, line.Value(source))
+		}
+	} else {
+		if _, err := w.WriteString("</code></pre></div>"); err != nil {
+			return ast.WalkStop, err
+		}
+	}
+	return ast.WalkContinue, nil
 }
 
 func (r *HTMLRenderer) renderDocument(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
-	n := node.(*ast.Document)
-
-	if val, has := n.AttributeString("lang"); has {
+	if val, has := node.AttributeString("lang"); has {
 		var err error
 		if entering {
 			_, err = w.WriteString("<div")
 			if err == nil {
-				_, err = w.WriteString(fmt.Sprintf(` lang=%q`, val))
+				_, err = fmt.Fprintf(w, ` lang=%q`, val)
 			}
 			if err == nil {
 				_, err = w.WriteRune('>')
@@ -194,29 +229,14 @@ func (r *HTMLRenderer) renderSummary(w util.BufWriter, source []byte, node ast.N
 	return ast.WalkContinue, nil
 }
 
-func (r *HTMLRenderer) renderIcon(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+func (r *HTMLRenderer) renderRawHTML(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
 	if !entering {
 		return ast.WalkContinue, nil
 	}
-
-	n := node.(*Icon)
-
-	name := strings.TrimSpace(strings.ToLower(string(n.Name)))
-
-	if len(name) == 0 {
-		// skip this
-		return ast.WalkContinue, nil
-	}
-
-	if !r.reValidName.MatchString(name) {
-		// skip this
-		return ast.WalkContinue, nil
-	}
-
-	_, err := w.WriteString(fmt.Sprintf(`<i class="icon %s"></i>`, name))
+	n := node.(*RawHTML) //nolint:forcetypeassert // registered for KindRawHTML only
+	_, err := w.WriteString(string(r.renderInternal.ProtectSafeAttrs(n.rawHTML)))
 	if err != nil {
 		return ast.WalkStop, err
 	}
-
 	return ast.WalkContinue, nil
 }

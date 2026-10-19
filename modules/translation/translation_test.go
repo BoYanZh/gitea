@@ -6,7 +6,7 @@ package translation
 import (
 	"testing"
 
-	"code.gitea.io/gitea/modules/translation/i18n"
+	"gitea.dev/modules/translation/i18n"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -20,13 +20,13 @@ func TestPrettyNumber(t *testing.T) {
 	allLangMap["id-ID"] = &LangType{Lang: "id-ID", Name: "Bahasa Indonesia"}
 
 	l := NewLocale("id-ID")
-	assert.EqualValues(t, "1.000.000", l.PrettyNumber(1000000))
-	assert.EqualValues(t, "1.000.000,1", l.PrettyNumber(1000000.1))
-	assert.EqualValues(t, "1.000.000", l.PrettyNumber("1000000"))
-	assert.EqualValues(t, "1.000.000", l.PrettyNumber("1000000.0"))
-	assert.EqualValues(t, "1.000.000,1", l.PrettyNumber("1000000.1"))
+	assert.Equal(t, "1.000.000", l.PrettyNumber(1000000))
+	assert.Equal(t, "1.000.000,1", l.PrettyNumber(1000000.1))
+	assert.Equal(t, "1.000.000", l.PrettyNumber("1000000"))
+	assert.Equal(t, "1.000.000", l.PrettyNumber("1000000.0"))
+	assert.Equal(t, "1.000.000,1", l.PrettyNumber("1000000.1"))
 
 	l = NewLocale("nosuch")
-	assert.EqualValues(t, "1,000,000", l.PrettyNumber(1000000))
-	assert.EqualValues(t, "1,000,000.1", l.PrettyNumber(1000000.1))
+	assert.Equal(t, "1,000,000", l.PrettyNumber(1000000))
+	assert.Equal(t, "1,000,000.1", l.PrettyNumber(1000000.1))
 }

@@ -1,1 +1,1 @@
-<a class="author text black tw-font-semibold muted"{{if gt .ID 0}} href="{{.HomeLink}}"{{end}}>{{.GetDisplayName}}</a>{{if .IsBot}}<span class="ui basic label tw-p-1">bot</span>{{end}}
+<a class="tw-font-semibold"{{if gt .ID 0}} href="{{.HomeLink}}"{{end}}>{{.GetDisplayName}}</a>{{template "shared/user/user_type_label" .}}

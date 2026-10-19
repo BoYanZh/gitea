@@ -5,11 +5,12 @@ package project
 
 import (
 	"fmt"
-	"strings"
+	"math"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/unittest"
+	"gitea.dev/models/db"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/util"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -17,29 +18,29 @@ import (
 func TestGetDefaultColumn(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 
-	projectWithoutDefault, err := GetProjectByID(db.DefaultContext, 5)
+	projectWithoutDefault, err := GetProjectByID(t.Context(), 5)
 	assert.NoError(t, err)
 
 	// check if default column was added
-	column, err := projectWithoutDefault.GetDefaultColumn(db.DefaultContext)
+	column, err := projectWithoutDefault.MustDefaultColumn(t.Context())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(5), column.ProjectID)
-	assert.Equal(t, "Uncategorized", column.Title)
+	assert.Equal(t, "Done", column.Title)
 
-	projectWithMultipleDefaults, err := GetProjectByID(db.DefaultContext, 6)
+	projectWithMultipleDefaults, err := GetProjectByID(t.Context(), 6)
 	assert.NoError(t, err)
 
 	// check if multiple defaults were removed
-	column, err = projectWithMultipleDefaults.GetDefaultColumn(db.DefaultContext)
+	column, err = projectWithMultipleDefaults.MustDefaultColumn(t.Context())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(6), column.ProjectID)
-	assert.Equal(t, int64(9), column.ID)
+	assert.Equal(t, int64(9), column.ID) // there are 2 default columns in the test data, use the latest one
 
 	// set 8 as default column
-	assert.NoError(t, SetDefaultColumn(db.DefaultContext, column.ProjectID, 8))
+	assert.NoError(t, SetDefaultColumn(t.Context(), column.ProjectID, 8))
 
 	// then 9 will become a non-default column
-	column, err = GetColumn(db.DefaultContext, 9)
+	column, err = GetColumn(t.Context(), 9)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(6), column.ProjectID)
 	assert.False(t, column.Default)
@@ -50,25 +51,25 @@ func Test_moveIssuesToAnotherColumn(t *testing.T) {
 
 	column1 := unittest.AssertExistsAndLoadBean(t, &Column{ID: 1, ProjectID: 1})
 
-	issues, err := column1.GetIssues(db.DefaultContext)
+	issues, err := column1.GetIssues(t.Context())
 	assert.NoError(t, err)
 	assert.Len(t, issues, 1)
 	assert.EqualValues(t, 1, issues[0].ID)
 
 	column2 := unittest.AssertExistsAndLoadBean(t, &Column{ID: 2, ProjectID: 1})
-	issues, err = column2.GetIssues(db.DefaultContext)
+	issues, err = column2.GetIssues(t.Context())
 	assert.NoError(t, err)
 	assert.Len(t, issues, 1)
 	assert.EqualValues(t, 3, issues[0].ID)
 
-	err = column1.moveIssuesToAnotherColumn(db.DefaultContext, column2)
+	err = moveIssuesToAnotherColumn(t.Context(), column1, column2)
 	assert.NoError(t, err)
 
-	issues, err = column1.GetIssues(db.DefaultContext)
+	issues, err = column1.GetIssues(t.Context())
 	assert.NoError(t, err)
-	assert.Len(t, issues, 0)
+	assert.Empty(t, issues)
 
-	issues, err = column2.GetIssues(db.DefaultContext)
+	issues, err = column2.GetIssues(t.Context())
 	assert.NoError(t, err)
 	assert.Len(t, issues, 2)
 	assert.EqualValues(t, 3, issues[0].ID)
@@ -81,47 +82,74 @@ func Test_MoveColumnsOnProject(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 
 	project1 := unittest.AssertExistsAndLoadBean(t, &Project{ID: 1})
-	columns, err := project1.GetColumns(db.DefaultContext)
+	columns, err := GetColumns(t.Context(), project1.ID, db.ListOptionsAll)
 	assert.NoError(t, err)
 	assert.Len(t, columns, 3)
 	assert.EqualValues(t, 0, columns[0].Sorting) // even if there is no default sorting, the code should also work
 	assert.EqualValues(t, 0, columns[1].Sorting)
 	assert.EqualValues(t, 0, columns[2].Sorting)
 
-	err = MoveColumnsOnProject(db.DefaultContext, project1, map[int64]int64{
+	err = MoveColumnsOnProject(t.Context(), project1, map[int64]int64{
 		0: columns[1].ID,
 		1: columns[2].ID,
 		2: columns[0].ID,
 	})
 	assert.NoError(t, err)
 
-	columnsAfter, err := project1.GetColumns(db.DefaultContext)
+	columnsAfter, err := GetColumns(t.Context(), project1.ID, db.ListOptionsAll)
 	assert.NoError(t, err)
 	assert.Len(t, columnsAfter, 3)
-	assert.EqualValues(t, columns[1].ID, columnsAfter[0].ID)
-	assert.EqualValues(t, columns[2].ID, columnsAfter[1].ID)
-	assert.EqualValues(t, columns[0].ID, columnsAfter[2].ID)
+	assert.Equal(t, columns[1].ID, columnsAfter[0].ID)
+	assert.Equal(t, columns[2].ID, columnsAfter[1].ID)
+	assert.Equal(t, columns[0].ID, columnsAfter[2].ID)
+
+	err = MoveColumnsOnProject(t.Context(), project1, map[int64]int64{200: columns[0].ID})
+	assert.ErrorIs(t, err, util.ErrUnprocessableContent) // int8 column, 200 would wrap
 }
 
 func Test_NewColumn(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 
 	project1 := unittest.AssertExistsAndLoadBean(t, &Project{ID: 1})
-	columns, err := project1.GetColumns(db.DefaultContext)
+	columns, err := GetColumns(t.Context(), project1.ID, db.ListOptionsAll)
 	assert.NoError(t, err)
 	assert.Len(t, columns, 3)
 
-	for i := 0; i < maxProjectColumns-3; i++ {
-		err := NewColumn(db.DefaultContext, &Column{
+	for i := range maxProjectColumns - 3 {
+		err := NewColumn(t.Context(), &Column{
 			Title:     fmt.Sprintf("column-%d", i+4),
 			ProjectID: project1.ID,
 		})
 		assert.NoError(t, err)
 	}
-	err = NewColumn(db.DefaultContext, &Column{
-		Title:     "column-21",
+	err = NewColumn(t.Context(), &Column{
+		Title:     fmt.Sprintf("column-%d", maxProjectColumns+1),
 		ProjectID: project1.ID,
 	})
 	assert.Error(t, err)
-	assert.True(t, strings.Contains(err.Error(), "maximum number of columns reached"))
+	assert.Contains(t, err.Error(), "maximum number of columns reached")
+}
+
+func Test_ColumnSorting(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	t.Run("appending an issue counts the legacy rows the default column renders", func(t *testing.T) {
+		_, err := db.Exec(t.Context(), "UPDATE `project_issue` SET sorting=9 WHERE project_id=1 AND project_board_id=0")
+		assert.NoError(t, err)
+
+		defaultColumn, err := GetColumn(t.Context(), 1)
+		assert.NoError(t, err)
+		next, err := GetColumnIssueNextSorting(t.Context(), defaultColumn)
+		assert.NoError(t, err)
+		assert.EqualValues(t, 10, next)
+	})
+
+	t.Run("appending a column at the int8 maximum does not wrap to the front", func(t *testing.T) {
+		_, err := db.Exec(t.Context(), "UPDATE `project_board` SET sorting=? WHERE id=3", math.MaxInt8)
+		assert.NoError(t, err)
+
+		appended := &Column{Title: "appended", ProjectID: 1}
+		assert.NoError(t, NewColumn(t.Context(), appended))
+		assert.EqualValues(t, math.MaxInt8, appended.Sorting)
+	})
 }

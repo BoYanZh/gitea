@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"code.gitea.io/gitea/modules/git"
+	"gitea.dev/modules/git"
 )
 
 // PullRequest defines a standard pull request information
@@ -49,8 +49,8 @@ func (p *PullRequest) IsForkPullRequest() bool {
 	return p.Head.RepoFullName() != p.Base.RepoFullName()
 }
 
-// GetGitRefName returns pull request relative path to head
-func (p PullRequest) GetGitRefName() string {
+// GetGitHeadRefName returns pull request relative path to head
+func (p PullRequest) GetGitHeadRefName() string {
 	return fmt.Sprintf("%s%d/head", git.PullPrefix, p.Number)
 }
 

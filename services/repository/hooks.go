@@ -7,12 +7,11 @@ import (
 	"context"
 	"fmt"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/webhook"
-	"code.gitea.io/gitea/modules/gitrepo"
-	"code.gitea.io/gitea/modules/log"
-	repo_module "code.gitea.io/gitea/modules/repository"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/webhook"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
 
 	"xorm.io/builder"
 )
@@ -32,12 +31,13 @@ func SyncRepositoryHooks(ctx context.Context) error {
 			default:
 			}
 
-			if err := repo_module.CreateDelegateHooks(repo.RepoPath()); err != nil {
-				return fmt.Errorf("SyncRepositoryHook: %w", err)
+			if err := git.CreateDelegateHooks(ctx, repo); err != nil {
+				return fmt.Errorf("CreateDelegateHooks: %w", err)
 			}
-			if repo.HasWiki() {
-				if err := repo_module.CreateDelegateHooks(repo.WikiPath()); err != nil {
-					return fmt.Errorf("SyncRepositoryHook: %w", err)
+
+			if HasWiki(ctx, repo) {
+				if err := git.CreateDelegateHooks(ctx, repo.WikiStorageRepo()); err != nil {
+					return fmt.Errorf("CreateDelegateHooks: %w", err)
 				}
 			}
 			return nil
@@ -52,25 +52,25 @@ func SyncRepositoryHooks(ctx context.Context) error {
 
 // GenerateGitHooks generates git hooks from a template repository
 func GenerateGitHooks(ctx context.Context, templateRepo, generateRepo *repo_model.Repository) error {
-	generateGitRepo, err := gitrepo.OpenRepository(ctx, generateRepo)
+	generateGitRepo, err := git.OpenRepository(ctx, generateRepo)
 	if err != nil {
 		return err
 	}
 	defer generateGitRepo.Close()
 
-	templateGitRepo, err := gitrepo.OpenRepository(ctx, templateRepo)
+	templateGitRepo, err := git.OpenRepository(ctx, templateRepo)
 	if err != nil {
 		return err
 	}
 	defer templateGitRepo.Close()
 
-	templateHooks, err := templateGitRepo.Hooks()
+	templateHooks, err := git.ListHooks(templateGitRepo)
 	if err != nil {
 		return err
 	}
 
 	for _, templateHook := range templateHooks {
-		generateHook, err := generateGitRepo.GetHook(templateHook.Name())
+		generateHook, err := git.GetHook(generateGitRepo, templateHook.Name())
 		if err != nil {
 			return err
 		}

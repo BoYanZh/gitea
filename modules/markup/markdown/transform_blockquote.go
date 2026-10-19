@@ -6,7 +6,7 @@ package markdown
 import (
 	"strings"
 
-	"code.gitea.io/gitea/modules/svg"
+	"gitea.dev/modules/svg"
 
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/text"
@@ -18,7 +18,7 @@ import (
 // renderAttention renders a quote marked with i.e. "> **Note**" or "> [!Warning]" with a corresponding svg
 func (r *HTMLRenderer) renderAttention(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		n := node.(*Attention)
+		n := node.(*Attention) //nolint:forcetypeassert // registered for KindAttention only
 		var octiconName string
 		switch n.AttentionType {
 		case "tip":
@@ -32,7 +32,8 @@ func (r *HTMLRenderer) renderAttention(w util.BufWriter, source []byte, node ast
 		default: // including "note"
 			octiconName = "info"
 		}
-		_, _ = w.WriteString(string(svg.RenderHTML("octicon-"+octiconName, 16, "attention-icon attention-"+n.AttentionType)))
+		svgHTML := svg.RenderHTML("octicon-"+octiconName, 16, "attention-icon attention-"+n.AttentionType)
+		_, _ = w.WriteString(string(r.renderInternal.ProtectSafeAttrs(svgHTML)))
 	}
 	return ast.WalkContinue, nil
 }
@@ -45,7 +46,10 @@ func (g *ASTTransformer) extractBlockquoteAttentionEmphasis(firstParagraph ast.N
 	if !ok {
 		return "", nil
 	}
-	val1 := string(node1.Text(reader.Source())) //nolint:staticcheck
+	val1, ok := childSingleText(node1, reader.Source())
+	if !ok {
+		return "", nil
+	}
 	attentionType := strings.ToLower(val1)
 	if g.attentionTypes.Contains(attentionType) {
 		return attentionType, []ast.Node{node1}
@@ -58,7 +62,7 @@ func (g *ASTTransformer) extractBlockquoteAttention2(firstParagraph ast.Node, re
 		return "", nil
 	}
 	node1, ok := firstParagraph.FirstChild().(*ast.Text)
-	if !ok {
+	if !ok || node1.SoftLineBreak() || node1.HardLineBreak() {
 		return "", nil
 	}
 	node2, ok := node1.NextSibling().(*ast.Text)
@@ -67,8 +71,9 @@ func (g *ASTTransformer) extractBlockquoteAttention2(firstParagraph ast.Node, re
 	}
 	val1 := string(node1.Segment.Value(reader.Source()))
 	val2 := string(node2.Segment.Value(reader.Source()))
-	if strings.HasPrefix(val1, `\[!`) && val2 == `\]` {
-		attentionType := strings.ToLower(val1[3:])
+	// Inline math options change where Goldmark splits the escaped marker.
+	if inner, ok := strings.CutPrefix(val1+val2, `\[!`); ok && strings.HasSuffix(val2, `\]`) {
+		attentionType := strings.ToLower(strings.TrimSuffix(inner, `\]`))
 		if g.attentionTypes.Contains(attentionType) {
 			return attentionType, []ast.Node{node1, node2}
 		}
@@ -114,6 +119,9 @@ func (g *ASTTransformer) transformBlockquote(v *ast.Blockquote, reader text.Read
 
 	// grab these nodes and make sure we adhere to the attention blockquote structure
 	firstParagraph := v.FirstChild()
+	if firstParagraph == nil {
+		return ast.WalkContinue, nil
+	}
 	g.applyElementDir(firstParagraph)
 
 	attentionType, processedNodes := g.extractBlockquoteAttentionEmphasis(firstParagraph, reader)
@@ -128,13 +136,13 @@ func (g *ASTTransformer) transformBlockquote(v *ast.Blockquote, reader text.Read
 	}
 
 	// color the blockquote
-	v.SetAttributeString("class", []byte("attention-header attention-"+attentionType))
+	v.SetAttributeString(g.renderInternal.SafeAttr("class"), []byte(g.renderInternal.SafeValue("attention-header attention-"+attentionType)))
 
 	// create an emphasis to make it bold
 	attentionParagraph := ast.NewParagraph()
 	g.applyElementDir(attentionParagraph)
 	emphasis := ast.NewEmphasis(2)
-	emphasis.SetAttributeString("class", []byte("attention-"+attentionType))
+	emphasis.SetAttributeString(g.renderInternal.SafeAttr("class"), []byte(g.renderInternal.SafeValue("attention-"+attentionType)))
 
 	attentionAstString := ast.NewString([]byte(cases.Title(language.English).String(attentionType)))
 

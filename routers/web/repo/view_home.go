@@ -1,0 +1,537 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/citation"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/htmlutil"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/svg"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers/web/feed"
+	"gitea.dev/services/context"
+	repo_service "gitea.dev/services/repository"
+)
+
+func checkOutdatedBranch(ctx *context.Context) {
+	if !(ctx.Repo.Permission.IsAdmin() || ctx.Repo.Permission.IsOwner()) {
+		return
+	}
+	if !ctx.Repo.RefFullName.IsBranch() {
+		return
+	}
+
+	dbBranch, err := git_model.GetBranchExisting(ctx, ctx.Repo.Repository.ID, ctx.Repo.RefFullName.ShortName())
+	if err != nil {
+		return // ignore the error which can only be "not exists"
+	}
+
+	if dbBranch.CommitID != ctx.Repo.CommitID {
+		ctx.Flash.Warning(ctx.Tr("repo.error.broken_git_hook", "https://docs.gitea.com/help/faq#push-hook--webhook--actions-arent-running"), true)
+	}
+}
+
+func prepareHomeSidebarRepoTopics(ctx *context.Context) {
+	topics, err := db.Find[repo_model.Topic](ctx, &repo_model.FindTopicOptions{
+		RepoID: ctx.Repo.Repository.ID,
+	})
+	if err != nil {
+		ctx.ServerError("models.FindTopics", err)
+		return
+	}
+	ctx.Data["Topics"] = topics
+}
+
+func prepareClonePanel(ctx *context.Context) {
+	var tmplApps []map[string]any
+	apps := setting.Config().Repository.OpenWithEditorApps.Value(ctx)
+	for _, app := range apps {
+		schema, _, _ := strings.Cut(app.OpenURL, ":")
+
+		var iconName string
+		switch schema {
+		case "vscode":
+			iconName = "octicon-vscode"
+		case "vscodium":
+			iconName = "gitea-vscodium"
+		case "jetbrains":
+			iconName = "gitea-jetbrains"
+		default:
+			// TODO: it could support user's customized icon in the future
+			iconName = "gitea-git"
+		}
+
+		tmplApps = append(tmplApps, map[string]any{
+			"DisplayName": app.DisplayName,
+			"OpenURL":     app.OpenURL,
+			"IconHTML":    svg.RenderHTML(iconName, 16),
+		})
+	}
+	ctx.Data["OpenWithEditorApps"] = tmplApps
+
+	if !setting.Repository.DisableDownloadSourceArchives {
+		// FIXME: here it only uses the shortname in the ref to build the link, it can't distinguish the branch/tag/commit with the same name
+		// in the future, it's better to use something like "/archive/branch/the-name.zip", "/archive/tag/the-name.zip" */}}
+		ctx.Data["DownloadArchiveLinkPrefix"] = ctx.Repo.RepoLink + "/archive/" + util.PathEscapeSegments(ctx.Repo.RefFullName.ShortName())
+	}
+}
+
+func prepareHomeSidebarCitationFile(ctx *context.Context) {
+	allEntries, err := ctx.Repo.Commit.Tree().ListEntries(ctx, ctx.Repo.GitRepo)
+	if err != nil {
+		ctx.ServerError("ListEntries", err)
+		return
+	}
+	isBlobSupported := func(entry *git.TreeEntry) bool {
+		return entry.IsRegular() || entry.IsExecutable() || entry.IsLink()
+	}
+	const nameCff = "CITATION.cff"
+	const nameBib = "CITATION.bib"
+	for _, name := range []string{nameCff, nameBib} {
+		idx := slices.IndexFunc(allEntries, func(entry *git.TreeEntry) bool {
+			return isBlobSupported(entry) && util.AsciiEqualFold(entry.Name(), name)
+		})
+		if idx == -1 {
+			continue
+		}
+		entry := allEntries[idx]
+		if entry.IsLink() {
+			res, err := git.EntryFollowLinks(ctx, ctx.Repo.GitRepo, ctx.Repo.Commit, entry.Name(), entry)
+			if err != nil || !isBlobSupported(res.TargetEntry) {
+				continue
+			}
+			entry = res.TargetEntry
+		}
+		content, err := entry.Blob(ctx.Repo.GitRepo).GetBlobContent(ctx, citation.MaxContentSize+1)
+		if err != nil {
+			log.Error("prepareHomeSidebarCitationFile: GetBlobContent: %v", err)
+			continue
+		}
+		apa, bibtex := "", content
+		if name == nameCff {
+			apa, bibtex = citation.FormatCFF(content)
+		}
+		if citation.IsLikelyBibTeX(bibtex) {
+			ctx.Data["CitationFileName"] = allEntries[idx].Name()
+			ctx.Data["CitationAPA"] = apa
+			ctx.Data["CitationBibTeX"] = bibtex
+			return
+		}
+	}
+}
+
+type licenseGroup struct {
+	LicensePath  string
+	LicenseNames []string
+}
+
+func prepareHomeSidebarLicenses(ctx *context.Context) {
+	repoLicenses, err := repo_model.GetUniqueRepoLicenses(ctx, ctx.Repo.Repository)
+	if err != nil {
+		ctx.ServerError("GetRepoLicenses", err)
+		return
+	}
+	if len(repoLicenses) == 0 {
+		return
+	}
+
+	order := make([]string, 0)
+	groups := make(map[string]*licenseGroup)
+	for _, rl := range repoLicenses {
+		if _, ok := groups[rl.LicensePath]; !ok {
+			groups[rl.LicensePath] = &licenseGroup{LicensePath: rl.LicensePath}
+			order = append(order, rl.LicensePath)
+		}
+		groups[rl.LicensePath].LicenseNames = append(groups[rl.LicensePath].LicenseNames, rl.License)
+	}
+
+	result := make([]licenseGroup, 0, len(order))
+	for _, path := range order {
+		result = append(result, *groups[path])
+	}
+	ctx.Data["LicenseGroups"] = result
+}
+
+func prepareToRenderDirectory(ctx *context.Context) {
+	treeEntry, subEntries := renderDirectoryFiles(ctx, 1*time.Second)
+	if ctx.Written() {
+		return
+	}
+
+	if ctx.Repo.TreePath != "" {
+		ctx.Data["HideRepoInfo"] = true
+		ctx.Data["Title"] = ctx.Tr("repo.file.title", ctx.Repo.Repository.Name+"/"+ctx.Repo.TreePath, ctx.Repo.RefFullName.ShortName())
+	}
+
+	subfolder, readmeFile, err := findReadmeFileInRepoTree(ctx, ctx.Repo.TreePath, treeEntry, subEntries)
+	if err != nil {
+		ctx.ServerError("findReadmeFileInRepo", err)
+		return
+	}
+	prepareToRenderReadmeFile(ctx, subfolder, readmeFile)
+}
+
+func prepareHomeSidebarLanguageStats(ctx *context.Context) {
+	langs, err := repo_model.GetTopLanguageStats(ctx, ctx.Repo.Repository, 5)
+	if err != nil {
+		ctx.ServerError("Repo.GetTopLanguageStats", err)
+		return
+	}
+
+	ctx.Data["LanguageStats"] = langs
+}
+
+func prepareHomeSidebarLatestRelease(ctx *context.Context) {
+	if !ctx.Repo.Repository.UnitEnabled(ctx, unit_model.TypeReleases) {
+		return
+	}
+
+	release, err := repo_model.GetLatestReleaseByRepoID(ctx, ctx.Repo.Repository.ID)
+	if err != nil && !repo_model.IsErrReleaseNotExist(err) {
+		ctx.ServerError("GetLatestReleaseByRepoID", err)
+		return
+	}
+
+	if release != nil {
+		if err = release.LoadAttributes(ctx); err != nil {
+			ctx.ServerError("release.LoadAttributes", err)
+			return
+		}
+		ctx.Data["LatestRelease"] = release
+	}
+}
+
+func prepareUpstreamDivergingInfo(ctx *context.Context) {
+	if !ctx.Repo.Repository.IsFork || !ctx.Repo.RefFullName.IsBranch() || ctx.Repo.TreePath != "" {
+		return
+	}
+	upstreamDivergingInfo, err := repo_service.GetUpstreamDivergingInfo(ctx, ctx.Repo.Repository, ctx.Repo.BranchName)
+	if err != nil {
+		if !errors.Is(err, util.ErrNotExist) && !errors.Is(err, util.ErrInvalidArgument) {
+			log.Error("GetUpstreamDivergingInfo: %v", err)
+		}
+		return
+	}
+	ctx.Data["UpstreamDivergingInfo"] = upstreamDivergingInfo
+}
+
+func updateContextRepoEmptyAndStatus(ctx *context.Context, empty bool, status repo_model.RepositoryStatus) {
+	if ctx.Repo.Repository.IsEmpty == empty && ctx.Repo.Repository.Status == status {
+		return
+	}
+	ctx.Repo.Repository.IsEmpty = empty
+	if ctx.Repo.Repository.Status == repo_model.RepositoryReady || ctx.Repo.Repository.Status == repo_model.RepositoryBroken {
+		ctx.Repo.Repository.Status = status // only handle ready and broken status, leave other status as-is
+	}
+	if err := repo_model.UpdateRepositoryColsNoAutoTime(ctx, ctx.Repo.Repository, "is_empty", "status"); err != nil {
+		ctx.ServerError("updateContextRepoEmptyAndStatus: UpdateRepositoryCols", err)
+		return
+	}
+}
+
+func handleRepoEmptyOrBroken(ctx *context.Context) {
+	showEmpty := true
+	if ctx.Repo.GitRepo == nil {
+		// in case the repo really exists and works, but the status was incorrectly marked as "broken", we need to open and check it again
+		ctx.Repo.GitRepo, _ = git.RepositoryFromRequestContextOrOpen(ctx, ctx.Repo.Repository)
+	}
+	if ctx.Repo.GitRepo != nil {
+		reallyEmpty, err := ctx.Repo.GitRepo.IsEmpty(ctx)
+		if err != nil {
+			showEmpty = true // the repo is broken
+			updateContextRepoEmptyAndStatus(ctx, true, repo_model.RepositoryBroken)
+			log.Error("GitRepo.IsEmpty: %v", err)
+			ctx.Flash.Error(ctx.Tr("error.occurred"), true)
+		} else if reallyEmpty {
+			showEmpty = true // the repo is really empty
+			updateContextRepoEmptyAndStatus(ctx, true, repo_model.RepositoryReady)
+		} else if branches, _, _ := ctx.Repo.GitRepo.GetBranchNames(ctx, 0, 1); len(branches) == 0 {
+			showEmpty = true // it is not really empty, but there is no branch
+			// at the moment, other repo units like "actions" are not able to handle such case,
+			// so we just mark the repo as empty to prevent from displaying these units.
+			ctx.Data["RepoHasContentsWithoutBranch"] = true
+			updateContextRepoEmptyAndStatus(ctx, true, repo_model.RepositoryReady)
+		} else {
+			// the repo is actually not empty and has branches, need to update the database later
+			showEmpty = false
+		}
+	}
+	if showEmpty {
+		ctx.HTML(http.StatusOK, tplRepoEMPTY)
+		return
+	}
+
+	// The repo is not really empty, so we should update the model in database, such problem may be caused by:
+	// 1) an error occurs during pushing/receiving.
+	// 2) the user replaces an empty git repo manually.
+	updateContextRepoEmptyAndStatus(ctx, false, repo_model.RepositoryReady)
+	if err := repo_module.UpdateRepoSize(ctx, ctx.Repo.Repository); err != nil {
+		ctx.ServerError("UpdateRepoSize", err)
+		return
+	}
+
+	// the repo's IsEmpty has been updated, redirect to this page to make sure middlewares can get the correct values
+	link := ctx.Link
+	if ctx.Req.URL.RawQuery != "" {
+		link += "?" + ctx.Req.URL.RawQuery
+	}
+	ctx.Redirect(link)
+}
+
+func isViewHomeOnlyContent(ctx *context.Context) bool {
+	return ctx.FormBool("only_content")
+}
+
+func handleRepoViewSubmodule(ctx *context.Context, commitSubmoduleFile *git.CommitSubmoduleFile) {
+	submoduleWebLink := commitSubmoduleFile.SubmoduleWebLinkTree(ctx)
+	if submoduleWebLink == nil {
+		ctx.Data["NotFoundPrompt"] = ctx.Repo.TreePath
+		ctx.NotFound(nil)
+		return
+	}
+
+	redirectLink := submoduleWebLink.CommitWebLink
+	if isViewHomeOnlyContent(ctx) {
+		ctx.Resp.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = htmlutil.HTMLPrintf(ctx.Resp, `<a href="%s">%s</a>`, redirectLink, redirectLink)
+	} else if !httplib.IsCurrentGiteaSiteURL(ctx, redirectLink) {
+		// don't auto-redirect to external URL, to avoid open redirect or phishing
+		ctx.Data["NotFoundPrompt"] = redirectLink
+		ctx.NotFound(nil)
+	} else {
+		ctx.RedirectToCurrentSite(redirectLink)
+	}
+}
+
+func prepareToRenderDirOrFile(entry *git.TreeEntry) func(ctx *context.Context) {
+	return func(ctx *context.Context) {
+		if entry.IsSubModule() {
+			commitSubmoduleFile, err := git.GetCommitInfoSubmoduleFile(ctx, ctx.Repo.RepoLink, ctx.Repo.TreePath, ctx.Repo.GitRepo, ctx.Repo.Commit, entry.ID)
+			if err != nil {
+				HandleGitError(ctx, "prepareToRenderDirOrFile: GetCommitInfoSubmoduleFile", err)
+				return
+			}
+			handleRepoViewSubmodule(ctx, commitSubmoduleFile)
+		} else if entry.IsDir() {
+			prepareToRenderDirectory(ctx)
+		} else {
+			prepareFileView(ctx, entry)
+		}
+	}
+}
+
+func handleRepoHomeFeed(ctx *context.Context) bool {
+	if !setting.Other.EnableFeed {
+		return false
+	}
+	isFeed, showFeedType := feed.GetFeedType(ctx.PathParam("reponame"), ctx.Req)
+	if !isFeed {
+		return false
+	}
+	if ctx.Link == fmt.Sprintf("%s.%s", ctx.Repo.RepoLink, showFeedType) {
+		feed.ShowRepoFeed(ctx, ctx.Repo.Repository, showFeedType)
+	} else if ctx.Repo.TreePath == "" {
+		feed.ShowBranchFeed(ctx, ctx.Repo.Repository, showFeedType)
+	} else {
+		feed.ShowFileFeed(ctx, ctx.Repo.Repository, showFeedType)
+	}
+	return true
+}
+
+func prepareHomeTreeSideBarSwitch(ctx *context.Context) {
+	showFileTree := true
+	if ctx.Doer != nil {
+		v, err := user_model.GetUserSetting(ctx, ctx.Doer.ID, user_model.SettingsKeyCodeViewShowFileTree, "true")
+		if err != nil {
+			log.Error("GetUserSetting: %v", err)
+		} else {
+			showFileTree, _ = strconv.ParseBool(v)
+		}
+	}
+	ctx.Data["UserSettingCodeViewShowFileTree"] = showFileTree
+}
+
+func redirectSrcToRaw(ctx *context.Context) bool {
+	// GitHub redirects a tree path with "?raw=1" to the raw path
+	// It is useful to embed some raw contents into Markdown files,
+	// then viewing the Markdown in "src" path could embed the raw content correctly.
+	if ctx.Repo.TreePath != "" && ctx.FormBool("raw") {
+		ctx.Redirect(ctx.Repo.RepoLink + "/raw/" + ctx.Repo.RefTypeNameSubURL() + "/" + util.PathEscapeSegments(ctx.Repo.TreePath))
+		return true
+	}
+	return false
+}
+
+func redirectFollowSymlink(ctx *context.Context, treePathEntry *git.TreeEntry) bool {
+	if ctx.Repo.TreePath == "" || !ctx.FormBool("follow_symlink") {
+		return false
+	}
+	if treePathEntry.IsLink() {
+		res, err := git.EntryFollowLinks(ctx, ctx.Repo.GitRepo, ctx.Repo.Commit, ctx.Repo.TreePath, treePathEntry)
+		if err == nil {
+			redirect := ctx.Repo.RepoLink + "/src/" + ctx.Repo.RefTypeNameSubURL() + "/" + util.PathEscapeSegments(res.TargetFullPath) + "?" + ctx.Req.URL.RawQuery
+			ctx.Redirect(redirect)
+			return true
+		} // else: don't handle the links we cannot resolve, so ignore the error
+	}
+	return false
+}
+
+func prepareRepoViewContent(ctx *context.Context, refTypeNameSubURL string) {
+	// for: home, file list, file view, blame
+	ctx.Data["PageIsViewCode"] = true
+	ctx.Data["RepositoryUploadEnabled"] = setting.Repository.Upload.Enabled // show Upload File button or menu item
+
+	// prepare the tree path navigation
+	var treeNames, paths []string
+	branchLink := ctx.Repo.RepoLink + "/src/" + refTypeNameSubURL
+	treeLink := branchLink
+	if ctx.Repo.TreePath != "" {
+		treeLink += "/" + util.PathEscapeSegments(ctx.Repo.TreePath)
+		treeNames = strings.Split(ctx.Repo.TreePath, "/")
+		for i := range treeNames {
+			paths = append(paths, strings.Join(treeNames[:i+1], "/"))
+		}
+		ctx.Data["HasParentPath"] = true
+		if len(paths)-2 >= 0 {
+			ctx.Data["ParentPath"] = "/" + paths[len(paths)-2]
+		}
+	}
+	ctx.Data["Paths"] = paths
+	ctx.Data["TreeLink"] = treeLink
+	ctx.Data["TreeNames"] = treeNames
+	ctx.Data["BranchLink"] = branchLink
+}
+
+// Home render repository home page
+func Home(ctx *context.Context) {
+	if handleRepoHomeFeed(ctx) {
+		return
+	}
+	if redirectSrcToRaw(ctx) {
+		return
+	}
+
+	// a scoped or public-only API token authenticating this web request must still satisfy
+	// the repository read scope before private repo content is served
+	context.CheckRepoScopedToken(ctx, auth_model.Read)
+	if ctx.Written() {
+		return
+	}
+
+	// Check whether the repo is viewable: not in migration, and the code unit should be enabled
+	// Ideally the "feed" logic should be after this, but old code did so, so keep it as-is.
+	checkHomeCodeViewable(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	title := ctx.Repo.Repository.Owner.Name + "/" + ctx.Repo.Repository.Name
+	if ctx.Repo.Repository.Description != "" {
+		title += ": " + ctx.Repo.Repository.Description
+	}
+	ctx.Data["Title"] = title
+	prepareRepoViewContent(ctx, ctx.Repo.RefTypeNameSubURL())
+
+	if ctx.Repo.Commit == nil || ctx.Repo.Repository.IsEmpty || ctx.Repo.Repository.IsBroken() {
+		// empty or broken repositories need to be handled differently
+		handleRepoEmptyOrBroken(ctx)
+		return
+	}
+
+	prepareHomeTreeSideBarSwitch(ctx)
+
+	// get the current git entry which doer user is currently looking at.
+	entry, err := ctx.Repo.Commit.GetTreeEntryByPath(ctx, ctx.Repo.GitRepo, ctx.Repo.TreePath)
+	if err != nil {
+		HandleGitError(ctx, "Repo.Commit.GetTreeEntryByPath", err)
+		return
+	}
+
+	if redirectFollowSymlink(ctx, entry) {
+		return
+	}
+
+	// some UI components are only shown when the tree path is root
+	isTreePathRoot := ctx.Repo.TreePath == ""
+
+	prepareFuncs := []func(*context.Context){
+		prepareClonePanel,
+		prepareHomeSidebarRepoTopics,
+		prepareToRenderDirOrFile(entry),
+		prepareRecentlyPushedNewBranches,
+	}
+
+	if isTreePathRoot {
+		prepareFuncs = append(prepareFuncs,
+			checkOutdatedBranch,
+			prepareUpstreamDivergingInfo,
+			prepareHomeSidebarLicenses,
+			prepareHomeSidebarCitationFile,
+			prepareHomeSidebarLanguageStats,
+			prepareHomeSidebarLatestRelease,
+		)
+	}
+
+	for _, prepare := range prepareFuncs {
+		prepare(ctx)
+		if ctx.Written() {
+			return
+		}
+	}
+
+	if isViewHomeOnlyContent(ctx) {
+		ctx.HTML(http.StatusOK, tplRepoViewContent)
+	} else if ctx.Repo.TreePath != "" {
+		ctx.HTML(http.StatusOK, tplRepoView)
+	} else {
+		ctx.HTML(http.StatusOK, tplRepoHome)
+	}
+}
+
+func RedirectRepoTreeToSrc(ctx *context.Context) {
+	// Redirect "/owner/repo/tree/*" requests to "/owner/repo/src/*",
+	// then use the deprecated "/src/*" handler to guess the ref type and render a file list page.
+	// This is done intentionally so that Gitea's repo URL structure matches other forges (GitHub/GitLab) provide,
+	// allowing us to construct submodule URLs across forges easily.
+	// For example, when viewing a submodule, we can simply construct the link as:
+	// * "https://gitea/owner/repo/tree/{CommitID}"
+	// * "https://github/owner/repo/tree/{CommitID}"
+	// * "https://gitlab/owner/repo/tree/{CommitID}"
+	// Then no matter which forge the submodule is using, the link works.
+	redirect := ctx.Repo.RepoLink + "/src/" + ctx.PathParamRaw("*")
+	if ctx.Req.URL.RawQuery != "" {
+		redirect += "?" + ctx.Req.URL.RawQuery
+	}
+	ctx.Redirect(redirect)
+}
+
+func RedirectRepoBlobToCommit(ctx *context.Context) {
+	// redirect "/owner/repo/blob/*" requests to "/owner/repo/src/commit/*"
+	// just like GitHub: browse files of a commit by "https://github/owner/repo/blob/{CommitID}"
+	// TODO: maybe we could guess more types to redirect to the related pages in the future
+	redirect := ctx.Repo.RepoLink + "/src/commit/" + ctx.PathParamRaw("*")
+	if ctx.Req.URL.RawQuery != "" {
+		redirect += "?" + ctx.Req.URL.RawQuery
+	}
+	ctx.Redirect(redirect)
+}

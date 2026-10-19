@@ -5,10 +5,9 @@ package markdown
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 
-	"code.gitea.io/gitea/modules/markup"
+	"gitea.dev/modules/markup"
 
 	"github.com/microcosm-cc/bluemonday/css"
 	"github.com/yuin/goldmark/ast"
@@ -40,7 +39,7 @@ func (r *HTMLRenderer) renderCodeSpan(w util.BufWriter, source []byte, n ast.Nod
 					r.Writer.RawWrite(w, value)
 				}
 			case *ColorPreview:
-				_, _ = w.WriteString(fmt.Sprintf(`<span class="color-preview" style="background-color: %v"></span>`, string(v.Color)))
+				_ = r.renderInternal.FormatWithSafeAttrs(w, `<span class="color-preview" style="background-color: %s"></span>`, v.Color)
 			}
 		}
 		return ast.WalkSkipChildren, nil
@@ -69,8 +68,11 @@ func cssColorHandler(value string) bool {
 }
 
 func (g *ASTTransformer) transformCodeSpan(_ *markup.RenderContext, v *ast.CodeSpan, reader text.Reader) {
-	colorContent := v.Text(reader.Source()) //nolint:staticcheck
-	if cssColorHandler(string(colorContent)) {
+	colorContent, ok := childSingleText(v, reader.Source())
+	if !ok {
+		return
+	}
+	if cssColorHandler(colorContent) {
 		v.AppendChild(v, NewColorPreview(colorContent))
 	}
 }

@@ -18,7 +18,9 @@ func TestSet(t *testing.T) {
 
 	assert.True(t, s.Contains("key1"))
 	assert.True(t, s.Contains("key2"))
+	assert.True(t, s.Contains("key1", "key2"))
 	assert.False(t, s.Contains("key3"))
+	assert.False(t, s.Contains("key1", "key3"))
 
 	assert.True(t, s.Remove("key2"))
 	assert.False(t, s.Contains("key2"))
@@ -33,4 +35,14 @@ func TestSet(t *testing.T) {
 	assert.False(t, s.Contains("key1"))
 	assert.True(t, s.Contains("key6"))
 	assert.True(t, s.Contains("key7"))
+
+	s = SetOf("a", "b", "c")
+	n := s.RemoveFromSet(SetOf("b", "c", "d"))
+	assert.Equal(t, 2, n)
+	assert.ElementsMatch(t, []string{"a"}, s.Values())
+
+	s = SetOf("a", "b", "c")
+	n = s.RemoveFromSlice([]string{"b", "c", "d"})
+	assert.Equal(t, 2, n)
+	assert.ElementsMatch(t, []string{"a"}, s.Values())
 }

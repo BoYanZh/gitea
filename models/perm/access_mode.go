@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"slices"
 
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/util"
 )
 
 // AccessMode specifies the users access mode
@@ -60,3 +60,6 @@ func ParseAccessMode(permission string, allowed ...AccessMode) AccessMode {
 	}
 	return util.Iif(slices.Contains(allowed, m), m, AccessModeNone)
 }
+
+// ErrInvalidAccessMode is returned when an invalid access mode is used
+var ErrInvalidAccessMode = util.NewInvalidArgumentErrorf("Invalid access mode")

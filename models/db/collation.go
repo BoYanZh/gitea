@@ -8,11 +8,10 @@ import (
 	"fmt"
 	"strings"
 
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
 
-	"xorm.io/xorm"
 	"xorm.io/xorm/schemas"
 )
 
@@ -27,7 +26,7 @@ type CheckCollationsResult struct {
 	InconsistentCollationColumns []string
 }
 
-func findAvailableCollationsMySQL(x *xorm.Engine) (ret container.Set[string], err error) {
+func findAvailableCollationsMySQL(x EngineMigration) (ret container.Set[string], err error) {
 	var res []struct {
 		Collation string
 	}
@@ -41,7 +40,7 @@ func findAvailableCollationsMySQL(x *xorm.Engine) (ret container.Set[string], er
 	return ret, nil
 }
 
-func findAvailableCollationsMSSQL(x *xorm.Engine) (ret container.Set[string], err error) {
+func findAvailableCollationsMSSQL(x EngineMigration) (ret container.Set[string], err error) {
 	var res []struct {
 		Name string
 	}
@@ -55,7 +54,7 @@ func findAvailableCollationsMSSQL(x *xorm.Engine) (ret container.Set[string], er
 	return ret, nil
 }
 
-func CheckCollations(x *xorm.Engine) (*CheckCollationsResult, error) {
+func CheckCollations(x EngineMigration) (*CheckCollationsResult, error) {
 	dbTables, err := x.DBMetas()
 	if err != nil {
 		return nil, err
@@ -68,7 +67,8 @@ func CheckCollations(x *xorm.Engine) (*CheckCollationsResult, error) {
 
 	var candidateCollations []string
 	if x.Dialect().URI().DBType == schemas.MYSQL {
-		if _, err = x.SQL("SELECT @@collation_database").Get(&res.DatabaseCollation); err != nil {
+		_, err = x.SQL("SELECT DEFAULT_COLLATION_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?", setting.Database.Name).Get(&res.DatabaseCollation)
+		if err != nil {
 			return nil, err
 		}
 		res.IsCollationCaseSensitive = func(s string) bool {
@@ -97,7 +97,7 @@ func CheckCollations(x *xorm.Engine) (*CheckCollationsResult, error) {
 			return nil, err
 		}
 	} else {
-		return nil, nil
+		return nil, nil //nolint:nilnil // return nil for unsupported database types
 	}
 
 	if res.DatabaseCollation == "" {
@@ -139,10 +139,10 @@ func CheckCollations(x *xorm.Engine) (*CheckCollationsResult, error) {
 }
 
 func CheckCollationsDefaultEngine() (*CheckCollationsResult, error) {
-	return CheckCollations(x)
+	return CheckCollations(xormEngine)
 }
 
-func alterDatabaseCollation(x *xorm.Engine, collation string) error {
+func alterDatabaseCollation(x EngineMigration, collation string) error {
 	if x.Dialect().URI().DBType == schemas.MYSQL {
 		_, err := x.Exec("ALTER DATABASE CHARACTER SET utf8mb4 COLLATE " + collation)
 		return err
@@ -155,7 +155,7 @@ func alterDatabaseCollation(x *xorm.Engine, collation string) error {
 }
 
 // preprocessDatabaseCollation checks database & table column collation, and alter the database collation if needed
-func preprocessDatabaseCollation(x *xorm.Engine) {
+func preprocessDatabaseCollation(x EngineMigration) {
 	r, err := CheckCollations(x)
 	if err != nil {
 		log.Error("Failed to check database collation: %v", err)

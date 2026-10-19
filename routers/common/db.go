@@ -5,17 +5,16 @@ package common
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/migrations"
-	system_model "code.gitea.io/gitea/models/system"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/setting/config"
-
-	"xorm.io/xorm"
+	"gitea.dev/modelmigration"
+	"gitea.dev/models/db"
+	system_model "gitea.dev/models/system"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/setting/config"
+	"gitea.dev/services/versioned_migration"
 )
 
 // InitDBEngine In case of problems connecting to DB, retry connection. Eg, PGSQL in Docker Container on Synology
@@ -24,7 +23,7 @@ func InitDBEngine(ctx context.Context) (err error) {
 	for i := 0; i < setting.Database.DBConnectRetries; i++ {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("Aborted due to shutdown:\nin retry ORM engine initialization")
+			return errors.New("Aborted due to shutdown:\nin retry ORM engine initialization")
 		default:
 		}
 		log.Info("ORM engine initialization attempt #%d/%d...", i+1, setting.Database.DBConnectRetries)
@@ -41,17 +40,17 @@ func InitDBEngine(ctx context.Context) (err error) {
 	return nil
 }
 
-func migrateWithSetting(x *xorm.Engine) error {
+func migrateWithSetting(ctx context.Context, x db.EngineMigration) error {
 	if setting.Database.AutoMigration {
-		return migrations.Migrate(x)
+		return versioned_migration.Migrate(ctx, x)
 	}
 
-	if current, err := migrations.GetCurrentDBVersion(x); err != nil {
+	if current, err := modelmigration.GetCurrentDBVersion(x); err != nil {
 		return err
 	} else if current < 0 {
 		// execute migrations when the database isn't initialized even if AutoMigration is false
-		return migrations.Migrate(x)
-	} else if expected := migrations.ExpectedDBVersion(); current != expected {
+		return versioned_migration.Migrate(ctx, x)
+	} else if expected := modelmigration.ExpectedDBVersion(); current != expected {
 		log.Fatal(`"database.AUTO_MIGRATION" is disabled, but current database version %d is not equal to the expected version %d.`+
 			`You can set "database.AUTO_MIGRATION" to true or migrate manually by running "gitea [--config /path/to/app.ini] migrate"`, current, expected)
 	}

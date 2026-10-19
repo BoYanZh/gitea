@@ -4,45 +4,41 @@
 package migrations
 
 import (
-	"context"
-	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
-	base "code.gitea.io/gitea/modules/migration"
+	"gitea.dev/models/unittest"
+	base "gitea.dev/modules/migration"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestGogsDownloadRepo(t *testing.T) {
-	// Skip tests if Gogs token is not found
-	gogsPersonalAccessToken := os.Getenv("GOGS_READ_TOKEN")
-	if len(gogsPersonalAccessToken) == 0 {
-		t.Skip("skipped test because GOGS_READ_TOKEN was not in the environment")
-	}
+	token := os.Getenv("GOGS_READ_TOKEN")
+	liveMode := token != ""
 
-	resp, err := http.Get("https://try.gogs.io/lunnytest/TESTREPO")
-	if err != nil || resp.StatusCode/100 != 2 {
-		// skip and don't run test
-		t.Skipf("visit test repo failed, ignored")
-		return
-	}
+	_, callerFile, _, _ := runtime.Caller(0)
+	fixtureDir := filepath.Join(filepath.Dir(callerFile), "_mock_data/TestGogsDownloadRepo")
+	mockServer := unittest.NewMockWebServer(t, "https://try.gogs.io", fixtureDir, liveMode)
 
-	downloader := NewGogsDownloader(context.Background(), "https://try.gogs.io", "", "", gogsPersonalAccessToken, "lunnytest", "TESTREPO")
-	repo, err := downloader.GetRepoInfo()
+	ctx := t.Context()
+	downloader := NewGogsDownloader(ctx, mockServer.URL, "", "", token, "lunnytest", "TESTREPO")
+	repo, err := downloader.GetRepoInfo(ctx)
 	assert.NoError(t, err)
 
 	assertRepositoryEqual(t, &base.Repository{
 		Name:          "TESTREPO",
 		Owner:         "lunnytest",
 		Description:   "",
-		CloneURL:      "https://try.gogs.io/lunnytest/TESTREPO.git",
-		OriginalURL:   "https://try.gogs.io/lunnytest/TESTREPO",
+		CloneURL:      mockServer.URL + "/lunnytest/TESTREPO.git",
+		OriginalURL:   mockServer.URL + "/lunnytest/TESTREPO",
 		DefaultBranch: "master",
 	}, repo)
 
-	milestones, err := downloader.GetMilestones()
+	milestones, err := downloader.GetMilestones(ctx)
 	assert.NoError(t, err)
 	assertMilestonesEqual(t, []*base.Milestone{
 		{
@@ -51,7 +47,7 @@ func TestGogsDownloadRepo(t *testing.T) {
 		},
 	}, milestones)
 
-	labels, err := downloader.GetLabels()
+	labels, err := downloader.GetLabels(ctx)
 	assert.NoError(t, err)
 	assertLabelsEqual(t, []*base.Label{
 		{
@@ -85,7 +81,7 @@ func TestGogsDownloadRepo(t *testing.T) {
 	}, labels)
 
 	// downloader.GetIssues()
-	issues, isEnd, err := downloader.GetIssues(1, 8)
+	issues, isEnd, err := downloader.GetIssues(ctx, 1, 8)
 	assert.NoError(t, err)
 	assert.False(t, isEnd)
 	assertIssuesEqual(t, []*base.Issue{
@@ -110,7 +106,7 @@ func TestGogsDownloadRepo(t *testing.T) {
 	}, issues)
 
 	// downloader.GetComments()
-	comments, _, err := downloader.GetComments(&base.Issue{Number: 1, ForeignIndex: 1})
+	comments, _, err := downloader.GetComments(ctx, &base.Issue{Number: 1, ForeignIndex: 1})
 	assert.NoError(t, err)
 	assertCommentsEqual(t, []*base.Comment{
 		{
@@ -134,6 +130,6 @@ func TestGogsDownloadRepo(t *testing.T) {
 	}, comments)
 
 	// downloader.GetPullRequests()
-	_, _, err = downloader.GetPullRequests(1, 3)
+	_, _, err = downloader.GetPullRequests(ctx, 1, 3)
 	assert.Error(t, err)
 }

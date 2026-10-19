@@ -8,42 +8,42 @@ import (
 	"testing"
 	"time"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/services/convert"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/services/convert"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestAPITeamUser(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
+	user2Session := loginUser(t, "user2")
+	user2Token := getTokenForLoggedInUser(t, user2Session, auth_model.AccessTokenScopeWriteOrganization)
 
-	normalUsername := "user2"
-	session := loginUser(t, normalUsername)
-	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeReadOrganization)
-	req := NewRequest(t, "GET", "/api/v1/teams/1/members/user1").
-		AddTokenAuth(token)
-	MakeRequest(t, req, http.StatusNotFound)
+	t.Run("User2ReadUser1", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/api/v1/teams/1/members/user1").AddTokenAuth(user2Token)
+		MakeRequest(t, req, http.StatusNotFound)
+	})
 
-	req = NewRequest(t, "GET", "/api/v1/teams/1/members/user2").
-		AddTokenAuth(token)
-	resp := MakeRequest(t, req, http.StatusOK)
-	var user2 *api.User
-	DecodeJSON(t, resp, &user2)
-	user2.Created = user2.Created.In(time.Local)
-	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user2"})
+	t.Run("User2ReadSelf", func(t *testing.T) {
+		// read self user
+		req := NewRequest(t, "GET", "/api/v1/teams/1/members/user2").AddTokenAuth(user2Token)
+		resp := MakeRequest(t, req, http.StatusOK)
+		user2 := DecodeJSON(t, resp, &api.User{})
+		user2.Created = user2.Created.In(time.Local)
+		user := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user2"})
 
-	expectedUser := convert.ToUser(db.DefaultContext, user, user)
+		expectedUser := convert.ToUser(t.Context(), user, user)
 
-	// test time via unix timestamp
-	assert.EqualValues(t, expectedUser.LastLogin.Unix(), user2.LastLogin.Unix())
-	assert.EqualValues(t, expectedUser.Created.Unix(), user2.Created.Unix())
-	expectedUser.LastLogin = user2.LastLogin
-	expectedUser.Created = user2.Created
+		// test time via unix timestamp
+		assert.Equal(t, expectedUser.LastLogin.Unix(), user2.LastLogin.Unix())
+		assert.Equal(t, expectedUser.Created.Unix(), user2.Created.Unix())
+		expectedUser.LastLogin = user2.LastLogin
+		expectedUser.Created = user2.Created
 
-	assert.Equal(t, expectedUser, user2)
+		assert.Equal(t, expectedUser, user2)
+	})
 }

@@ -4,8 +4,8 @@
 package org
 
 import (
-	"code.gitea.io/gitea/routers/api/v1/shared"
-	"code.gitea.io/gitea/services/context"
+	"gitea.dev/routers/api/v1/shared"
+	"gitea.dev/services/context"
 )
 
 func ListBlocks(ctx *context.APIContext) {
@@ -47,7 +47,7 @@ func CheckUserBlock(ctx *context.APIContext) {
 	//   required: true
 	// - name: username
 	//   in: path
-	//   description: user to check
+	//   description: username of the user to check
 	//   type: string
 	//   required: true
 	// responses:
@@ -71,7 +71,7 @@ func BlockUser(ctx *context.APIContext) {
 	//   required: true
 	// - name: username
 	//   in: path
-	//   description: user to block
+	//   description: username of the user to block
 	//   type: string
 	//   required: true
 	// - name: note
@@ -101,7 +101,7 @@ func UnblockUser(ctx *context.APIContext) {
 	//   required: true
 	// - name: username
 	//   in: path
-	//   description: user to unblock
+	//   description: username of the user to unblock
 	//   type: string
 	//   required: true
 	// responses:

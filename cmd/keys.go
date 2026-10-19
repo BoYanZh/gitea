@@ -4,52 +4,56 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/private"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/private"
 
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
-// CmdKeys represents the available keys sub-command
-var CmdKeys = &cli.Command{
-	Name:        "keys",
-	Usage:       "(internal) Should only be called by SSH server",
-	Description: "Queries the Gitea database to get the authorized command for a given ssh key fingerprint",
-	Before:      PrepareConsoleLoggerLevel(log.FATAL),
-	Action:      runKeys,
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:    "expected",
-			Aliases: []string{"e"},
-			Value:   "git",
-			Usage:   "Expected user for whom provide key commands",
+// NewKeysCommand returns the internal SSH key lookup sub-command.
+func NewKeysCommand() *cli.Command {
+	return &cli.Command{
+		Name:        "keys",
+		Usage:       "(internal) Should only be called by SSH server",
+		Hidden:      true, // internal commands shouldn't be visible
+		Description: "Queries the Gitea database to get the authorized command for a given ssh key fingerprint",
+		Before:      PrepareConsoleLoggerLevel(log.FATAL),
+		Action:      runKeys,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "expected",
+				Aliases: []string{"e"},
+				Value:   "git",
+				Usage:   "Expected user for whom provide key commands",
+			},
+			&cli.StringFlag{
+				Name:    "username",
+				Aliases: []string{"u"},
+				Value:   "",
+				Usage:   "Username trying to log in by SSH",
+			},
+			&cli.StringFlag{
+				Name:    "type",
+				Aliases: []string{"t"},
+				Value:   "",
+				Usage:   "Type of the SSH key provided to the SSH Server (requires content to be provided too)",
+			},
+			&cli.StringFlag{
+				Name:    "content",
+				Aliases: []string{"k"},
+				Value:   "",
+				Usage:   "Base64 encoded content of the SSH key provided to the SSH Server (requires type to be provided too)",
+			},
 		},
-		&cli.StringFlag{
-			Name:    "username",
-			Aliases: []string{"u"},
-			Value:   "",
-			Usage:   "Username trying to log in by SSH",
-		},
-		&cli.StringFlag{
-			Name:    "type",
-			Aliases: []string{"t"},
-			Value:   "",
-			Usage:   "Type of the SSH key provided to the SSH Server (requires content to be provided too)",
-		},
-		&cli.StringFlag{
-			Name:    "content",
-			Aliases: []string{"k"},
-			Value:   "",
-			Usage:   "Base64 encoded content of the SSH key provided to the SSH Server (requires type to be provided too)",
-		},
-	},
+	}
 }
 
-func runKeys(c *cli.Context) error {
+func runKeys(ctx context.Context, c *cli.Command) error {
 	if !c.IsSet("username") {
 		return errors.New("No username provided")
 	}
@@ -68,16 +72,13 @@ func runKeys(c *cli.Context) error {
 		return errors.New("No key type and content provided")
 	}
 
-	ctx, cancel := installSignals()
-	defer cancel()
-
 	setup(ctx, c.Bool("debug"))
 
-	authorizedString, extra := private.AuthorizedPublicKeyByContent(ctx, content)
+	authorizedString, extra := private.AuthorizedPublicKeyForSSH(ctx, content)
 	// do not use handleCliResponseExtra or cli.NewExitError, if it exists immediately, it breaks some tests like Test_CmdKeys
 	if extra.Error != nil {
 		return extra.Error
 	}
-	_, _ = fmt.Fprintln(c.App.Writer, strings.TrimSpace(authorizedString.Text))
+	_, _ = fmt.Fprintln(c.Root().Writer, strings.TrimSpace(authorizedString.Text))
 	return nil
 }

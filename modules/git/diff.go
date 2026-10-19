@@ -5,67 +5,83 @@ package git
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
-// RawDiffType type of a raw diff.
+// RawDiffType output format: diff or patch
 type RawDiffType string
 
-// RawDiffType possible values.
 const (
 	RawDiffNormal RawDiffType = "diff"
 	RawDiffPatch  RawDiffType = "patch"
 )
 
 // GetRawDiff dumps diff results of repository in given commit ID to io.Writer.
-func GetRawDiff(repo *Repository, commitID string, diffType RawDiffType, writer io.Writer) error {
-	return GetRepoRawDiffForFile(repo, "", commitID, diffType, "", writer)
-}
-
-// GetReverseRawDiff dumps the reverse diff results of repository in given commit ID to io.Writer.
-func GetReverseRawDiff(ctx context.Context, repoPath, commitID string, writer io.Writer) error {
-	stderr := new(bytes.Buffer)
-	cmd := NewCommand(ctx, "show", "--pretty=format:revert %H%n", "-R").AddDynamicArguments(commitID)
-	if err := cmd.Run(&RunOpts{
-		Dir:    repoPath,
-		Stdout: writer,
-		Stderr: stderr,
-	}); err != nil {
-		return fmt.Errorf("Run: %w - %s", err, stderr)
-	}
-	return nil
-}
-
-// GetRepoRawDiffForFile dumps diff results of file in given commit ID to io.Writer according given repository
-func GetRepoRawDiffForFile(repo *Repository, startCommit, endCommit string, diffType RawDiffType, file string, writer io.Writer) error {
-	commit, err := repo.GetCommit(endCommit)
+func GetRawDiff(ctx context.Context, repo *Repository, commitID string, diffType RawDiffType, writer io.Writer) (retErr error) {
+	cmd, err := getRepoRawDiffForFileCmd(ctx, repo, "", commitID, diffType, "")
 	if err != nil {
+		return fmt.Errorf("getRepoRawDiffForFileCmd: %w", err)
+	}
+	return cmd.WithStdoutCopy(writer).RunWithStderr(ctx)
+}
+
+// GetFileDiffCutAroundLine cuts the old or new part of the diff of a file around a specific line number
+func GetFileDiffCutAroundLine(
+	ctx context.Context, repo *Repository, startCommit, endCommit, treePath string,
+	line int64, old bool, numbersOfLine int,
+) (ret string, retErr error) {
+	cmd, err := getRepoRawDiffForFileCmd(ctx, repo, startCommit, endCommit, RawDiffNormal, treePath)
+	if err != nil {
+		return "", fmt.Errorf("getRepoRawDiffForFileCmd: %w", err)
+	}
+	stdoutReader, stdoutClose := cmd.MakeStdoutPipe()
+	defer stdoutClose()
+	cmd.WithPipelineFunc(func(ctx gitcmd.Context) error {
+		ret, err = CutDiffAroundLine(stdoutReader, line, old, numbersOfLine)
 		return err
+	})
+	return ret, cmd.RunWithStderr(ctx)
+}
+
+// getRepoRawDiffForFile returns an io.Reader for the diff results of file in given commit ID
+// and a "finish" function to wait for the git command and clean up resources after reading is done.
+func getRepoRawDiffForFileCmd(ctx context.Context, repo *Repository, startCommit, endCommit string, diffType RawDiffType, file string) (*gitcmd.Command, error) {
+	commit, err := repo.GetCommit(ctx, endCommit)
+	if err != nil {
+		return nil, err
 	}
 	var files []string
 	if len(file) > 0 {
 		files = append(files, file)
 	}
 
-	cmd := NewCommand(repo.Ctx)
+	cmd := gitcmd.NewCommand().WithRepo(repo)
 	switch diffType {
 	case RawDiffNormal:
 		if len(startCommit) != 0 {
-			cmd.AddArguments("diff", "-M").AddDynamicArguments(startCommit, endCommit).AddDashesAndList(files...)
+			cmd.AddArguments("diff").
+				AddOptionFormat("--find-renames=%s", setting.Git.DiffRenameSimilarityThreshold).
+				AddDynamicArguments(startCommit, endCommit).AddDashesAndList(files...)
 		} else if commit.ParentCount() == 0 {
 			cmd.AddArguments("show").AddDynamicArguments(endCommit).AddDashesAndList(files...)
 		} else {
-			c, _ := commit.Parent(0)
-			cmd.AddArguments("diff", "-M").AddDynamicArguments(c.ID.String(), endCommit).AddDashesAndList(files...)
+			c, err := commit.Parent(ctx, repo, 0)
+			if err != nil {
+				return nil, err
+			}
+			cmd.AddArguments("diff").
+				AddOptionFormat("--find-renames=%s", setting.Git.DiffRenameSimilarityThreshold).
+				AddDynamicArguments(c.ID.String(), endCommit).AddDashesAndList(files...)
 		}
 	case RawDiffPatch:
 		if len(startCommit) != 0 {
@@ -74,28 +90,22 @@ func GetRepoRawDiffForFile(repo *Repository, startCommit, endCommit string, diff
 		} else if commit.ParentCount() == 0 {
 			cmd.AddArguments("format-patch", "--no-signature", "--stdout", "--root").AddDynamicArguments(endCommit).AddDashesAndList(files...)
 		} else {
-			c, _ := commit.Parent(0)
+			c, err := commit.Parent(ctx, repo, 0)
+			if err != nil {
+				return nil, err
+			}
 			query := fmt.Sprintf("%s...%s", endCommit, c.ID.String())
 			cmd.AddArguments("format-patch", "--no-signature", "--stdout").AddDynamicArguments(query).AddDashesAndList(files...)
 		}
 	default:
-		return fmt.Errorf("invalid diffType: %s", diffType)
+		return nil, util.NewInvalidArgumentErrorf("invalid diff type: %s", diffType)
 	}
-
-	stderr := new(bytes.Buffer)
-	if err = cmd.Run(&RunOpts{
-		Dir:    repo.Path,
-		Stdout: writer,
-		Stderr: stderr,
-	}); err != nil {
-		return fmt.Errorf("Run: %w - %s", err, stderr)
-	}
-	return nil
+	return cmd, nil
 }
 
-// ParseDiffHunkString parse the diffhunk content and return
-func ParseDiffHunkString(diffhunk string) (leftLine, leftHunk, rightLine, righHunk int) {
-	ss := strings.Split(diffhunk, "@@")
+// ParseDiffHunkString parse the diff hunk content and return
+func ParseDiffHunkString(diffHunk string) (leftLine, leftHunk, rightLine, rightHunk int) {
+	ss := strings.Split(diffHunk, "@@")
 	ranges := strings.Split(ss[1][1:], " ")
 	leftRange := strings.Split(ranges[0], ",")
 	leftLine, _ = strconv.Atoi(leftRange[0][1:])
@@ -106,14 +116,19 @@ func ParseDiffHunkString(diffhunk string) (leftLine, leftHunk, rightLine, righHu
 		rightRange := strings.Split(ranges[1], ",")
 		rightLine, _ = strconv.Atoi(rightRange[0])
 		if len(rightRange) > 1 {
-			righHunk, _ = strconv.Atoi(rightRange[1])
+			rightHunk, _ = strconv.Atoi(rightRange[1])
 		}
 	} else {
-		log.Debug("Parse line number failed: %v", diffhunk)
+		log.Debug("Parse line number failed: %v", diffHunk)
 		rightLine = leftLine
-		righHunk = leftHunk
+		rightHunk = leftHunk
 	}
-	return leftLine, leftHunk, rightLine, righHunk
+	if rightLine == 0 {
+		// FIXME: GIT-DIFF-CUT-BUG search this tag to see details
+		// this is only a hacky patch, the rightLine&rightHunk might still be incorrect in some cases.
+		rightLine++
+	}
+	return leftLine, leftHunk, rightLine, rightHunk
 }
 
 // Example: @@ -1,8 +1,9 @@ => [..., 1, 8, 1, 9]
@@ -125,6 +140,14 @@ func isHeader(lof string, inHunk bool) bool {
 	return strings.HasPrefix(lof, cmdDiffHead) || (!inHunk && (strings.HasPrefix(lof, "---") || strings.HasPrefix(lof, "+++")))
 }
 
+func NewGitDiffScanner(r io.Reader) *bufio.Scanner {
+	// TODO: GIT-DIFF-PARSE-LONG-LINE: ideally it shouldn't use bufio.Scanner which has a limit.
+	// It will cause errors if a line is very long.
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(nil, max(512*1024, int(setting.UI.MaxDisplayFileSize/16)))
+	return scanner
+}
+
 // CutDiffAroundLine cuts a diff of a file in way that only the given line + numberOfLine above it will be shown
 // it also recalculates hunks and adds the appropriate headers to the new diff.
 // Warning: Only one-file diffs are allowed.
@@ -134,7 +157,7 @@ func CutDiffAroundLine(originalDiff io.Reader, line int64, old bool, numbersOfLi
 		return "", nil
 	}
 
-	scanner := bufio.NewScanner(originalDiff)
+	scanner := NewGitDiffScanner(originalDiff)
 	hunk := make([]string, 0)
 
 	// begin is the start of the hunk containing searched line
@@ -222,7 +245,7 @@ func CutDiffAroundLine(originalDiff io.Reader, line int64, old bool, numbersOfLi
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", err
+		return "", fmt.Errorf("CutDiffAroundLine: scan: %w", err)
 	}
 
 	// No hunk found
@@ -264,6 +287,12 @@ func CutDiffAroundLine(originalDiff io.Reader, line int64, old bool, numbersOfLi
 			oldNumOfLines++
 		}
 	}
+
+	// "git diff" outputs "@@ -1 +1,3 @@" for "OLD" => "A\nB\nC"
+	// FIXME: GIT-DIFF-CUT-BUG But there is a bug in CutDiffAroundLine, then the "Patch" stored in the comment model becomes "@@ -1,1 +0,4 @@"
+	// It may generate incorrect results for difference cases, for example: delete 2 line add 1 line, delete 2 line add 2 line etc, need to double check.
+	// For example: "L1\nL2" => "A\nB", then the patch shows "L2" as line 1 on the left (deleted part)
+
 	// construct the new hunk header
 	newHunk[headerLines] = fmt.Sprintf("@@ -%d,%d +%d,%d @@",
 		oldBegin, oldNumOfLines, newBegin, newNumOfLines)
@@ -271,9 +300,9 @@ func CutDiffAroundLine(originalDiff io.Reader, line int64, old bool, numbersOfLi
 }
 
 // GetAffectedFiles returns the affected files between two commits
-func GetAffectedFiles(repo *Repository, branchName, oldCommitID, newCommitID string, env []string) ([]string, error) {
+func GetAffectedFiles(ctx context.Context, repo *Repository, branchName, oldCommitID, newCommitID string, env []string) ([]string, error) {
 	if oldCommitID == emptySha1ObjectID.String() || oldCommitID == emptySha256ObjectID.String() {
-		startCommitID, err := repo.GetCommitBranchStart(env, branchName, newCommitID)
+		startCommitID, err := repo.GetCommitBranchStart(ctx, env, branchName, newCommitID)
 		if err != nil {
 			return nil, err
 		}
@@ -282,46 +311,38 @@ func GetAffectedFiles(repo *Repository, branchName, oldCommitID, newCommitID str
 		}
 		oldCommitID = startCommitID
 	}
-	stdoutReader, stdoutWriter, err := os.Pipe()
-	if err != nil {
-		log.Error("Unable to create os.Pipe for %s", repo.Path)
-		return nil, err
-	}
-	defer func() {
-		_ = stdoutReader.Close()
-		_ = stdoutWriter.Close()
-	}()
 
 	affectedFiles := make([]string, 0, 32)
 
 	// Run `git diff --name-only` to get the names of the changed files
-	err = NewCommand(repo.Ctx, "diff", "--name-only").AddDynamicArguments(oldCommitID, newCommitID).
-		Run(&RunOpts{
-			Env:    env,
-			Dir:    repo.Path,
-			Stdout: stdoutWriter,
-			PipelineFunc: func(ctx context.Context, cancel context.CancelFunc) error {
-				// Close the writer end of the pipe to begin processing
-				_ = stdoutWriter.Close()
-				defer func() {
-					// Close the reader on return to terminate the git command if necessary
-					_ = stdoutReader.Close()
-				}()
-				// Now scan the output from the command
-				scanner := bufio.NewScanner(stdoutReader)
-				for scanner.Scan() {
-					path := strings.TrimSpace(scanner.Text())
-					if len(path) == 0 {
-						continue
-					}
-					affectedFiles = append(affectedFiles, path)
+	cmd := gitcmd.NewCommand("diff", "--name-only").AddDynamicArguments(oldCommitID, newCommitID)
+	stdoutReader, stdoutReaderClose := cmd.MakeStdoutPipe()
+	defer stdoutReaderClose()
+	err := cmd.WithEnv(env).WithRepo(repo).
+		WithPipelineFunc(func(ctx gitcmd.Context) error {
+			// Now scan the output from the command
+			scanner := bufio.NewScanner(stdoutReader)
+			for scanner.Scan() {
+				path := strings.TrimSpace(scanner.Text())
+				if len(path) == 0 {
+					continue
 				}
-				return scanner.Err()
-			},
-		})
+				affectedFiles = append(affectedFiles, path)
+			}
+			return scanner.Err()
+		}).
+		Run(ctx)
 	if err != nil {
-		log.Error("Unable to get affected files for commits from %s to %s in %s: %v", oldCommitID, newCommitID, repo.Path, err)
+		log.Error("Unable to get affected files for commits from %s to %s in %s: %v", oldCommitID, newCommitID, repo.LogString(), err)
 	}
 
 	return affectedFiles, err
+}
+
+// GetReverseRawDiff dumps the reverse diff results of repository in given commit ID to io.Writer.
+func GetReverseRawDiff(ctx context.Context, repo RepositoryFacade, commitID string, writer io.Writer) error {
+	return gitcmd.NewCommand("show", "--pretty=format:revert %H%n", "-R").
+		AddDynamicArguments(commitID).
+		WithStdoutCopy(writer).
+		WithRepo(repo).RunWithStderr(ctx)
 }

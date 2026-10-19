@@ -7,7 +7,7 @@ package structs
 import (
 	"time"
 
-	"code.gitea.io/gitea/modules/json"
+	"gitea.dev/modules/json"
 )
 
 // User represents a user
@@ -15,10 +15,11 @@ import (
 type User struct {
 	// the user's id
 	ID int64 `json:"id"`
-	// the user's username
+	// login of the user, same as `username`
 	UserName string `json:"login"`
-	// the user's authentication sign-in name.
-	// default: empty
+	// the user type
+	Type UserTypeString `json:"type"`
+	// identifier of the user, provided by the external authenticator (if configured)
 	LoginName string `json:"login_name"`
 	// The ID of the user's Authentication Source
 	SourceID int64 `json:"source_id"`
@@ -35,9 +36,9 @@ type User struct {
 	// Is the user an administrator
 	IsAdmin bool `json:"is_admin"`
 	// swagger:strfmt date-time
-	LastLogin time.Time `json:"last_login,omitempty"`
+	LastLogin time.Time `json:"last_login"`
 	// swagger:strfmt date-time
-	Created time.Time `json:"created,omitempty"`
+	Created time.Time `json:"created"`
 	// Is user restricted
 	Restricted bool `json:"restricted"`
 	// Is user active
@@ -51,7 +52,7 @@ type User struct {
 	// the user's description
 	Description string `json:"description"`
 	// User visibility level option: public, limited, private
-	Visibility string `json:"visibility"`
+	Visibility VisibilityString `json:"visibility"`
 
 	// user counts
 	Followers    int `json:"followers_count"`
@@ -61,7 +62,7 @@ type User struct {
 
 // MarshalJSON implements the json.Marshaler interface for User, adding field(s) for backward compatibility
 func (u User) MarshalJSON() ([]byte, error) {
-	// Re-declaring User to avoid recursion
+	// Redeclaring User to avoid recursion
 	type shadow User
 	return json.Marshal(struct {
 		shadow
@@ -88,7 +89,7 @@ type UserSettings struct {
 // swagger:model
 type UserSettingsOptions struct {
 	FullName      *string `json:"full_name" binding:"MaxSize(100)"`
-	Website       *string `json:"website" binding:"OmitEmpty;ValidUrl;MaxSize(255)"`
+	Website       *string `json:"website" binding:"ValidUrl;MaxSize(255)"`
 	Description   *string `json:"description" binding:"MaxSize(255)"`
 	Location      *string `json:"location" binding:"MaxSize(50)"`
 	Language      *string `json:"language"`

@@ -6,21 +6,53 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"path"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/test"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitrepo"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	repo_service "gitea.dev/services/repository"
+	"gitea.dev/tests"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestViewRepo(t *testing.T) {
+func TestRepoView(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
+	t.Run("ViewRepoPublic", testViewRepoPublic)
+	t.Run("ViewRepoWithCache", testViewRepoWithCache)
+	t.Run("ViewRepoPrivate", testViewRepoPrivate)
+	t.Run("ViewRepo1CloneLinkAnonymous", testViewRepo1CloneLinkAnonymous)
+	t.Run("ViewRepo1CloneLinkAuthorized", testViewRepo1CloneLinkAuthorized)
+	t.Run("ViewRepoWithSymlinks", testViewRepoWithSymlinks)
+	t.Run("ViewFileInRepo", testViewFileInRepo)
+	t.Run("BlameFileInRepo", testBlameFileInRepo)
+	t.Run("ViewRepoDirectory", testViewRepoDirectory)
+	t.Run("ViewRepoDirectoryReadme", testViewRepoDirectoryReadme)
+	t.Run("ViewRepoSymlink", testViewRepoSymlink)
+	t.Run("ViewRepoCitationPicksCFFCaseInsensitivelyThroughSymlink", testViewRepoCitationPicksCFFCaseInsensitivelyThroughSymlink)
+	t.Run("MarkDownReadmeImage", testMarkDownReadmeImage)
+	t.Run("MarkDownReadmeImageSubfolder", testMarkDownReadmeImageSubfolder)
+	t.Run("GeneratedSourceLink", testGeneratedSourceLink)
+	t.Run("ViewCommit", testViewCommit)
+}
+
+func testViewRepoPublic(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -37,105 +69,130 @@ func TestViewRepo(t *testing.T) {
 	req = NewRequest(t, "GET", "/org3/repo3")
 	MakeRequest(t, req, http.StatusNotFound)
 
-	session = loginUser(t, "user1")
-	session.MakeRequest(t, req, http.StatusNotFound)
+	loginUser(t, "user1").MakeRequest(t, NewRequest(t, "GET", "/org3/repo3"), http.StatusOK)
 }
 
-func testViewRepo(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepoWithCache(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
+	testView := func(t *testing.T) {
+		req := NewRequest(t, "GET", "/org3/repo3")
+		session := loginUser(t, "user2")
+		resp := session.MakeRequest(t, req, http.StatusOK)
 
-	req := NewRequest(t, "GET", "/org3/repo3")
-	session := loginUser(t, "user2")
-	resp := session.MakeRequest(t, req, http.StatusOK)
+		htmlDoc := NewHTMLParser(t, resp.Body)
+		files := htmlDoc.doc.Find("#repo-files-table .repo-file-item")
 
-	htmlDoc := NewHTMLParser(t, resp.Body)
-	files := htmlDoc.doc.Find("#repo-files-table  > TBODY > TR")
+		type file struct {
+			fileName   string
+			commitID   string
+			commitMsg  string
+			commitTime string
+		}
 
-	type file struct {
-		fileName   string
-		commitID   string
-		commitMsg  string
-		commitTime string
-	}
+		var items []file
 
-	var items []file
+		files.Each(func(i int, s *goquery.Selection) {
+			tds := s.Find(".repo-file-cell")
+			var f file
+			tds.Each(func(i int, s *goquery.Selection) {
+				switch i {
+				case 0:
+					f.fileName = strings.TrimSpace(s.Text())
+				case 1:
+					a := s.Find("a")
+					f.commitMsg = strings.TrimSpace(a.Text())
+					l, _ := a.Attr("href")
+					f.commitID = path.Base(l)
+				}
+			})
 
-	files.Each(func(i int, s *goquery.Selection) {
-		tds := s.Find("td")
-		var f file
-		tds.Each(func(i int, s *goquery.Selection) {
-			if i == 0 {
-				f.fileName = strings.TrimSpace(s.Text())
-			} else if i == 1 {
-				a := s.Find("a")
-				f.commitMsg = strings.TrimSpace(a.Text())
-				l, _ := a.Attr("href")
-				f.commitID = path.Base(l)
-			}
+			// convert "2017-06-14 21:54:21 +0800" to "Wed, 14 Jun 2017 13:54:21 UTC"
+			htmlTimeString, _ := s.Find("relative-time").Attr("datetime")
+			htmlTime, _ := time.Parse(time.RFC3339, htmlTimeString)
+			f.commitTime = htmlTime.In(time.Local).Format(time.RFC1123)
+			items = append(items, f)
 		})
 
-		// convert "2017-06-14 21:54:21 +0800" to "Wed, 14 Jun 2017 13:54:21 UTC"
-		htmlTimeString, _ := s.Find("relative-time").Attr("datetime")
-		htmlTime, _ := time.Parse(time.RFC3339, htmlTimeString)
-		f.commitTime = htmlTime.In(time.Local).Format(time.RFC1123)
-		items = append(items, f)
-	})
+		commitT := time.Date(2017, time.June, 14, 13, 54, 21, 0, time.UTC).In(time.Local).Format(time.RFC1123)
+		assert.Equal(t, []file{
+			{
+				fileName:   "doc",
+				commitID:   "2a47ca4b614a9f5a43abbd5ad851a54a616ffee6",
+				commitMsg:  "init project",
+				commitTime: commitT,
+			},
+			{
+				fileName:   "README.md",
+				commitID:   "2a47ca4b614a9f5a43abbd5ad851a54a616ffee6",
+				commitMsg:  "init project",
+				commitTime: commitT,
+			},
+		}, items)
+	}
 
-	commitT := time.Date(2017, time.June, 14, 13, 54, 21, 0, time.UTC).In(time.Local).Format(time.RFC1123)
-	assert.EqualValues(t, []file{
-		{
-			fileName:   "doc",
-			commitID:   "2a47ca4b614a9f5a43abbd5ad851a54a616ffee6",
-			commitMsg:  "init project",
-			commitTime: commitT,
-		},
-		{
-			fileName:   "README.md",
-			commitID:   "2a47ca4b614a9f5a43abbd5ad851a54a616ffee6",
-			commitMsg:  "init project",
-			commitTime: commitT,
-		},
-	}, items)
+	// FIXME: these test don't seem quite right, no enough assert
+	testView(t) // first view will not hit the cache, need execute git operations
+	testView(t) // second view will hit the cache
 }
 
-func TestViewRepo2(t *testing.T) {
-	// no last commit cache
-	testViewRepo(t)
-
-	// enable last commit cache for all repositories
-	oldCommitsCount := setting.CacheService.LastCommit.CommitsCount
-	setting.CacheService.LastCommit.CommitsCount = 0
-	// first view will not hit the cache
-	testViewRepo(t)
-	// second view will hit the cache
-	testViewRepo(t)
-	setting.CacheService.LastCommit.CommitsCount = oldCommitsCount
-}
-
-func TestViewRepo3(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepoPrivate(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	req := NewRequest(t, "GET", "/org3/repo3")
-	session := loginUser(t, "user4")
-	session.MakeRequest(t, req, http.StatusOK)
+	MakeRequest(t, req, http.StatusNotFound)
+
+	t.Run("OrgMemberAccess", func(t *testing.T) {
+		req = NewRequest(t, "GET", "/org3/repo3")
+		session := loginUser(t, "user4")
+		resp := session.MakeRequest(t, req, http.StatusOK)
+		assert.Contains(t, resp.Body.String(), `<div id="repo-files-table"`)
+	})
+
+	t.Run("PublicAccess-AnonymousAccess", func(t *testing.T) {
+		session := loginUser(t, "user1")
+
+		// set unit code to "anonymous read"
+		req = NewRequestWithValues(t, "POST", "/org3/repo3/settings/public_access", map[string]string{
+			"repo-unit-access-" + strconv.Itoa(int(unit.TypeCode)): "anonymous-read",
+		})
+		session.MakeRequest(t, req, http.StatusSeeOther)
+
+		// try to "anonymous read" (ok)
+		req = NewRequest(t, "GET", "/org3/repo3")
+		resp := MakeRequest(t, req, http.StatusOK)
+		assert.Contains(t, resp.Body.String(), `<span class="ui basic orange label">Public Access</span>`)
+
+		// remove "anonymous read"
+		req = NewRequest(t, "POST", "/org3/repo3/settings/public_access")
+		session.MakeRequest(t, req, http.StatusSeeOther)
+
+		// try to "anonymous read" (not found)
+		req = NewRequest(t, "GET", "/org3/repo3")
+		MakeRequest(t, req, http.StatusNotFound)
+	})
 }
 
-func TestViewRepo1CloneLinkAnonymous(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepo1CloneLinkAnonymous(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	req := NewRequest(t, "GET", "/user2/repo1")
 	resp := MakeRequest(t, req, http.StatusOK)
 
 	htmlDoc := NewHTMLParser(t, resp.Body)
-	link, exists := htmlDoc.doc.Find("#repo-clone-https").Attr("data-link")
+	link, exists := htmlDoc.doc.Find(".repo-clone-https").Attr("data-link")
 	assert.True(t, exists, "The template has changed")
 	assert.Equal(t, setting.AppURL+"user2/repo1.git", link)
-	_, exists = htmlDoc.doc.Find("#repo-clone-ssh").Attr("data-link")
+
+	_, exists = htmlDoc.doc.Find(".repo-clone-ssh").Attr("data-link")
 	assert.False(t, exists)
+
+	link, exists = htmlDoc.doc.Find(".repo-clone-tea").Attr("data-link")
+	assert.True(t, exists, "The template has changed")
+	assert.Equal(t, "tea clone user2/repo1", link)
 }
 
-func TestViewRepo1CloneLinkAuthorized(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepo1CloneLinkAuthorized(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -143,25 +200,30 @@ func TestViewRepo1CloneLinkAuthorized(t *testing.T) {
 	resp := session.MakeRequest(t, req, http.StatusOK)
 
 	htmlDoc := NewHTMLParser(t, resp.Body)
-	link, exists := htmlDoc.doc.Find("#repo-clone-https").Attr("data-link")
+	link, exists := htmlDoc.doc.Find(".repo-clone-https").Attr("data-link")
 	assert.True(t, exists, "The template has changed")
 	assert.Equal(t, setting.AppURL+"user2/repo1.git", link)
-	link, exists = htmlDoc.doc.Find("#repo-clone-ssh").Attr("data-link")
+
+	link, exists = htmlDoc.doc.Find(".repo-clone-ssh").Attr("data-link")
 	assert.True(t, exists, "The template has changed")
 	sshURL := fmt.Sprintf("ssh://%s@%s:%d/user2/repo1.git", setting.SSH.User, setting.SSH.Domain, setting.SSH.Port)
 	assert.Equal(t, sshURL, link)
+
+	link, exists = htmlDoc.doc.Find(".repo-clone-tea").Attr("data-link")
+	assert.True(t, exists, "The template has changed")
+	assert.Equal(t, "tea clone user2/repo1", link)
 }
 
-func TestViewRepoWithSymlinks(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-
+func testViewRepoWithSymlinks(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
+	defer test.MockVariableValue(&setting.UI.FileIconTheme, "basic")()
 	session := loginUser(t, "user2")
 
 	req := NewRequest(t, "GET", "/user2/repo20.git")
 	resp := session.MakeRequest(t, req, http.StatusOK)
 
 	htmlDoc := NewHTMLParser(t, resp.Body)
-	files := htmlDoc.doc.Find("#repo-files-table > TBODY > TR > TD.name > SPAN.truncate")
+	files := htmlDoc.doc.Find("#repo-files-table .repo-file-cell.name")
 	items := files.Map(func(i int, s *goquery.Selection) string {
 		cls, _ := s.Find("SVG").Attr("class")
 		file := strings.Trim(s.Find("A").Text(), " \t\n")
@@ -176,8 +238,8 @@ func TestViewRepoWithSymlinks(t *testing.T) {
 }
 
 // TestViewFileInRepo repo description, topics and summary should not be displayed when viewing a file
-func TestViewFileInRepo(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewFileInRepo(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -188,15 +250,17 @@ func TestViewFileInRepo(t *testing.T) {
 	description := htmlDoc.doc.Find(".repo-description")
 	repoTopics := htmlDoc.doc.Find("#repo-topics")
 	repoSummary := htmlDoc.doc.Find(".repository-summary")
+	fileSize := htmlDoc.Find("div.file-info-entry > .file-info-size").Text()
 
-	assert.EqualValues(t, 0, description.Length())
-	assert.EqualValues(t, 0, repoTopics.Length())
-	assert.EqualValues(t, 0, repoSummary.Length())
+	assert.Equal(t, 0, description.Length())
+	assert.Equal(t, 0, repoTopics.Length())
+	assert.Equal(t, 0, repoSummary.Length())
+	assert.Equal(t, "30 B", fileSize)
 }
 
 // TestBlameFileInRepo repo description, topics and summary should not be displayed when running blame on a file
-func TestBlameFileInRepo(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testBlameFileInRepo(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -208,14 +272,14 @@ func TestBlameFileInRepo(t *testing.T) {
 	repoTopics := htmlDoc.doc.Find("#repo-topics")
 	repoSummary := htmlDoc.doc.Find(".repository-summary")
 
-	assert.EqualValues(t, 0, description.Length())
-	assert.EqualValues(t, 0, repoTopics.Length())
-	assert.EqualValues(t, 0, repoSummary.Length())
+	assert.Equal(t, 0, description.Length())
+	assert.Equal(t, 0, repoTopics.Length())
+	assert.Equal(t, 0, repoSummary.Length())
 }
 
 // TestViewRepoDirectory repo description, topics and summary should not be displayed when within a directory
-func TestViewRepoDirectory(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepoDirectory(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -228,7 +292,7 @@ func TestViewRepoDirectory(t *testing.T) {
 	repoSummary := htmlDoc.doc.Find(".repository-summary")
 
 	repoFilesTable := htmlDoc.doc.Find("#repo-files-table")
-	assert.NotZero(t, len(repoFilesTable.Nodes))
+	assert.NotEmpty(t, repoFilesTable.Nodes)
 
 	assert.Zero(t, description.Length())
 	assert.Zero(t, repoTopics.Length())
@@ -236,13 +300,95 @@ func TestViewRepoDirectory(t *testing.T) {
 }
 
 // ensure that the all the different ways to find and render a README work
-func TestViewRepoDirectoryReadme(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepoDirectoryReadme(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
+
+	user2 := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user2"})
+	repo56 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerID: user2.ID, Name: "readme-test"})
+
+	const symlink = git.EntryModeSymlink
+
+	allGitea := []git.FastImportFile{
+		{Path: ".gitea/README.en.md", Content: "This is .gitea/README.en.md"},
+		{Path: ".gitea/README.md", Content: "This is .gitea/README.md"},
+		{Path: ".gitea/README", Content: "This is .gitea/README"},
+	}
+	allGithub := []git.FastImportFile{
+		{Path: ".github/README.en.md", Content: "This is .github/README.en.md"},
+		{Path: ".github/README.md", Content: "This is .github/README.md"},
+		{Path: ".github/README", Content: "This is .github/README"},
+	}
+	allRoot := []git.FastImportFile{
+		{Path: "README.en.md", Content: "This is README.en.md"},
+		{Path: "README.md", Content: "This is README.md"},
+		{Path: "README", Content: "This is README"},
+	}
+	allDocs := []git.FastImportFile{
+		{Path: "docs/README.en.md", Content: "This is docs/README.en.md"},
+		{Path: "docs/README.md", Content: "This is docs/README.md"},
+		{Path: "docs/README", Content: "This is docs/README"},
+	}
+
+	combineFiles := func(slices ...[]git.FastImportFile) (res []git.FastImportFile) {
+		for _, s := range slices {
+			res = append(res, s...)
+		}
+		return res
+	}
+
+	err := git.ForceFastImport(t.Context(), repo56.CodeStorageRepo(), []git.FastImportCommit{
+		{Ref: "refs/heads/master", Message: "init master", Files: []git.FastImportFile{{Path: "README.md", Content: "The cake is a lie."}}},
+		{Ref: "refs/heads/txt", Message: "init txt", Files: []git.FastImportFile{{Path: "README.txt", Content: "My spoon is too big."}}},
+		{Ref: "refs/heads/plain", Message: "init plain", Files: []git.FastImportFile{{Path: "README", Content: "Birken my stocks gee howdy"}}},
+		{Ref: "refs/heads/i18n", Message: "init i18n", Files: []git.FastImportFile{{Path: "README.zh.md", Content: "你好世界"}}},
+		{Ref: "refs/heads/subdir", Message: "init subdir", Files: []git.FastImportFile{{Path: "libcake/README.md", Content: "Four pints of sugar."}}},
+		{Ref: "refs/heads/special-subdir-docs", Message: "init special-subdir-docs", Files: []git.FastImportFile{{Path: "docs/README.md", Content: "This is in docs/"}}},
+		{Ref: "refs/heads/special-subdir-.gitea", Message: "init special-subdir-.gitea", Files: []git.FastImportFile{{Path: ".gitea/README.md", Content: "This is in .gitea/"}}},
+		{Ref: "refs/heads/special-subdir-.github", Message: "init special-subdir-.github", Files: []git.FastImportFile{{Path: ".github/README.md", Content: "This is in .github/"}}},
+		{Ref: "refs/heads/special-subdir-nested", Message: "init special-subdir-nested", Files: []git.FastImportFile{
+			{Path: ".gitea/docs/README.md", Content: "This is in docs/"},
+			{Path: "subproject/.github/README.md", Content: "This is in .github/"},
+		}},
+		{Ref: "refs/heads/symlink", Message: "init symlink", Files: []git.FastImportFile{
+			{Mode: symlink, Path: ".github/README.md", Content: "../some/other/path/awefulcake.txt"},
+			{Mode: symlink, Path: "some/README.txt", Content: "other/path/awefulcake.txt"},
+			{Path: "some/other/path/awefulcake.txt", Content: "This is in some/other/path"},
+			{Mode: symlink, Path: "trampoline", Content: "up/back/down/down"},
+			{Mode: symlink, Path: "up/back/down/down/README.md", Content: "../../../../up/down/left/reelmein"},
+			{Path: "up/down/left/reelmein", Content: "It's a me, mario"},
+		}},
+		{Ref: "refs/heads/symlink-loop", Message: "init symlink-loop", Files: []git.FastImportFile{
+			{Mode: symlink, Path: "README.md", Content: "trampoline"},
+			{Mode: symlink, Path: "some/README.txt", Content: "other/path/awefulcake.txt"},
+			{Mode: symlink, Path: "some/other/path/awefulcake.txt", Content: "../../../README.md"},
+			{Mode: symlink, Path: "trampoline", Content: "README.md"},
+		}},
+		{Ref: "refs/heads/sp-ace", Message: "init sp-ace", Files: []git.FastImportFile{{Path: "read me", Content: "The cake is a lie."}}},
+		{Ref: "refs/heads/fallbacks", Message: "init fallbacks", Files: combineFiles(allGitea, allGithub, allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks2", Message: "init fallbacks2", Files: combineFiles(allGitea[1:], allGithub, allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks3", Message: "init fallbacks3", Files: combineFiles(allGitea[2:], allGithub, allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks4", Message: "init fallbacks4", Files: combineFiles(allGithub, allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks5", Message: "init fallbacks5", Files: combineFiles(allGithub[1:], allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks6", Message: "init fallbacks6", Files: combineFiles(allGithub[2:], allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks7", Message: "init fallbacks7", Files: combineFiles(allRoot, allDocs)},
+		{Ref: "refs/heads/fallbacks8", Message: "init fallbacks8", Files: combineFiles(allRoot[1:], allDocs)},
+		{Ref: "refs/heads/fallbacks9", Message: "init fallbacks9", Files: combineFiles(allRoot[2:], allDocs)},
+		{Ref: "refs/heads/fallbacks10", Message: "init fallbacks10", Files: combineFiles(allDocs)},
+		{Ref: "refs/heads/fallbacks11", Message: "init fallbacks11", Files: combineFiles(allDocs[1:])},
+		{Ref: "refs/heads/fallbacks12", Message: "init fallbacks12", Files: combineFiles(allDocs[2:])},
+		{Ref: "refs/heads/fallbacks-broken-symlinks", Message: "init fallbacks-broken-symlinks", Files: []git.FastImportFile{
+			{Mode: symlink, Path: ".gitea/README.md", Content: "non-existent-file"},
+			{Mode: symlink, Path: ".github/README.md", Content: "non-existent-file"},
+			{Mode: symlink, Path: "README.md", Content: "non-existent-file"},
+			{Path: "docs/README", Content: "This is docs/README"},
+		}},
+	})
+	require.NoError(t, err)
 
 	// there are many combinations:
 	// - READMEs can be .md, .txt, or have no extension
 	// - READMEs can be tagged with a language and even a country code
-	// - READMEs can be stored in docs/, .gitea/, or .github/
+	// - READMEs can be stored in "docs/", ".gitea/", or ".github/"
 	// - READMEs can be symlinks to other files
 	// - READMEs can be broken symlinks which should not render
 	//
@@ -275,7 +421,7 @@ func TestViewRepoDirectoryReadme(t *testing.T) {
 	check("md", "/user2/readme-test/src/branch/master/", "README.md", "markdown", "The cake is a lie.")
 	check("txt", "/user2/readme-test/src/branch/txt/", "README.txt", "plain-text", "My spoon is too big.")
 	check("plain", "/user2/readme-test/src/branch/plain/", "README", "plain-text", "Birken my stocks gee howdy")
-	check("i18n", "/user2/readme-test/src/branch/i18n/", "README.zh.md", "markdown", "蛋糕是一个谎言")
+	check("i18n", "/user2/readme-test/src/branch/i18n/", "README.zh.md", "markdown", "你好世界")
 
 	// using HEAD ref
 	check("branch-HEAD", "/user2/readme-test/src/branch/HEAD/", "README.md", "markdown", "The cake is a lie.")
@@ -288,33 +434,32 @@ func TestViewRepoDirectoryReadme(t *testing.T) {
 	check(".gitea", "/user2/readme-test/src/branch/special-subdir-.gitea/", ".gitea/README.md", "markdown", "This is in .gitea/")
 	check(".github", "/user2/readme-test/src/branch/special-subdir-.github/", ".github/README.md", "markdown", "This is in .github/")
 
-	// symlinks
 	// symlinks are subtle:
 	// - they should be able to handle going a reasonable number of times up and down in the tree
 	// - they shouldn't get stuck on link cycles
 	// - they should determine the filetype based on the name of the link, not the target
-	check("symlink", "/user2/readme-test/src/branch/symlink/", "README.md", "markdown", "This is in some/other/path")
+	check("symlink", "/user2/readme-test/src/branch/symlink/", ".github/README.md", "markdown", "This is in some/other/path")
 	check("symlink-multiple", "/user2/readme-test/src/branch/symlink/some/", "README.txt", "plain-text", "This is in some/other/path")
 	check("symlink-up-and-down", "/user2/readme-test/src/branch/symlink/up/back/down/down", "README.md", "markdown", "It's a me, mario")
 
 	// testing fallback rules
 	// READMEs are searched in this order:
-	// - [README.zh-cn.md, README.zh_cn.md, README.zh.md, README_zh.md, README.md, README.txt, README,
-	//     docs/README.zh-cn.md, docs/README.zh_cn.md, docs/README.zh.md, docs/README_zh.md, docs/README.md, docs/README.txt, docs/README,
-	//    .gitea/README.zh-cn.md, .gitea/README.zh_cn.md, .gitea/README.zh.md, .gitea/README_zh.md, .gitea/README.md, .gitea/README.txt, .gitea/README,
-
-	//     .github/README.zh-cn.md, .github/README.zh_cn.md, .github/README.zh.md, .github/README_zh.md, .github/README.md, .github/README.txt, .github/README]
+	// - directories: .gitea -> .github -> (root) -> docs
+	// - extensions: longer to shorter, non-English to English, e.g.: ".zh-cn.md" -> ".zh.md" -> "_zh.md" -> "en.md" -> ".md" -> (no-ext)
 	// and a broken/looped symlink counts as not existing at all and should be skipped.
 	// again, this doesn't cover all cases, but it covers a few
-	check("fallback/top", "/user2/readme-test/src/branch/fallbacks/", "README.en.md", "markdown", "This is README.en.md")
-	check("fallback/2", "/user2/readme-test/src/branch/fallbacks2/", "README.md", "markdown", "This is README.md")
-	check("fallback/3", "/user2/readme-test/src/branch/fallbacks3/", "README", "plain-text", "This is README")
-	check("fallback/4", "/user2/readme-test/src/branch/fallbacks4/", "docs/README.en.md", "markdown", "This is docs/README.en.md")
-	check("fallback/5", "/user2/readme-test/src/branch/fallbacks5/", "docs/README.md", "markdown", "This is docs/README.md")
-	check("fallback/6", "/user2/readme-test/src/branch/fallbacks6/", "docs/README", "plain-text", "This is docs/README")
-	check("fallback/7", "/user2/readme-test/src/branch/fallbacks7/", ".gitea/README.en.md", "markdown", "This is .gitea/README.en.md")
-	check("fallback/8", "/user2/readme-test/src/branch/fallbacks8/", ".gitea/README.md", "markdown", "This is .gitea/README.md")
-	check("fallback/9", "/user2/readme-test/src/branch/fallbacks9/", ".gitea/README", "plain-text", "This is .gitea/README")
+	check("fallback/top", "/user2/readme-test/src/branch/fallbacks/", ".gitea/README.en.md", "markdown", "This is .gitea/README.en.md")
+	check("fallback/2", "/user2/readme-test/src/branch/fallbacks2/", ".gitea/README.md", "markdown", "This is .gitea/README.md")
+	check("fallback/3", "/user2/readme-test/src/branch/fallbacks3/", ".gitea/README", "plain-text", "This is .gitea/README")
+	check("fallback/4", "/user2/readme-test/src/branch/fallbacks4/", ".github/README.en.md", "markdown", "This is .github/README.en.md")
+	check("fallback/5", "/user2/readme-test/src/branch/fallbacks5/", ".github/README.md", "markdown", "This is .github/README.md")
+	check("fallback/6", "/user2/readme-test/src/branch/fallbacks6/", ".github/README", "plain-text", "This is .github/README")
+	check("fallback/7", "/user2/readme-test/src/branch/fallbacks7/", "README.en.md", "markdown", "This is README.en.md")
+	check("fallback/8", "/user2/readme-test/src/branch/fallbacks8/", "README.md", "markdown", "This is README.md")
+	check("fallback/9", "/user2/readme-test/src/branch/fallbacks9/", "README", "plain-text", "This is README")
+	check("fallback/10", "/user2/readme-test/src/branch/fallbacks10/", "docs/README.en.md", "markdown", "This is docs/README.en.md")
+	check("fallback/11", "/user2/readme-test/src/branch/fallbacks11/", "docs/README.md", "markdown", "This is docs/README.md")
+	check("fallback/12", "/user2/readme-test/src/branch/fallbacks12/", "docs/README", "plain-text", "This is docs/README")
 
 	// this case tests that broken symlinks count as missing files, instead of rendering their contents
 	check("fallbacks-broken-symlinks", "/user2/readme-test/src/branch/fallbacks-broken-symlinks/", "docs/README", "plain-text", "This is docs/README")
@@ -338,13 +483,56 @@ func TestViewRepoDirectoryReadme(t *testing.T) {
 		})
 	}
 	missing("sp-ace", "/user2/readme-test/src/branch/sp-ace/")
-	missing("nested-special", "/user2/readme-test/src/branch/special-subdir-nested/subproject") // the special subdirs should only trigger on the repo root
+	missing("nested-special", "/user2/readme-test/src/branch/special-subdir-nested/subproject") // the special sub-dirs should only trigger on the repo root
 	missing("special-subdir-nested", "/user2/readme-test/src/branch/special-subdir-nested/")
 	missing("symlink-loop", "/user2/readme-test/src/branch/symlink-loop/")
 }
 
-func TestMarkDownReadmeImage(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewRepoSymlink(t *testing.T) {
+	session := loginUser(t, "user2")
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerID: 2, ID: 1})
+	err := git.ForceFastImport(t.Context(), repo.CodeStorageRepo(), []git.FastImportCommit{
+		{
+			Ref: "refs/heads/symlink", Message: "test", Files: []git.FastImportFile{
+				{Mode: git.EntryModeSymlink, Path: "README.md", Content: "some/other/path/awefulcake.txt"},
+				{Path: "some/other/path/awefulcake.txt", Content: "text content"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	req := NewRequest(t, "GET", "/user2/repo1/src/branch/symlink")
+	resp := session.MakeRequest(t, req, http.StatusOK)
+
+	htmlDoc := NewHTMLParser(t, resp.Body)
+	AssertHTMLElement(t, htmlDoc, ".entry-symbol-link", true)
+	followSymbolLinkHref := htmlDoc.Find(".entry-symbol-link").AttrOr("href", "")
+	require.Equal(t, "/user2/repo1/src/branch/symlink/README.md?follow_symlink=1", followSymbolLinkHref)
+
+	req = NewRequest(t, "GET", followSymbolLinkHref)
+	resp = session.MakeRequest(t, req, http.StatusSeeOther)
+	assert.Equal(t, "/user2/repo1/src/branch/symlink/some/other/path/awefulcake.txt?follow_symlink=1", resp.Header().Get("Location"))
+}
+
+func testViewRepoCitationPicksCFFCaseInsensitivelyThroughSymlink(t *testing.T) {
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerID: 2, ID: 1})
+	require.NoError(t, git.ForceFastImport(t.Context(), repo.CodeStorageRepo(), []git.FastImportCommit{
+		{
+			Ref: "refs/heads/citation", Message: "test", Files: []git.FastImportFile{
+				{Path: "CITATION.CFF/README.md", Content: "not a citation"},
+				{Path: "CITATION.bib", Content: "@misc{key}"},
+				{Mode: git.EntryModeSymlink, Path: "citation.cff", Content: "meta/citation.yaml"},
+				{Path: "meta/citation.yaml", Content: "title: Tool\nauthors: [{name: Team}]\n"},
+			},
+		},
+	}))
+	resp := MakeRequest(t, NewRequest(t, "GET", "/user2/repo1/src/branch/citation"), http.StatusOK)
+	htmlDoc := NewHTMLParser(t, resp.Body)
+	assert.Equal(t, "Team. Tool [Computer software]", htmlDoc.Find("#cite-repo-modal .citation-apa").AttrOr("data-text", ""))
+	assert.Equal(t, "/user2/repo1/src/branch/citation/citation.cff", htmlDoc.Find("#cite-repo-modal a.jump").AttrOr("href", ""))
+}
+
+func testMarkDownReadmeImage(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -365,8 +553,8 @@ func TestMarkDownReadmeImage(t *testing.T) {
 	assert.Equal(t, "/user2/repo1/media/branch/home-md-img-check/test-fake-img.jpg", src)
 }
 
-func TestMarkDownReadmeImageSubfolder(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testMarkDownReadmeImageSubfolder(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	session := loginUser(t, "user2")
 
@@ -388,8 +576,8 @@ func TestMarkDownReadmeImageSubfolder(t *testing.T) {
 	assert.Equal(t, "/user2/repo1/media/branch/sub-home-md-img-check/docs/test-fake-img.jpg", src)
 }
 
-func TestGeneratedSourceLink(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testGeneratedSourceLink(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	t.Run("Rendered file", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
@@ -403,7 +591,7 @@ func TestGeneratedSourceLink(t *testing.T) {
 
 		dataURL, exists = doc.doc.Find(".ref-in-new-issue").Attr("data-url-param-body-link")
 		assert.True(t, exists)
-		assert.Equal(t, "/user2/repo1/src/commit/65f1bf27bc3bf70f64657658635e66094edbcb4d/README.md?display=source", dataURL)
+		assert.Equal(t, setting.AppURL+"user2/repo1/src/commit/65f1bf27bc3bf70f64657658635e66094edbcb4d/README.md?display=source", dataURL)
 	})
 
 	t.Run("Non-Rendered file", func(t *testing.T) {
@@ -420,15 +608,85 @@ func TestGeneratedSourceLink(t *testing.T) {
 
 		dataURL, exists = doc.doc.Find(".ref-in-new-issue").Attr("data-url-param-body-link")
 		assert.True(t, exists)
-		assert.Equal(t, "/user27/repo49/src/commit/aacbdfe9e1c4b47f60abe81849045fa4e96f1d75/test/test.txt", dataURL)
+		assert.Equal(t, setting.AppURL+"user27/repo49/src/commit/aacbdfe9e1c4b47f60abe81849045fa4e96f1d75/test/test.txt", dataURL)
 	})
 }
 
-func TestViewCommit(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func testViewCommit(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
 
 	req := NewRequest(t, "GET", "/user2/repo1/commit/0123456789012345678901234567890123456789")
 	req.Header.Add("Accept", "text/html")
 	resp := MakeRequest(t, req, http.StatusNotFound)
 	assert.True(t, test.IsNormalPageCompleted(resp.Body.String()), "non-existing commit should render 404 page")
+}
+
+// TestGenerateRepository the test cannot succeed when moved as a unit test
+func TestGenerateRepository(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	// a successful generate from template
+	user2 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	repo44 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 44})
+
+	t.Run("Success", func(t *testing.T) {
+		tmplRepoLabels := []*issues_model.Label{
+			{RepoID: 44, Name: "priority/high", Exclusive: true, ExclusiveOrder: 2, Color: "#ee0000", Description: "desc-high"},
+			{RepoID: 44, Name: "priority/low", Exclusive: true, ExclusiveOrder: 1, Color: "#0000ee", Description: "desc-low"},
+		}
+
+		require.NoError(t, issues_model.NewLabels(t.Context(), tmplRepoLabels...))
+
+		generatedRepo, err := repo_service.GenerateRepository(t.Context(), user2, user2, repo44, repo_service.GenerateRepoOptions{
+			Name:        "generated-from-template-44",
+			GitContent:  true,
+			IssueLabels: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, generatedRepo)
+
+		exist, err := git.IsRepositoryExist(t.Context(), generatedRepo)
+		require.NoError(t, err)
+		require.True(t, exist)
+
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerName: user2.Name, Name: generatedRepo.Name})
+
+		generatedLabels, err := issues_model.GetLabelsByRepoID(t.Context(), generatedRepo.ID, "", db.ListOptions{})
+		require.NoError(t, err)
+		require.Len(t, generatedLabels, len(tmplRepoLabels))
+		for i, tmplLabel := range tmplRepoLabels {
+			genLabel := generatedLabels[i]
+			assert.Equal(t, tmplLabel.Name, genLabel.Name)
+			assert.Equal(t, tmplLabel.Exclusive, genLabel.Exclusive)
+			assert.Equal(t, tmplLabel.ExclusiveOrder, genLabel.ExclusiveOrder)
+			assert.Equal(t, tmplLabel.Color, genLabel.Color)
+			assert.Equal(t, tmplLabel.Description, genLabel.Description)
+		}
+
+		err = repo_service.DeleteRepositoryDirectly(t.Context(), generatedRepo.ID)
+		assert.NoError(t, err)
+	})
+
+	t.Run("Failure", func(t *testing.T) {
+		// a failed creating because some mock data
+		// create the repository directory so that the creation will fail after database record created.
+		testFailureRepoName := "generated-from-template-44"
+		testFailureRepo := gitrepo.CodeRepoByName(user2.Name, testFailureRepoName)
+		testFailurePath := gitrepo.RepoLocalPath(testFailureRepo)
+		assert.NoError(t, os.MkdirAll(testFailurePath, os.ModePerm))
+
+		generatedRepoFailure, err := repo_service.GenerateRepository(t.Context(), user2, user2, repo44, repo_service.GenerateRepoOptions{
+			Name:       testFailureRepoName,
+			GitContent: true,
+		})
+		assert.Nil(t, generatedRepoFailure)
+		assert.Error(t, err)
+
+		// assert the cleanup is successful
+		unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerName: user2.Name, Name: testFailureRepoName})
+
+		exist, err := git.IsRepositoryExist(t.Context(), testFailureRepo)
+		assert.NoError(t, err)
+		assert.False(t, exist)
+	})
 }

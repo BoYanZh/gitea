@@ -6,28 +6,31 @@ package issues
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"regexp"
-	"strconv"
 	"strings"
+	"time"
 
-	"code.gitea.io/gitea/models/db"
-	git_model "code.gitea.io/gitea/models/git"
-	org_model "code.gitea.io/gitea/models/organization"
-	pull_model "code.gitea.io/gitea/models/pull"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	org_model "gitea.dev/models/organization"
+	pull_model "gitea.dev/models/pull"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
+	"github.com/dlclark/regexp2/v2"
 	"xorm.io/builder"
 )
 
 var ErrMustCollaborator = util.NewPermissionDeniedErrorf("user must be a collaborator")
+
+const reviewedBy = "Reviewed-by: "
 
 // ErrPullRequestNotExist represents a "PullRequestNotExist" kind of error.
 type ErrPullRequestNotExist struct {
@@ -80,22 +83,6 @@ func (err ErrPullRequestAlreadyExists) Unwrap() error {
 	return util.ErrAlreadyExist
 }
 
-// ErrPullWasClosed is used close a closed pull request
-type ErrPullWasClosed struct {
-	ID    int64
-	Index int64
-}
-
-// IsErrPullWasClosed checks if an error is a ErrErrPullWasClosed.
-func IsErrPullWasClosed(err error) bool {
-	_, ok := err.(ErrPullWasClosed)
-	return ok
-}
-
-func (err ErrPullWasClosed) Error() string {
-	return fmt.Sprintf("Pull request [%d] %d was already closed", err.ID, err.Index)
-}
-
 // PullRequestType defines pull request type
 type PullRequestType int
 
@@ -118,27 +105,6 @@ const (
 	PullRequestStatusEmpty
 	PullRequestStatusAncestor
 )
-
-func (status PullRequestStatus) String() string {
-	switch status {
-	case PullRequestStatusConflict:
-		return "CONFLICT"
-	case PullRequestStatusChecking:
-		return "CHECKING"
-	case PullRequestStatusMergeable:
-		return "MERGEABLE"
-	case PullRequestStatusManuallyMerged:
-		return "MANUALLY_MERGED"
-	case PullRequestStatusError:
-		return "ERROR"
-	case PullRequestStatusEmpty:
-		return "EMPTY"
-	case PullRequestStatusAncestor:
-		return "ANCESTOR"
-	default:
-		return strconv.Itoa(int(status))
-	}
-}
 
 // PullRequestFlow the flow of pull request
 type PullRequestFlow int
@@ -236,15 +202,10 @@ func (pr *PullRequest) String() string {
 	return s.String()
 }
 
-// MustHeadUserName returns the HeadRepo's username if failed return blank
-func (pr *PullRequest) MustHeadUserName(ctx context.Context) string {
-	if err := pr.LoadHeadRepo(ctx); err != nil {
-		if !repo_model.IsErrRepoNotExist(err) {
-			log.Error("LoadHeadRepo: %v", err)
-		} else {
-			log.Warn("LoadHeadRepo %d but repository does not exist: %v", pr.HeadRepoID, err)
-		}
-		return ""
+// OptionalHeadUserName returns the HeadRepo's username if failed return blank
+func (pr *PullRequest) OptionalHeadUserName(ctx context.Context) string {
+	if err := pr.LoadHeadRepo(ctx); err != nil && !errors.Is(err, util.ErrNotExist) {
+		log.Error("LoadHeadRepo: %v", err)
 	}
 	if pr.HeadRepo == nil {
 		return ""
@@ -255,16 +216,10 @@ func (pr *PullRequest) MustHeadUserName(ctx context.Context) string {
 // LoadAttributes loads pull request attributes from database
 // Note: don't try to get Issue because will end up recursive querying.
 func (pr *PullRequest) LoadAttributes(ctx context.Context) (err error) {
-	if pr.HasMerged && pr.Merger == nil {
-		pr.Merger, err = user_model.GetUserByID(ctx, pr.MergerID)
-		if user_model.IsErrUserNotExist(err) {
-			pr.MergerID = user_model.GhostUserID
-			pr.Merger = user_model.NewGhostUser()
-		} else if err != nil {
-			return fmt.Errorf("getUserByID [%d]: %w", pr.MergerID, err)
-		}
+	if pr.Merger == nil && pr.MergerID != 0 {
+		pr.MergerID, pr.Merger, err = user_model.GetPossibleUserByID(ctx, pr.MergerID)
+		return err
 	}
-
 	return nil
 }
 
@@ -301,7 +256,7 @@ func (pr *PullRequest) LoadRequestedReviewers(ctx context.Context) error {
 		return nil
 	}
 
-	reviews, err := GetReviewsByIssueID(ctx, pr.Issue.ID)
+	reviews, _, err := GetReviewsByIssueID(ctx, pr.Issue.ID)
 	if err != nil {
 		return err
 	}
@@ -320,7 +275,7 @@ func (pr *PullRequest) LoadRequestedReviewers(ctx context.Context) error {
 
 // LoadRequestedReviewersTeams loads the requested reviewers teams.
 func (pr *PullRequest) LoadRequestedReviewersTeams(ctx context.Context) error {
-	reviews, err := GetReviewsByIssueID(ctx, pr.Issue.ID)
+	reviews, _, err := GetReviewsByIssueID(ctx, pr.Issue.ID)
 	if err != nil {
 		return err
 	}
@@ -385,7 +340,11 @@ type ReviewCount struct {
 func (pr *PullRequest) GetApprovalCounts(ctx context.Context) ([]*ReviewCount, error) {
 	rCounts := make([]*ReviewCount, 0, 6)
 	sess := db.GetEngine(ctx).Where("issue_id = ?", pr.IssueID)
-	return rCounts, sess.Select("issue_id, type, count(id) as `count`").Where("official = ? AND dismissed = ?", true, false).GroupBy("issue_id, type").Table("review").Find(&rCounts)
+	return rCounts, sess.Select("issue_id, type, count(id) as `count`").
+		Where(builder.Eq{"official": true, "dismissed": false}).
+		GroupBy("issue_id, type").
+		Table("review").
+		Find(&rCounts)
 }
 
 // GetApprovers returns the approvers of the pull request
@@ -401,16 +360,9 @@ func (pr *PullRequest) GetApprovers(ctx context.Context) string {
 
 func (pr *PullRequest) getReviewedByLines(ctx context.Context, writer io.Writer) error {
 	maxReviewers := setting.Repository.PullRequest.DefaultMergeMessageMaxApprovers
-
 	if maxReviewers == 0 {
 		return nil
 	}
-
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
 
 	// Note: This doesn't page as we only expect a very limited number of reviews
 	reviews, err := FindLatestReviews(ctx, FindReviewOptions{
@@ -436,7 +388,7 @@ func (pr *PullRequest) getReviewedByLines(ctx context.Context, writer io.Writer)
 		} else if review.Reviewer == nil {
 			continue
 		}
-		if _, err := writer.Write([]byte("Reviewed-by: ")); err != nil {
+		if _, err := writer.Write([]byte(reviewedBy)); err != nil {
 			return err
 		}
 		if _, err := writer.Write([]byte(review.Reviewer.NewGitSig().String())); err != nil {
@@ -447,16 +399,27 @@ func (pr *PullRequest) getReviewedByLines(ctx context.Context, writer io.Writer)
 		}
 		reviewersWritten++
 	}
-	return committer.Commit()
+	return nil
 }
 
-// GetGitRefName returns git ref for hidden pull request branch
-func (pr *PullRequest) GetGitRefName() string {
-	return fmt.Sprintf("%s%d/head", git.PullPrefix, pr.Index)
+// GetGitHeadRefName returns git ref for hidden pull request branch
+func (pr *PullRequest) GetGitHeadRefName() string { // TODO: make it return RefName but not string
+	return git.RefNameFromPullIndex(pr.Index).String()
 }
 
-func (pr *PullRequest) GetGitHeadBranchRefName() string {
-	return fmt.Sprintf("%s%s", git.BranchPrefix, pr.HeadBranch)
+func (pr *PullRequest) GetInstructionsCliArgs() (ret struct {
+	BaseBranchArg  string
+	HeadBranchArg  string
+	LocalBranchArg string
+},
+) {
+	ret.BaseBranchArg = util.ShellEscape(pr.BaseBranch)
+	ret.HeadBranchArg = util.ShellEscape(pr.HeadBranch)
+	ret.LocalBranchArg = ret.HeadBranchArg
+	if pr.HeadRepo != nil && pr.HeadRepoID != pr.BaseRepoID {
+		ret.LocalBranchArg = util.ShellEscape(pr.HeadRepo.OwnerName) + "-" + ret.HeadBranchArg
+	}
+	return ret
 }
 
 // GetReviewCommentsCount returns the number of review comments made on the diff of a PR review (not including comments on commits or issues in a PR)
@@ -479,8 +442,8 @@ func (pr *PullRequest) IsChecking() bool {
 	return pr.Status == PullRequestStatusChecking
 }
 
-// CanAutoMerge returns true if this pull request can be merged automatically.
-func (pr *PullRequest) CanAutoMerge() bool {
+// IsStatusMergeable returns true if this pull request is mergeable to its base
+func (pr *PullRequest) IsStatusMergeable() bool {
 	return pr.Status == PullRequestStatusMergeable
 }
 
@@ -499,105 +462,38 @@ func (pr *PullRequest) IsFromFork() bool {
 	return pr.HeadRepoID != pr.BaseRepoID
 }
 
-// SetMerged sets a pull request to merged and closes the corresponding issue
-func (pr *PullRequest) SetMerged(ctx context.Context) (bool, error) {
-	if pr.HasMerged {
-		return false, fmt.Errorf("PullRequest[%d] already merged", pr.Index)
-	}
-	if pr.MergedCommitID == "" || pr.MergedUnix == 0 || pr.Merger == nil {
-		return false, fmt.Errorf("Unable to merge PullRequest[%d], some required fields are empty", pr.Index)
-	}
-
-	pr.HasMerged = true
-	sess := db.GetEngine(ctx)
-
-	if _, err := sess.Exec("UPDATE `issue` SET `repo_id` = `repo_id` WHERE `id` = ?", pr.IssueID); err != nil {
-		return false, err
-	}
-
-	if _, err := sess.Exec("UPDATE `pull_request` SET `issue_id` = `issue_id` WHERE `id` = ?", pr.ID); err != nil {
-		return false, err
-	}
-
-	pr.Issue = nil
-	if err := pr.LoadIssue(ctx); err != nil {
-		return false, err
-	}
-
-	if tmpPr, err := GetPullRequestByID(ctx, pr.ID); err != nil {
-		return false, err
-	} else if tmpPr.HasMerged {
-		if pr.Issue.IsClosed {
-			return false, nil
-		}
-		return false, fmt.Errorf("PullRequest[%d] already merged but it's associated issue [%d] is not closed", pr.Index, pr.IssueID)
-	} else if pr.Issue.IsClosed {
-		return false, fmt.Errorf("PullRequest[%d] already closed", pr.Index)
-	}
-
-	if err := pr.Issue.LoadRepo(ctx); err != nil {
-		return false, err
-	}
-
-	if err := pr.Issue.Repo.LoadOwner(ctx); err != nil {
-		return false, err
-	}
-
-	if _, err := changeIssueStatus(ctx, pr.Issue, pr.Merger, true, true); err != nil {
-		return false, fmt.Errorf("Issue.changeStatus: %w", err)
-	}
-
-	// reset the conflicted files as there cannot be any if we're merged
-	pr.ConflictedFiles = []string{}
-
-	// We need to save all of the data used to compute this merge as it may have already been changed by TestPatch. FIXME: need to set some state to prevent TestPatch from running whilst we are merging.
-	if _, err := sess.Where("id = ?", pr.ID).Cols("has_merged, status, merge_base, merged_commit_id, merger_id, merged_unix, conflicted_files").Update(pr); err != nil {
-		return false, fmt.Errorf("Failed to update pr[%d]: %w", pr.ID, err)
-	}
-
-	return true, nil
-}
-
 // NewPullRequest creates new pull request with labels for repository.
 func NewPullRequest(ctx context.Context, repo *repo_model.Repository, issue *Issue, labelIDs []int64, uuids []string, pr *PullRequest) (err error) {
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-
-	idx, err := db.GetNextResourceIndex(ctx, "issue_index", repo.ID)
-	if err != nil {
-		return fmt.Errorf("generate pull request index failed: %w", err)
-	}
-
-	issue.Index = idx
-
-	if err = NewIssueWithIndex(ctx, issue.Poster, NewIssueOptions{
-		Repo:        repo,
-		Issue:       issue,
-		LabelIDs:    labelIDs,
-		Attachments: uuids,
-		IsPull:      true,
-	}); err != nil {
-		if repo_model.IsErrUserDoesNotHaveAccessToRepo(err) || IsErrNewIssueInsert(err) {
-			return err
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		idx, err := db.GetNextResourceIndex(ctx, "issue_index", repo.ID)
+		if err != nil {
+			return fmt.Errorf("generate pull request index failed: %w", err)
 		}
-		return fmt.Errorf("newIssue: %w", err)
-	}
 
-	pr.Index = issue.Index
-	pr.BaseRepo = repo
-	pr.IssueID = issue.ID
-	if err = db.Insert(ctx, pr); err != nil {
-		return fmt.Errorf("insert pull repo: %w", err)
-	}
+		issue.Index = idx
+		issue.Title = util.EllipsisDisplayString(issue.Title, 255)
+		issue.IsPull = true
 
-	if err = committer.Commit(); err != nil {
-		return fmt.Errorf("Commit: %w", err)
-	}
+		if err = NewIssueWithIndex(ctx, issue.Poster, NewIssueOptions{
+			Repo:        repo,
+			Issue:       issue,
+			LabelIDs:    labelIDs,
+			Attachments: uuids,
+		}); err != nil {
+			if repo_model.IsErrUserDoesNotHaveAccessToRepo(err) {
+				return err
+			}
+			return fmt.Errorf("newIssue: %w", err)
+		}
 
-	return nil
+		pr.Index = issue.Index
+		pr.BaseRepo = repo
+		pr.IssueID = issue.ID
+		if err = db.Insert(ctx, pr); err != nil {
+			return fmt.Errorf("insert pull repo: %w", err)
+		}
+		return nil
+	})
 }
 
 // ErrUserMustCollaborator represents an error that the user must be a collaborator to a given repo.
@@ -643,12 +539,8 @@ func GetPullRequestByIndex(ctx context.Context, repoID, index int64) (*PullReque
 	if index < 1 {
 		return nil, ErrPullRequestNotExist{}
 	}
-	pr := &PullRequest{
-		BaseRepoID: repoID,
-		Index:      index,
-	}
 
-	has, err := db.GetEngine(ctx).Get(pr)
+	pr, has, err := db.Get[PullRequest](ctx, builder.Eq{"base_repo_id": repoID, "`index`": index})
 	if err != nil {
 		return nil, err
 	} else if !has {
@@ -744,12 +636,6 @@ func GetAllUnmergedAgitPullRequestByPoster(ctx context.Context, uid int64) ([]*P
 	return pulls, err
 }
 
-// Update updates all fields of pull request.
-func (pr *PullRequest) Update(ctx context.Context) error {
-	_, err := db.GetEngine(ctx).ID(pr.ID).AllCols().Update(pr)
-	return err
-}
-
 // UpdateCols updates specific fields of pull request.
 func (pr *PullRequest) UpdateCols(ctx context.Context, cols ...string) error {
 	_, err := db.GetEngine(ctx).ID(pr.ID).Cols(cols...).Update(pr)
@@ -757,9 +643,8 @@ func (pr *PullRequest) UpdateCols(ctx context.Context, cols ...string) error {
 }
 
 // UpdateColsIfNotMerged updates specific fields of a pull request if it has not been merged
-func (pr *PullRequest) UpdateColsIfNotMerged(ctx context.Context, cols ...string) error {
-	_, err := db.GetEngine(ctx).Where("id = ? AND has_merged = ?", pr.ID, false).Cols(cols...).Update(pr)
-	return err
+func (pr *PullRequest) UpdateColsIfNotMerged(ctx context.Context, cols ...string) (int64, error) {
+	return db.GetEngine(ctx).Where("id = ? AND has_merged = ?", pr.ID, false).Cols(cols...).Update(pr)
 }
 
 // IsWorkInProgress determine if the Pull Request is a Work In Progress by its title
@@ -774,17 +659,24 @@ func (pr *PullRequest) IsWorkInProgress(ctx context.Context) bool {
 
 // HasWorkInProgressPrefix determines if the given PR title has a Work In Progress prefix
 func HasWorkInProgressPrefix(title string) bool {
-	for _, prefix := range setting.Repository.PullRequest.WorkInProgressPrefixes {
-		if strings.HasPrefix(strings.ToUpper(title), strings.ToUpper(prefix)) {
-			return true
-		}
-	}
-	return false
+	_, ok := CutWorkInProgressPrefix(title)
+	return ok
 }
 
-// IsFilesConflicted determines if the  Pull Request has changes conflicting with the target branch.
+func CutWorkInProgressPrefix(title string) (origTitle string, ok bool) {
+	for _, prefix := range setting.Repository.PullRequest.WorkInProgressPrefixes {
+		prefixLen := len(prefix)
+		if prefixLen <= len(title) && util.AsciiEqualFold(title[:prefixLen], prefix) {
+			return title[len(prefix):], true
+		}
+	}
+	return title, false
+}
+
+// IsFilesConflicted determines if the Pull Request has changes conflicting with the target branch.
+// Sometimes a conflict may not list any files
 func (pr *PullRequest) IsFilesConflicted() bool {
-	return len(pr.ConflictedFiles) > 0
+	return pr.Status == PullRequestStatusConflict
 }
 
 // GetWorkInProgressPrefix returns the prefix used to mark the pull request as a work in progress.
@@ -806,7 +698,7 @@ func (pr *PullRequest) GetWorkInProgressPrefix(ctx context.Context) string {
 // UpdateCommitDivergence update Divergence of a pull request
 func (pr *PullRequest) UpdateCommitDivergence(ctx context.Context, ahead, behind int) error {
 	if pr.ID == 0 {
-		return fmt.Errorf("pull ID is 0")
+		return errors.New("pull ID is 0")
 	}
 	pr.CommitsAhead = ahead
 	pr.CommitsBehind = behind
@@ -969,8 +861,13 @@ func GetCodeOwnersFromContent(ctx context.Context, data string) ([]*CodeOwnerRul
 	return rules, warnings
 }
 
+// codeOwnerMatchTimeout bounds a single pattern match so a crafted pattern
+// cannot stall via catastrophic backtracking. See also the aggregate budget
+// enforced by the caller across the whole rules×files match loop.
+const codeOwnerMatchTimeout = 150 * time.Millisecond
+
 type CodeOwnerRule struct {
-	Rule     *regexp.Regexp
+	Rule     *regexp2.Regexp // it supports negative lookahead, does better for end users
 	Negative bool
 	Users    []*user_model.User
 	Teams    []*org_model.Team
@@ -986,11 +883,19 @@ func ParseCodeOwnersLine(ctx context.Context, tokens []string) (*CodeOwnerRule, 
 
 	warnings := make([]string, 0)
 
-	rule.Rule, err = regexp.Compile(fmt.Sprintf("^%s$", strings.TrimPrefix(tokens[0], "!")))
+	// Strip leading "!" for negative rules, then strip leading "/" since
+	// git returns relative paths (e.g. "docs/foo.md" not "/docs/foo.md")
+	// and the regex is already anchored with ^...$, so the "/" is redundant.
+	pattern := strings.TrimPrefix(tokens[0], "!")
+	pattern = strings.TrimPrefix(pattern, "/")
+	expr := fmt.Sprintf("^%s$", pattern)
+	rule.Rule, err = regexp2.Compile(expr, regexp2.None)
 	if err != nil {
 		warnings = append(warnings, fmt.Sprintf("incorrect codeowner regexp: %s", err))
 		return nil, warnings
 	}
+	// Bound matching time so user-supplied patterns cannot stall PR creation via catastrophic backtracking.
+	rule.Rule.MatchTimeout = codeOwnerMatchTimeout
 
 	for _, user := range tokens[1:] {
 		user = strings.TrimPrefix(user, "@")
@@ -999,7 +904,7 @@ func ParseCodeOwnersLine(ctx context.Context, tokens []string) (*CodeOwnerRule, 
 		if strings.Contains(user, "/") {
 			s := strings.Split(user, "/")
 			if len(s) != 2 {
-				warnings = append(warnings, fmt.Sprintf("incorrect codeowner group: %s", user))
+				warnings = append(warnings, "incorrect codeowner group: "+user)
 				continue
 			}
 			orgName := s[0]
@@ -1007,12 +912,12 @@ func ParseCodeOwnersLine(ctx context.Context, tokens []string) (*CodeOwnerRule, 
 
 			org, err := org_model.GetOrgByName(ctx, orgName)
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("incorrect codeowner organization: %s", user))
+				warnings = append(warnings, "incorrect codeowner organization: "+user)
 				continue
 			}
 			teams, err := org.LoadTeams(ctx)
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("incorrect codeowner team: %s", user))
+				warnings = append(warnings, "incorrect codeowner team: "+user)
 				continue
 			}
 
@@ -1024,7 +929,7 @@ func ParseCodeOwnersLine(ctx context.Context, tokens []string) (*CodeOwnerRule, 
 		} else {
 			u, err := user_model.GetUserByName(ctx, user)
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("incorrect codeowner user: %s", user))
+				warnings = append(warnings, "incorrect codeowner user: "+user)
 				continue
 			}
 			rule.Users = append(rule.Users, u)
@@ -1078,22 +983,18 @@ func TokenizeCodeOwnersLine(line string) []string {
 
 // InsertPullRequests inserted pull requests
 func InsertPullRequests(ctx context.Context, prs ...*PullRequest) error {
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-	sess := db.GetEngine(ctx)
-	for _, pr := range prs {
-		if err := insertIssue(ctx, pr.Issue); err != nil {
-			return err
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		for _, pr := range prs {
+			if err := insertIssue(ctx, pr.Issue); err != nil {
+				return err
+			}
+			pr.IssueID = pr.Issue.ID
+			if _, err := db.GetEngine(ctx).NoAutoTime().Insert(pr); err != nil {
+				return err
+			}
 		}
-		pr.IssueID = pr.Issue.ID
-		if _, err := sess.NoAutoTime().Insert(pr); err != nil {
-			return err
-		}
-	}
-	return committer.Commit()
+		return nil
+	})
 }
 
 // GetPullRequestByMergedCommit returns a merged pull request by the given commit
@@ -1114,4 +1015,17 @@ func GetPullRequestByMergedCommit(ctx context.Context, repoID int64, sha string)
 	}
 
 	return pr, nil
+}
+
+// GetPullRequestRequestedReviewerIDs returns IDs of reviewers currently requested for the given pull request.
+func GetPullRequestRequestedReviewerIDs(ctx context.Context, issueID int64) ([]int64, error) {
+	userIDs := make([]int64, 0, 5)
+	return userIDs, db.GetEngine(ctx).
+		Table("review").
+		Cols("reviewer_id").
+		Where("issue_id=?", issueID).
+		And("type=?", ReviewTypeRequest).
+		And("reviewer_id > 0").
+		Distinct("reviewer_id").
+		Find(&userIDs)
 }

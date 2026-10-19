@@ -5,30 +5,29 @@ package integration
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
-	"path"
-	"strconv"
 	"strings"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	git_model "code.gitea.io/gitea/models/git"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/lfs"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	git_model "gitea.dev/models/git"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAPILFSNotStarted(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
-
-	setting.LFS.StartServer = false
+	defer test.MockVariableValue(&setting.LFS.StartServer, false)()
 
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
 	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
@@ -47,8 +46,7 @@ func TestAPILFSNotStarted(t *testing.T) {
 
 func TestAPILFSMediaType(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
-
-	setting.LFS.StartServer = true
+	defer test.MockVariableValue(&setting.LFS.StartServer, true)()
 
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
 	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
@@ -59,26 +57,25 @@ func TestAPILFSMediaType(t *testing.T) {
 	MakeRequest(t, req, http.StatusUnsupportedMediaType)
 }
 
-func createLFSTestRepository(t *testing.T, name string) *repo_model.Repository {
-	ctx := NewAPITestContext(t, "user2", "lfs-"+name+"-repo", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
+func createLFSTestRepository(t *testing.T, repoName string) *repo_model.Repository {
+	t.Helper()
+	ctx := NewAPITestContext(t, "user2", repoName, auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
 	t.Run("CreateRepo", doAPICreateRepository(ctx, false))
 
-	repo, err := repo_model.GetRepositoryByOwnerAndName(db.DefaultContext, "user2", "lfs-"+name+"-repo")
-	assert.NoError(t, err)
+	repo, err := repo_model.GetRepositoryByOwnerAndName(t.Context(), "user2", repoName)
+	require.NoError(t, err)
 
 	return repo
 }
 
 func TestAPILFSBatch(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
+	defer test.MockVariableValue(&setting.LFS.StartServer, true)()
 
-	setting.LFS.StartServer = true
+	repo := createLFSTestRepository(t, "lfs-batch-repo")
 
-	repo := createLFSTestRepository(t, "batch")
-
-	content := []byte("dummy1")
-	oid := storeObjectInRepo(t, repo.ID, &content)
-	defer git_model.RemoveLFSMetaObjectByOid(db.DefaultContext, repo.ID, oid)
+	oid := storeObjectInRepo(t, repo.ID, "dummy1")
+	defer git_model.RemoveLFSMetaObjectByOid(t.Context(), repo.ID, oid)
 
 	session := loginUser(t, "user2")
 
@@ -226,9 +223,7 @@ func TestAPILFSBatch(t *testing.T) {
 
 		t.Run("FileTooBig", func(t *testing.T) {
 			defer tests.PrintCurrentTest(t)()
-
-			oldMaxFileSize := setting.LFS.MaxFileSize
-			setting.LFS.MaxFileSize = 2
+			defer test.MockVariableValue(&setting.LFS.MaxFileSize, 2)()
 
 			req := newRequest(t, &lfs.BatchRequest{
 				Operation: "upload",
@@ -243,13 +238,16 @@ func TestAPILFSBatch(t *testing.T) {
 			assert.NotNil(t, br.Objects[0].Error)
 			assert.Equal(t, http.StatusUnprocessableEntity, br.Objects[0].Error.Code)
 			assert.Equal(t, "Size must be less than or equal to 2", br.Objects[0].Error.Message)
-
-			setting.LFS.MaxFileSize = oldMaxFileSize
 		})
 
-		t.Run("AddMeta", func(t *testing.T) {
+		t.Run("CrossRepoObjectRequiresUpload", func(t *testing.T) {
 			defer tests.PrintCurrentTest(t)()
 
+			// An object whose bytes already exist in the store but which is not
+			// linked to this repo must not be silently linked, even when the
+			// caller can access it in another repo. Auto-linking let a deploy key
+			// (whose token carries the repo owner's identity) exfiltrate objects
+			// across repos without proving possession. The client must upload.
 			p := lfs.Pointer{Oid: "05eeb4eb5be71f2dd291ca39157d6d9effd7d1ea19cbdc8a99411fe2a8f26a00", Size: 6}
 
 			contentStore := lfs.NewContentStore()
@@ -257,11 +255,11 @@ func TestAPILFSBatch(t *testing.T) {
 			assert.NoError(t, err)
 			assert.True(t, exist)
 
-			repo2 := createLFSTestRepository(t, "batch2")
-			content := []byte("dummy0")
-			storeObjectInRepo(t, repo2.ID, &content)
+			// The object is linked to another repo owned by the same user.
+			repo2 := createLFSTestRepository(t, "lfs-batch2-repo")
+			storeObjectInRepo(t, repo2.ID, "dummy0")
 
-			meta, err := git_model.GetLFSMetaObjectByOid(db.DefaultContext, repo.ID, p.Oid)
+			meta, err := git_model.GetLFSMetaObjectByOid(t.Context(), repo.ID, p.Oid)
 			assert.Nil(t, meta)
 			assert.Equal(t, git_model.ErrLFSObjectNotExist, err)
 
@@ -274,14 +272,16 @@ func TestAPILFSBatch(t *testing.T) {
 			br := decodeResponse(t, resp.Body)
 			assert.Len(t, br.Objects, 1)
 			assert.Nil(t, br.Objects[0].Error)
-			assert.Empty(t, br.Objects[0].Actions)
+			// The client is told to upload instead of the object being linked.
+			assert.Contains(t, br.Objects[0].Actions, "upload")
 
-			meta, err = git_model.GetLFSMetaObjectByOid(db.DefaultContext, repo.ID, p.Oid)
-			assert.NoError(t, err)
-			assert.NotNil(t, meta)
+			// No meta object may have been created for this repo.
+			meta, err = git_model.GetLFSMetaObjectByOid(t.Context(), repo.ID, p.Oid)
+			assert.Nil(t, meta)
+			assert.Equal(t, git_model.ErrLFSObjectNotExist, err)
 
 			// Cleanup
-			err = contentStore.Delete(p.RelativePath())
+			err = contentStore.ObjectStorage.Delete(p.RelativePath())
 			assert.NoError(t, err)
 		})
 
@@ -320,6 +320,7 @@ func TestAPILFSBatch(t *testing.T) {
 			ul := br.Objects[0].Actions["upload"]
 			assert.NotNil(t, ul)
 			assert.NotEmpty(t, ul.Href)
+			assert.Equal(t, "chunked", ul.Header["Transfer-Encoding"], "git-lfs client needs Transfer-Encoding to do chunked transfer")
 			assert.Contains(t, br.Objects[0].Actions, "verify")
 			vl := br.Objects[0].Actions["verify"]
 			assert.NotNil(t, vl)
@@ -330,19 +331,14 @@ func TestAPILFSBatch(t *testing.T) {
 
 func TestAPILFSUpload(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
+	defer test.MockVariableValue(&setting.LFS.StartServer, true)()
 
-	setting.LFS.StartServer = true
-
-	repo := createLFSTestRepository(t, "upload")
-
-	content := []byte("dummy3")
-	oid := storeObjectInRepo(t, repo.ID, &content)
-	defer git_model.RemoveLFSMetaObjectByOid(db.DefaultContext, repo.ID, oid)
-
+	repo := createLFSTestRepository(t, "lfs-upload-repo")
 	session := loginUser(t, "user2")
 
 	newRequest := func(t testing.TB, p lfs.Pointer, content string) *RequestWrapper {
-		return NewRequestWithBody(t, "PUT", path.Join("/user2/lfs-upload-repo.git/info/lfs/objects/", p.Oid, strconv.FormatInt(p.Size, 10)), strings.NewReader(content))
+		reqUrl := fmt.Sprintf("/user2/lfs-upload-repo.git/info/lfs/objects/%s/%d", p.Oid, p.Size)
+		return NewRequestWithBody(t, "PUT", reqUrl, strings.NewReader(content))
 	}
 
 	t.Run("InvalidPointer", func(t *testing.T) {
@@ -365,7 +361,7 @@ func TestAPILFSUpload(t *testing.T) {
 		err = contentStore.Put(p, bytes.NewReader([]byte("dummy5")))
 		assert.NoError(t, err)
 
-		meta, err := git_model.GetLFSMetaObjectByOid(db.DefaultContext, repo.ID, p.Oid)
+		meta, err := git_model.GetLFSMetaObjectByOid(t.Context(), repo.ID, p.Oid)
 		assert.Nil(t, meta)
 		assert.Equal(t, git_model.ErrLFSObjectNotExist, err)
 
@@ -378,21 +374,20 @@ func TestAPILFSUpload(t *testing.T) {
 			req := newRequest(t, p, "dummy5")
 
 			session.MakeRequest(t, req, http.StatusOK)
-			meta, err = git_model.GetLFSMetaObjectByOid(db.DefaultContext, repo.ID, p.Oid)
+			meta, err = git_model.GetLFSMetaObjectByOid(t.Context(), repo.ID, p.Oid)
 			assert.NoError(t, err)
 			assert.NotNil(t, meta)
 		})
 
 		// Cleanup
-		err = contentStore.Delete(p.RelativePath())
+		err = contentStore.ObjectStorage.Delete(p.RelativePath())
 		assert.NoError(t, err)
 	})
 
 	t.Run("MetaAlreadyExists", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
-
+		oid := storeObjectInRepo(t, repo.ID, "123456")
 		req := newRequest(t, lfs.Pointer{Oid: oid, Size: 6}, "")
-
 		session.MakeRequest(t, req, http.StatusOK)
 	})
 
@@ -412,6 +407,24 @@ func TestAPILFSUpload(t *testing.T) {
 		session.MakeRequest(t, req, http.StatusUnprocessableEntity)
 	})
 
+	t.Run("ConcurrentFailureKeepsExistingMeta", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+		pointer, err := lfs.GeneratePointer(strings.NewReader("any-content"))
+		assert.NoError(t, err)
+
+		// mock a record in database: it should not happen in real world (no existing file in the store)
+		// !!for testing purpose only!! to verify a failed upload should not remove a valid record,
+		_, err = git_model.NewLFSMetaObject(t.Context(), repo.ID, pointer)
+		assert.NoError(t, err)
+
+		// make an invalid request, the existing lfs record should not be removed
+		req := newRequest(t, lfs.Pointer{Oid: pointer.Oid, Size: 1}, "invalid content")
+		session.MakeRequest(t, req, http.StatusUnprocessableEntity)
+		meta, err := git_model.GetLFSMetaObjectByOid(t.Context(), repo.ID, pointer.Oid)
+		assert.NoError(t, err)
+		assert.NotNil(t, meta)
+	})
+
 	t.Run("Success", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
@@ -426,7 +439,7 @@ func TestAPILFSUpload(t *testing.T) {
 		assert.NoError(t, err)
 		assert.True(t, exist)
 
-		meta, err := git_model.GetLFSMetaObjectByOid(db.DefaultContext, repo.ID, p.Oid)
+		meta, err := git_model.GetLFSMetaObjectByOid(t.Context(), repo.ID, p.Oid)
 		assert.NoError(t, err)
 		assert.NotNil(t, meta)
 	})
@@ -434,14 +447,11 @@ func TestAPILFSUpload(t *testing.T) {
 
 func TestAPILFSVerify(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
+	defer test.MockVariableValue(&setting.LFS.StartServer, true)()
 
-	setting.LFS.StartServer = true
-
-	repo := createLFSTestRepository(t, "verify")
-
-	content := []byte("dummy3")
-	oid := storeObjectInRepo(t, repo.ID, &content)
-	defer git_model.RemoveLFSMetaObjectByOid(db.DefaultContext, repo.ID, oid)
+	repo := createLFSTestRepository(t, "lfs-verify-repo")
+	oid := storeObjectInRepo(t, repo.ID, "dummy3")
+	defer git_model.RemoveLFSMetaObjectByOid(t.Context(), repo.ID, oid)
 
 	session := loginUser(t, "user2")
 

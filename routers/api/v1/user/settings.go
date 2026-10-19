@@ -6,12 +6,12 @@ package user
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/modules/optional"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
-	user_service "code.gitea.io/gitea/services/user"
+	"gitea.dev/modules/optional"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	user_service "gitea.dev/services/user"
 )
 
 // GetUserSettings returns user settings
@@ -43,7 +43,7 @@ func UpdateUserSettings(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/UserSettings"
 
-	form := web.GetForm(ctx).(*api.UserSettingsOptions)
+	form := web.GetForm[*api.UserSettingsOptions](ctx)
 
 	opts := &user_service.UpdateOptions{
 		FullName:            optional.FromPtr(form.FullName),
@@ -57,7 +57,7 @@ func UpdateUserSettings(ctx *context.APIContext) {
 		KeepActivityPrivate: optional.FromPtr(form.HideActivity),
 	}
 	if err := user_service.UpdateUser(ctx, ctx.Doer, opts); err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 

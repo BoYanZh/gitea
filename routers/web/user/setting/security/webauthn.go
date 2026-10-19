@@ -9,14 +9,17 @@ import (
 	"strconv"
 	"time"
 
-	"code.gitea.io/gitea/models/auth"
-	user_model "code.gitea.io/gitea/models/user"
-	wa "code.gitea.io/gitea/modules/auth/webauthn"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/forms"
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
+	wa "gitea.dev/modules/auth/webauthn"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -25,11 +28,11 @@ import (
 // WebAuthnRegister initializes the webauthn registration procedure
 func WebAuthnRegister(ctx *context.Context) {
 	if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureManageMFA) {
-		ctx.Error(http.StatusNotFound)
+		ctx.HTTPError(http.StatusNotFound)
 		return
 	}
 
-	form := web.GetForm(ctx).(*forms.WebauthnRegistrationForm)
+	form := web.GetForm[*forms.WebauthnRegistrationForm](ctx)
 	if form.Name == "" {
 		// Set name to the hexadecimal of the current time
 		form.Name = strconv.FormatInt(time.Now().UnixNano(), 16)
@@ -41,7 +44,7 @@ func WebAuthnRegister(ctx *context.Context) {
 		return
 	}
 	if cred != nil {
-		ctx.Error(http.StatusConflict, "Name already taken")
+		ctx.HTTPError(http.StatusConflict, "Name already taken")
 		return
 	}
 
@@ -51,8 +54,18 @@ func WebAuthnRegister(ctx *context.Context) {
 		return
 	}
 
-	credentialOptions, sessionData, err := wa.WebAuthn.BeginRegistration((*wa.User)(ctx.Doer), webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+	webAuthnUser := wa.NewWebAuthnUser(ctx, ctx.Doer)
+	// the exclusions stop enrolling the same authenticator twice
+	credentials, err := auth.GetWebAuthnCredentialsByUID(ctx, ctx.Doer.ID)
+	if err != nil {
+		ctx.ServerError("GetWebAuthnCredentialsByUID", err)
+		return
+	}
+	exclusions := webauthn.Credentials(credentials.ToCredentials()).CredentialDescriptors()
+	credentialOptions, sessionData, err := wa.WebAuthn.BeginRegistration(webAuthnUser, webauthn.WithExclusions(exclusions), webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 		ResidentKey: protocol.ResidentKeyRequirementRequired,
+		// anything else makes Chromium raise it to credProtect level 3, hiding it from the second factor
+		UserVerification: protocol.VerificationRequired,
 	}))
 	if err != nil {
 		ctx.ServerError("Unable to BeginRegistration", err)
@@ -71,7 +84,7 @@ func WebAuthnRegister(ctx *context.Context) {
 // WebauthnRegisterPost receives the response of the security key
 func WebauthnRegisterPost(ctx *context.Context) {
 	if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureManageMFA) {
-		ctx.Error(http.StatusNotFound)
+		ctx.HTTPError(http.StatusNotFound)
 		return
 	}
 
@@ -92,7 +105,8 @@ func WebauthnRegisterPost(ctx *context.Context) {
 	}()
 
 	// Verify that the challenge succeeded
-	cred, err := wa.WebAuthn.FinishRegistration((*wa.User)(ctx.Doer), *sessionData, ctx.Req)
+	webAuthnUser := wa.NewWebAuthnUser(ctx, ctx.Doer)
+	cred, err := wa.WebAuthn.FinishRegistration(webAuthnUser, *sessionData, ctx.Req)
 	if err != nil {
 		if pErr, ok := err.(*protocol.Error); ok {
 			log.Error("Unable to finish registration due to error: %v\nDevInfo: %s", pErr, pErr.DevInfo)
@@ -107,32 +121,71 @@ func WebauthnRegisterPost(ctx *context.Context) {
 		return
 	}
 	if dbCred != nil {
-		ctx.Error(http.StatusConflict, "Name already taken")
+		ctx.HTTPError(http.StatusConflict, "Name already taken")
 		return
 	}
 
 	// Create the credential
-	_, err = auth.CreateCredential(ctx, ctx.Doer.ID, name, cred)
+	dbCred, err = auth.CreateCredential(ctx, ctx.Doer.ID, name, cred)
 	if err != nil {
 		ctx.ServerError("CreateCredential", err)
 		return
 	}
 	_ = ctx.Session.Delete("webauthnName")
+	_ = ctx.Session.Set(session.KeyUserHasTwoFactorAuth, true)
+
+	audit.Record(ctx, audit_model.UserWebAuthAdd, ctx.Doer, "credential", dbCred.Name)
 
 	ctx.JSON(http.StatusCreated, cred)
 }
 
-// WebauthnDelete deletes an security key by id
-func WebauthnDelete(ctx *context.Context) {
+// WebauthnRename changes the nickname of a security key
+func WebauthnRename(ctx *context.Context) {
 	if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureManageMFA) {
-		ctx.Error(http.StatusNotFound)
+		ctx.HTTPError(http.StatusNotFound)
 		return
 	}
 
-	form := web.GetForm(ctx).(*forms.WebauthnDeleteForm)
-	if _, err := auth.DeleteCredential(ctx, form.ID, ctx.Doer.ID); err != nil {
-		ctx.ServerError("GetWebAuthnCredentialByID", err)
+	form := context.GetFetchActionForm[*forms.WebauthnRenameForm](ctx)
+	if form == nil {
 		return
+	}
+
+	cred, err := auth.GetWebAuthnCredentialByID(ctx, ctx.Doer.ID, ctx.FormInt64("id"))
+	if err != nil {
+		ctx.JSONErrorAuto(err)
+		return
+	}
+
+	renamed, err := auth.RenameCredential(ctx, ctx.Doer.ID, form.ID, form.Name)
+	if err != nil {
+		ctx.JSONErrorAuto(err)
+		return
+	}
+	if renamed {
+		audit.Record(ctx, audit_model.UserWebAuthRename, ctx.Doer, "previous_credential", cred.Name, "credential", form.Name)
+	}
+	ctx.JSONRedirect(setting.AppSubURL + "/user/settings/security")
+}
+
+// WebauthnDelete deletes a security key by id
+func WebauthnDelete(ctx *context.Context) {
+	if user_model.IsFeatureDisabledWithLoginType(ctx.Doer, setting.UserFeatureManageMFA) {
+		ctx.HTTPError(http.StatusNotFound)
+		return
+	}
+
+	cred, err := auth.GetWebAuthnCredentialByID(ctx, ctx.Doer.ID, ctx.FormInt64("id"))
+	if err != nil {
+		ctx.JSONErrorAuto(err)
+		return
+	}
+
+	if ok, err := auth.DeleteCredential(ctx, ctx.Doer.ID, cred.ID); err != nil {
+		ctx.ServerError("DeleteCredential", err)
+		return
+	} else if ok {
+		audit.Record(ctx, audit_model.UserWebAuthRemove, ctx.Doer, "credential", cred.Name)
 	}
 	ctx.JSONRedirect(setting.AppSubURL + "/user/settings/security")
 }

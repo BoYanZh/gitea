@@ -5,12 +5,13 @@ package goproxy
 
 import (
 	"archive/zip"
-	"fmt"
 	"io"
 	"path"
 	"strings"
 
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/util"
+
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -21,6 +22,7 @@ const (
 
 var (
 	ErrInvalidStructure  = util.NewInvalidArgumentErrorf("package has invalid structure")
+	ErrInvalidVersion    = util.NewInvalidArgumentErrorf("package version is invalid")
 	ErrGoModFileTooLarge = util.NewInvalidArgumentErrorf("go.mod file is too large")
 )
 
@@ -55,6 +57,13 @@ func ParsePackage(r io.ReaderAt, size int64) (*Package, error) {
 				Name:    strings.TrimSuffix(nameAndVersion, "@"+parts[1]),
 				Version: versionParts[0],
 			}
+
+			// the version is taken verbatim from the zip path and later written
+			// one per line into the @v/list proxy response, so it has to be a
+			// valid module version (no newlines or other stray characters)
+			if !semver.IsValid(p.Version) {
+				return nil, ErrInvalidVersion
+			}
 		}
 
 		if len(versionParts) > 1 {
@@ -88,7 +97,7 @@ func ParsePackage(r io.ReaderAt, size int64) (*Package, error) {
 		return nil, ErrInvalidStructure
 	}
 
-	p.GoMod = fmt.Sprintf("module %s", p.Name)
+	p.GoMod = "module " + p.Name
 
 	return p, nil
 }

@@ -4,18 +4,19 @@
 package integration
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/lfs"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/db"
+	"gitea.dev/models/git"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/lfs"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,7 @@ func TestLFSRender(t *testing.T) {
 		doc := NewHTMLParser(t, resp.Body).doc
 
 		fileInfo := doc.Find("div.file-info-entry").First().Text()
-		assert.Contains(t, fileInfo, "Stored with Git LFS")
+		assert.Contains(t, fileInfo, "LFS")
 
 		content := doc.Find("div.file-view").Text()
 		assert.Contains(t, content, "Testing documents in LFS")
@@ -53,7 +54,7 @@ func TestLFSRender(t *testing.T) {
 		doc := NewHTMLParser(t, resp.Body).doc
 
 		fileInfo := doc.Find("div.file-info-entry").First().Text()
-		assert.Contains(t, fileInfo, "Stored with Git LFS")
+		assert.Contains(t, fileInfo, "LFS")
 
 		src, exists := doc.Find(".file-view img").Attr("src")
 		assert.True(t, exists, "The image should be in an <img> tag")
@@ -67,14 +68,17 @@ func TestLFSRender(t *testing.T) {
 		req := NewRequest(t, "GET", "/user2/lfs/src/branch/master/crypt.bin")
 		resp := session.MakeRequest(t, req, http.StatusOK)
 
-		doc := NewHTMLParser(t, resp.Body).doc
+		doc := NewHTMLParser(t, resp.Body)
 
 		fileInfo := doc.Find("div.file-info-entry").First().Text()
-		assert.Contains(t, fileInfo, "Stored with Git LFS")
+		assert.Contains(t, fileInfo, "LFS")
+		fileSize := doc.Find("div.file-info-entry > .file-info-size").Text()
+		assert.Equal(t, "2.0 KiB", fileSize)
 
-		rawLink, exists := doc.Find("div.file-view > div.view-raw > a").Attr("href")
-		assert.True(t, exists, "Download link should render instead of content because this is a binary file")
-		assert.Equal(t, "/user2/lfs/media/branch/master/crypt.bin", rawLink, "The download link should use the proper /media link because it's in LFS")
+		// find new file view container
+		fileViewContainer := doc.Find("[data-global-init=initRepoFileView]")
+		assert.Equal(t, "/user2/lfs/media/branch/master/crypt.bin", fileViewContainer.AttrOr("data-raw-file-link", ""))
+		AssertHTMLElement(t, doc, ".view-raw > .file-view-render-container > .file-view-raw-prompt", 1)
 	})
 
 	// check that a directory with a README file shows its text
@@ -94,13 +98,18 @@ func TestLFSRender(t *testing.T) {
 	t.Run("Invalid", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
-		req := NewRequest(t, "GET", "/user2/lfs/src/branch/master/invalid")
+		// the LFS exists
+		req := NewRequest(t, "GET", "/user2/lfs/src/branch/master/CONTRIBUTING.md")
 		resp := session.MakeRequest(t, req, http.StatusOK)
+		content := NewHTMLParser(t, resp.Body).Find("div.file-view").Text()
+		assert.Contains(t, content, "Testing documents in LFS")
 
-		doc := NewHTMLParser(t, resp.Body).doc
-
-		content := doc.Find("div.file-view").Text()
-		assert.Contains(t, content, "oid sha256:9d178b5f15046343fd32f451df93acc2bdd9e6373be478b968e4cad6b6647351")
+		// then make it disappear
+		assert.NoError(t, db.TruncateBeans(t.Context(), &git.LFSMetaObject{}))
+		req = NewRequest(t, "GET", "/user2/lfs/src/branch/master/CONTRIBUTING.md")
+		resp = session.MakeRequest(t, req, http.StatusOK)
+		content = NewHTMLParser(t, resp.Body).Find("div.file-view").Text()
+		assert.Contains(t, content, "oid sha256:7b6b2c88dba9f760a1a58469b67fee2b698ef7e9399c4ca4f34a14ccbe39f623")
 	})
 }
 
@@ -120,8 +129,7 @@ func TestLFSLockView(t *testing.T) {
 		req.Header.Set("Accept", lfs.AcceptHeader)
 		req.Header.Set("Content-Type", lfs.MediaType)
 		resp := session.MakeRequest(t, req, http.StatusCreated)
-		lockResp := &api.LFSLockResponse{}
-		DecodeJSON(t, resp, lockResp)
+		lockResp := DecodeJSON(t, resp, &api.LFSLockResponse{})
 		lockID = lockResp.Lock.ID
 	}
 	defer func() {
@@ -136,7 +144,7 @@ func TestLFSLockView(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
 		// make sure the display names are different, or the test is meaningless
-		require.NoError(t, repo3.LoadOwner(context.Background()))
+		require.NoError(t, repo3.LoadOwner(t.Context()))
 		require.NotEqual(t, user2.DisplayName(), repo3.Owner.DisplayName())
 
 		req := NewRequest(t, "GET", fmt.Sprintf("/%s/settings/lfs/locks", repo3.FullName()))

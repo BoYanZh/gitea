@@ -10,15 +10,17 @@ import (
 	"strconv"
 	"strings"
 
-	indexer_internal "code.gitea.io/gitea/modules/indexer/internal"
-	inner_meilisearch "code.gitea.io/gitea/modules/indexer/internal/meilisearch"
-	"code.gitea.io/gitea/modules/indexer/issues/internal"
+	"gitea.dev/modules/indexer"
+	indexer_internal "gitea.dev/modules/indexer/internal"
+	inner_meilisearch "gitea.dev/modules/indexer/internal/meilisearch"
+	"gitea.dev/modules/indexer/issues/internal"
+	"gitea.dev/modules/json"
 
 	"github.com/meilisearch/meilisearch-go"
 )
 
 const (
-	issueIndexerLatestVersion = 3
+	issueIndexerLatestVersion = 6
 
 	// TODO: make this configurable if necessary
 	maxTotalHits = 10000
@@ -33,6 +35,10 @@ var _ internal.Indexer = &Indexer{}
 type Indexer struct {
 	inner                    *inner_meilisearch.Indexer
 	indexer_internal.Indexer // do not composite inner_meilisearch.Indexer directly to avoid exposing too much
+}
+
+func (b *Indexer) SupportedSearchModes() []indexer.SearchMode {
+	return indexer.SearchModesExactWords()
 }
 
 // NewIndexer creates a new meilisearch indexer
@@ -61,13 +67,15 @@ func NewIndexer(url, apiKey, indexerName string) *Indexer {
 			"is_public",
 			"is_pull",
 			"is_closed",
+			"is_archived",
 			"label_ids",
 			"no_label",
 			"milestone_id",
-			"project_id",
-			"project_board_id",
+			"project_ids",
+			"no_project",
 			"poster_id",
-			"assignee_id",
+			"assignee_ids",
+			"no_assignee",
 			"mention_ids",
 			"reviewed_ids",
 			"review_requested_ids",
@@ -100,7 +108,8 @@ func (b *Indexer) Index(_ context.Context, issues ...*internal.IndexerData) erro
 		return nil
 	}
 	for _, issue := range issues {
-		_, err := b.inner.Client.Index(b.inner.VersionedIndexName()).AddDocuments(issue)
+		// use default primary key which should be "id"
+		_, err := b.inner.Client.Index(b.inner.VersionedIndexName()).AddDocuments(issue, nil)
 		if err != nil {
 			return err
 		}
@@ -116,7 +125,7 @@ func (b *Indexer) Delete(_ context.Context, ids ...int64) error {
 	}
 
 	for _, id := range ids {
-		_, err := b.inner.Client.Index(b.inner.VersionedIndexName()).DeleteDocument(strconv.FormatInt(id, 10))
+		_, err := b.inner.Client.Index(b.inner.VersionedIndexName()).DeleteDocument(strconv.FormatInt(id, 10), nil)
 		if err != nil {
 			return err
 		}
@@ -145,6 +154,9 @@ func (b *Indexer) Search(ctx context.Context, options *internal.SearchOptions) (
 	if options.IsClosed.Has() {
 		query.And(inner_meilisearch.NewFilterEq("is_closed", options.IsClosed.Value()))
 	}
+	if options.IsArchived.Has() {
+		query.And(inner_meilisearch.NewFilterEq("is_archived", options.IsArchived.Value()))
+	}
 
 	if options.NoLabelOnly {
 		query.And(inner_meilisearch.NewFilterEq("no_label", true))
@@ -171,19 +183,28 @@ func (b *Indexer) Search(ctx context.Context, options *internal.SearchOptions) (
 		query.And(inner_meilisearch.NewFilterIn("milestone_id", options.MilestoneIDs...))
 	}
 
-	if options.ProjectID.Has() {
-		query.And(inner_meilisearch.NewFilterEq("project_id", options.ProjectID.Value()))
-	}
-	if options.ProjectColumnID.Has() {
-		query.And(inner_meilisearch.NewFilterEq("project_board_id", options.ProjectColumnID.Value()))
-	}
-
-	if options.PosterID.Has() {
-		query.And(inner_meilisearch.NewFilterEq("poster_id", options.PosterID.Value()))
+	if options.NoProjectOnly {
+		query.And(inner_meilisearch.NewFilterEq("no_project", true))
+	} else if len(options.ProjectIDs) > 0 {
+		// FIXME: ISSUE-MULTIPLE-PROJECTS-FILTER: this logic is not right, it should use "AND" but not "OR"
+		query.And(inner_meilisearch.NewFilterIn("project_ids", options.ProjectIDs...))
 	}
 
-	if options.AssigneeID.Has() {
-		query.And(inner_meilisearch.NewFilterEq("assignee_id", options.AssigneeID.Value()))
+	if options.PosterID != "" {
+		// "(none)" becomes 0, it means no poster
+		posterIDInt64, _ := strconv.ParseInt(options.PosterID, 10, 64)
+		query.And(inner_meilisearch.NewFilterEq("poster_id", posterIDInt64))
+	}
+
+	switch options.AssigneeID {
+	case "":
+	case "(any)":
+		query.And(inner_meilisearch.NewFilterEq("no_assignee", false))
+	case "(none)":
+		query.And(inner_meilisearch.NewFilterEq("no_assignee", true))
+	default:
+		assigneeIDInt64, _ := strconv.ParseInt(options.AssigneeID, 10, 64)
+		query.And(inner_meilisearch.NewFilterEq("assignee_ids", assigneeIDInt64))
 	}
 
 	if options.MentionID.Has() {
@@ -226,9 +247,8 @@ func (b *Indexer) Search(ctx context.Context, options *internal.SearchOptions) (
 		limit = 1
 	}
 
-	keyword := options.Keyword
-	if !options.IsFuzzyKeyword {
-		// to make it non fuzzy ("typo tolerance" in meilisearch terms), we have to quote the keyword(s)
+	keyword := options.Keyword // default to match "words"
+	if options.SearchMode == indexer.SearchModeExact {
 		// https://www.meilisearch.com/docs/reference/api/search#phrase-search
 		keyword = doubleQuoteKeyword(keyword)
 	}
@@ -283,18 +303,13 @@ func doubleQuoteKeyword(k string) string {
 func convertHits(searchRes *meilisearch.SearchResponse) ([]internal.Match, error) {
 	hits := make([]internal.Match, 0, len(searchRes.Hits))
 	for _, hit := range searchRes.Hits {
-		hit, ok := hit.(map[string]any)
-		if !ok {
-			return nil, ErrMalformedResponse
-		}
-
-		issueID, ok := hit["id"].(float64)
-		if !ok {
+		var issueID int64
+		if err := json.Unmarshal(hit["id"], &issueID); err != nil {
 			return nil, ErrMalformedResponse
 		}
 
 		hits = append(hits, internal.Match{
-			ID: int64(issueID),
+			ID: issueID,
 		})
 	}
 	return hits, nil

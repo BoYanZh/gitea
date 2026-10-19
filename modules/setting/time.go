@@ -6,7 +6,7 @@ package setting
 import (
 	"time"
 
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/log"
 )
 
 // DefaultUILocation is the location on the UI, so that we can display the time on UI.
@@ -20,7 +20,6 @@ func loadTimeFrom(rootCfg ConfigProvider) {
 		if err != nil {
 			log.Fatal("Load time zone failed: %v", err)
 		}
-		log.Info("Default UI Location is %v", zone)
 	}
 	if DefaultUILocation == nil {
 		DefaultUILocation = time.Local

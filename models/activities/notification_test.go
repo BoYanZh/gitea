@@ -7,20 +7,23 @@ import (
 	"context"
 	"testing"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
+	activities_model "gitea.dev/models/activities"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateOrUpdateIssueNotifications(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 	issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: 1})
 
-	assert.NoError(t, activities_model.CreateOrUpdateIssueNotifications(db.DefaultContext, issue.ID, 0, 2, 0))
+	_, err := activities_model.CreateOrUpdateIssueNotifications(t.Context(), issue.ID, 0, 2, 0)
+	assert.NoError(t, err)
 
 	// User 9 is inactive, thus notifications for user 1 and 4 are created
 	notf := unittest.AssertExistsAndLoadBean(t, &activities_model.Notification{UserID: 1, IssueID: issue.ID})
@@ -31,10 +34,65 @@ func TestCreateOrUpdateIssueNotifications(t *testing.T) {
 	assert.Equal(t, activities_model.NotificationStatusUnread, notf.Status)
 }
 
+func TestCreateOrUpdateIssueNotificationsForAssigneeAndReviewer(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	// user 13 neither watches repo 1 nor participates in PR 3
+	assert.NoError(t, db.Insert(t.Context(), &issues_model.IssueAssignees{AssigneeID: 13, IssueID: 3}))
+	_, err := activities_model.CreateOrUpdateIssueNotifications(t.Context(), 3, 0, 1, 0)
+	assert.NoError(t, err)
+	unittest.AssertExistsAndLoadBean(t, &activities_model.Notification{UserID: 13, IssueID: 3})
+
+	// user 1 is a requested reviewer of PR 12 and does not participate in it
+	_, err = activities_model.CreateOrUpdateIssueNotifications(t.Context(), 12, 0, 2, 0)
+	assert.NoError(t, err)
+	unittest.AssertExistsAndLoadBean(t, &activities_model.Notification{UserID: 1, IssueID: 12})
+}
+
+func TestCreateOrUpdateIssueNotificationsIgnored(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	// user 4 watches repo 1 and would be notified about issue 1
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
+	assert.NoError(t, repo_model.WatchRepoWithOptions(t.Context(), user, repo, repo_model.WatchOptions{Mode: repo_model.WatchModeDont}))
+
+	notified, err := activities_model.CreateOrUpdateIssueNotifications(t.Context(), 1, 0, 2, 0)
+	assert.NoError(t, err)
+	assert.NotContains(t, notified, user.ID)
+
+	// muting outranks a direct receiver too
+	notified, err = activities_model.CreateOrUpdateIssueNotifications(t.Context(), 1, 0, 2, user.ID)
+	assert.NoError(t, err)
+	assert.Empty(t, notified)
+}
+
+func TestNotificationsSkipBots(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	for _, id := range []int64{4, 28} {
+		assert.NoError(t, user_model.UpdateUserCols(t.Context(), &user_model.User{ID: id, Type: user_model.UserTypeBot}, "type"))
+	}
+
+	notifiedIDs, err := activities_model.CreateOrUpdateIssueNotifications(t.Context(), 1, 0, 2, 0)
+	assert.NoError(t, err)
+	assert.Contains(t, notifiedIDs, int64(1))
+	assert.NotContains(t, notifiedIDs, int64(4))
+
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+	org := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 3})
+	assert.NoError(t, activities_model.CreateRepoTransferNotification(t.Context(), doer, org, unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 3})))
+	unittest.AssertExistsAndLoadBean(t, &activities_model.Notification{UserID: 2, RepoID: 3, Source: activities_model.NotificationSourceRepository})
+	unittest.AssertNotExistsBean(t, &activities_model.Notification{UserID: 28, RepoID: 3, Source: activities_model.NotificationSourceRepository})
+
+	bot := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
+	assert.NoError(t, activities_model.CreateRepoTransferNotification(t.Context(), doer, bot, unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})))
+	unittest.AssertNotExistsBean(t, &activities_model.Notification{UserID: 4, RepoID: 1, Source: activities_model.NotificationSourceRepository})
+}
+
 func TestNotificationsForUser(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
-	notfs, err := db.Find[activities_model.Notification](db.DefaultContext, activities_model.FindNotificationOptions{
+	notfs, err := db.Find[activities_model.Notification](t.Context(), activities_model.FindNotificationOptions{
 		UserID: user.ID,
 		Status: []activities_model.NotificationStatus{
 			activities_model.NotificationStatusRead,
@@ -44,36 +102,101 @@ func TestNotificationsForUser(t *testing.T) {
 	assert.NoError(t, err)
 	if assert.Len(t, notfs, 3) {
 		assert.EqualValues(t, 5, notfs[0].ID)
-		assert.EqualValues(t, user.ID, notfs[0].UserID)
+		assert.Equal(t, user.ID, notfs[0].UserID)
 		assert.EqualValues(t, 4, notfs[1].ID)
-		assert.EqualValues(t, user.ID, notfs[1].UserID)
+		assert.Equal(t, user.ID, notfs[1].UserID)
 		assert.EqualValues(t, 2, notfs[2].ID)
-		assert.EqualValues(t, user.ID, notfs[2].UserID)
+		assert.Equal(t, user.ID, notfs[2].UserID)
 	}
+}
+
+func TestNotificationListLoadAttributes(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	first := &activities_model.Notification{RepoID: 1, IssueID: 1, UserID: 1, CommentID: 2}
+	last := &activities_model.Notification{RepoID: 2, IssueID: 4, UserID: 2, CommentID: 8}
+	loaded := &activities_model.Notification{
+		RepoID: 1, IssueID: 1, UserID: 1, CommentID: 2,
+		Repository: &repo_model.Repository{ID: 1},
+		Issue:      &issues_model.Issue{ID: 1},
+		User:       &user_model.User{ID: 1},
+		Comment:    &issues_model.Comment{ID: 2},
+	}
+	saved := *loaded
+	list := activities_model.NotificationList{first}
+	var wantFailures []int
+	for i := range db.DefaultMaxInSize {
+		id := unittest.NonexistentID - int64(i)
+		wantFailures = append(wantFailures, len(list))
+		list = append(list, &activities_model.Notification{RepoID: id, IssueID: id, UserID: id, CommentID: id})
+	}
+	withoutIssue := &activities_model.Notification{RepoID: 1}
+	list = append(list, last, loaded, withoutIssue)
+
+	repos, failures, err := list.LoadRepos(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, wantFailures, failures)
+	require.Len(t, repos, 2)
+	assert.Equal(t, int64(1), repos[0].ID)
+	assert.Equal(t, int64(2), repos[1].ID)
+	failures, err = list.LoadIssues(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, wantFailures, failures)
+	failures, err = list.LoadUsers(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, failures)
+	failures, err = list.LoadComments(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, failures)
+
+	for _, notification := range []*activities_model.Notification{first, last} {
+		require.NotNil(t, notification.Repository)
+		assert.Equal(t, notification.RepoID, notification.Repository.ID)
+		require.NotNil(t, notification.Issue)
+		assert.Equal(t, notification.IssueID, notification.Issue.ID)
+		assert.Same(t, notification.Repository, notification.Issue.Repo)
+		require.NotNil(t, notification.User)
+		assert.Equal(t, notification.UserID, notification.User.ID)
+		require.NotNil(t, notification.Comment)
+		assert.Equal(t, notification.CommentID, notification.Comment.ID)
+		assert.Same(t, notification.Issue, notification.Comment.Issue)
+	}
+	assert.Same(t, saved.Repository, loaded.Repository)
+	assert.Same(t, saved.Issue, loaded.Issue)
+	assert.Same(t, saved.User, loaded.User)
+	assert.Same(t, saved.Comment, loaded.Comment)
+	for _, notification := range list[1 : db.DefaultMaxInSize+1] {
+		assert.Nil(t, notification.Repository)
+		assert.Nil(t, notification.Issue)
+		assert.Nil(t, notification.User)
+		assert.Nil(t, notification.Comment)
+	}
+	assert.Nil(t, withoutIssue.Issue)
+	assert.Nil(t, withoutIssue.User)
+	assert.Nil(t, withoutIssue.Comment)
 }
 
 func TestNotification_GetRepo(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 	notf := unittest.AssertExistsAndLoadBean(t, &activities_model.Notification{RepoID: 1})
-	repo, err := notf.GetRepo(db.DefaultContext)
+	repo, err := notf.GetRepo(t.Context())
 	assert.NoError(t, err)
 	assert.Equal(t, repo, notf.Repository)
-	assert.EqualValues(t, notf.RepoID, repo.ID)
+	assert.Equal(t, notf.RepoID, repo.ID)
 }
 
 func TestNotification_GetIssue(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 	notf := unittest.AssertExistsAndLoadBean(t, &activities_model.Notification{RepoID: 1})
-	issue, err := notf.GetIssue(db.DefaultContext)
+	issue, err := notf.GetIssue(t.Context())
 	assert.NoError(t, err)
 	assert.Equal(t, issue, notf.Issue)
-	assert.EqualValues(t, notf.IssueID, issue.ID)
+	assert.Equal(t, notf.IssueID, issue.ID)
 }
 
 func TestGetNotificationCount(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
-	cnt, err := db.Count[activities_model.Notification](db.DefaultContext, activities_model.FindNotificationOptions{
+	cnt, err := db.Count[activities_model.Notification](t.Context(), activities_model.FindNotificationOptions{
 		UserID: user.ID,
 		Status: []activities_model.NotificationStatus{
 			activities_model.NotificationStatusRead,
@@ -82,7 +205,7 @@ func TestGetNotificationCount(t *testing.T) {
 	assert.NoError(t, err)
 	assert.EqualValues(t, 0, cnt)
 
-	cnt, err = db.Count[activities_model.Notification](db.DefaultContext, activities_model.FindNotificationOptions{
+	cnt, err = db.Count[activities_model.Notification](t.Context(), activities_model.FindNotificationOptions{
 		UserID: user.ID,
 		Status: []activities_model.NotificationStatus{
 			activities_model.NotificationStatusUnread,
@@ -97,14 +220,14 @@ func TestSetNotificationStatus(t *testing.T) {
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
 	notf := unittest.AssertExistsAndLoadBean(t,
 		&activities_model.Notification{UserID: user.ID, Status: activities_model.NotificationStatusRead})
-	_, err := activities_model.SetNotificationStatus(db.DefaultContext, notf.ID, user, activities_model.NotificationStatusPinned)
+	_, err := activities_model.SetNotificationStatus(t.Context(), notf.ID, user, activities_model.NotificationStatusPinned)
 	assert.NoError(t, err)
 	unittest.AssertExistsAndLoadBean(t,
 		&activities_model.Notification{ID: notf.ID, Status: activities_model.NotificationStatusPinned})
 
-	_, err = activities_model.SetNotificationStatus(db.DefaultContext, 1, user, activities_model.NotificationStatusRead)
+	_, err = activities_model.SetNotificationStatus(t.Context(), 1, user, activities_model.NotificationStatusRead)
 	assert.Error(t, err)
-	_, err = activities_model.SetNotificationStatus(db.DefaultContext, unittest.NonexistentID, user, activities_model.NotificationStatusRead)
+	_, err = activities_model.SetNotificationStatus(t.Context(), unittest.NonexistentID, user, activities_model.NotificationStatusRead)
 	assert.Error(t, err)
 }
 
@@ -117,7 +240,8 @@ func TestUpdateNotificationStatuses(t *testing.T) {
 		&activities_model.Notification{UserID: user.ID, Status: activities_model.NotificationStatusRead})
 	notfPinned := unittest.AssertExistsAndLoadBean(t,
 		&activities_model.Notification{UserID: user.ID, Status: activities_model.NotificationStatusPinned})
-	assert.NoError(t, activities_model.UpdateNotificationStatuses(db.DefaultContext, user, activities_model.NotificationStatusUnread, activities_model.NotificationStatusRead))
+	_, err := activities_model.UpdateNotificationStatuses(t.Context(), user, activities_model.NotificationStatusUnread, activities_model.NotificationStatusRead)
+	assert.NoError(t, err)
 	unittest.AssertExistsAndLoadBean(t,
 		&activities_model.Notification{ID: notfUnread.ID, Status: activities_model.NotificationStatusRead})
 	unittest.AssertExistsAndLoadBean(t,
@@ -130,11 +254,12 @@ func TestSetIssueReadBy(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
 	issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: 1})
-	assert.NoError(t, db.WithTx(db.DefaultContext, func(ctx context.Context) error {
-		return activities_model.SetIssueReadBy(ctx, issue.ID, user.ID)
+	assert.NoError(t, db.WithTx(t.Context(), func(ctx context.Context) error {
+		_, err := activities_model.SetIssueReadBy(ctx, issue.ID, user.ID)
+		return err
 	}))
 
-	nt, err := activities_model.GetIssueNotification(db.DefaultContext, user.ID, issue.ID)
+	nt, err := activities_model.GetIssueNotification(t.Context(), user.ID, issue.ID)
 	assert.NoError(t, err)
-	assert.EqualValues(t, activities_model.NotificationStatusRead, nt.Status)
+	assert.Equal(t, activities_model.NotificationStatusRead, nt.Status)
 }

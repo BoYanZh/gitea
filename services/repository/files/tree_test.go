@@ -4,11 +4,14 @@
 package files
 
 import (
+	"html/template"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/services/contexttest"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/fileicon"
+	"gitea.dev/modules/git"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/services/contexttest"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -22,17 +25,15 @@ func TestGetTreeBySHA(t *testing.T) {
 	contexttest.LoadGitRepo(t, ctx)
 	defer ctx.Repo.GitRepo.Close()
 
-	sha := ctx.Repo.Repository.DefaultBranch
 	page := 1
 	perPage := 10
-	ctx.SetPathParam(":id", "1")
-	ctx.SetPathParam(":sha", sha)
+	ctx.SetPathParam("sha", ctx.Repo.Repository.DefaultBranch)
 
-	tree, err := GetTreeBySHA(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, ctx.PathParam(":sha"), page, perPage, true)
+	tree, err := GetTreeBySHA(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, ctx.PathParam("sha"), page, perPage, true)
 	assert.NoError(t, err)
 	expectedTree := &api.GitTreeResponse{
-		SHA: "65f1bf27bc3bf70f64657658635e66094edbcb4d",
-		URL: "https://try.gitea.io/api/v1/repos/user2/repo1/git/trees/65f1bf27bc3bf70f64657658635e66094edbcb4d",
+		SHA: "2a2f1d4670728a2e10049e345bd7a276468beab6",
+		URL: "https://try.gitea.io/api/v1/repos/user2/repo1/git/trees/2a2f1d4670728a2e10049e345bd7a276468beab6",
 		Entries: []api.GitEntry{
 			{
 				Path: "README.md",
@@ -48,5 +49,73 @@ func TestGetTreeBySHA(t *testing.T) {
 		TotalCount: 1,
 	}
 
-	assert.EqualValues(t, expectedTree, tree)
+	assert.Equal(t, expectedTree, tree)
+}
+
+func TestGetTreeViewNodes(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+
+	ctx, _ := contexttest.MockContext(t, "user2/repo1")
+	ctx.Repo.RefFullName = git.RefNameFromBranch("sub-home-md-img-check")
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadRepoCommit(t, ctx)
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo.GitRepo.Close()
+
+	curRepoLink := "/any/repo-link"
+	renderedIconPool := fileicon.NewRenderedIconPool()
+	mockIconForFile := func(id string) template.HTML {
+		return template.HTML(`<svg class="svg git-entry-icon octicon-file" width="16" height="16" aria-hidden="true"><use href="#` + id + `"></use></svg>`)
+	}
+	mockIconForFolder := func() template.HTML {
+		// With basic theme (default for folders), we get octicon icons without IDs
+		return template.HTML(`<span>octicon-file-directory-fill(16/)</span>`)
+	}
+	mockOpenIconForFolder := func() template.HTML {
+		// With basic theme (default for folders), we get octicon icons without IDs
+		return template.HTML(`<span>octicon-file-directory-open-fill(16/)</span>`)
+	}
+	treeNodes, err := GetTreeViewNodes(ctx, curRepoLink, renderedIconPool, ctx.Repo.GitRepo, ctx.Repo.Commit, "", "")
+	assert.NoError(t, err)
+	assert.Equal(t, []*TreeViewNode{
+		{
+			EntryName:     "docs",
+			EntryMode:     "tree",
+			FullPath:      "docs",
+			EntryIcon:     mockIconForFolder(),
+			EntryIconOpen: mockOpenIconForFolder(),
+		},
+	}, treeNodes)
+
+	treeNodes, err = GetTreeViewNodes(ctx, curRepoLink, renderedIconPool, ctx.Repo.GitRepo, ctx.Repo.Commit, "", "docs/README.md")
+	assert.NoError(t, err)
+	assert.Equal(t, []*TreeViewNode{
+		{
+			EntryName:     "docs",
+			EntryMode:     "tree",
+			FullPath:      "docs",
+			EntryIcon:     mockIconForFolder(),
+			EntryIconOpen: mockOpenIconForFolder(),
+			Children: []*TreeViewNode{
+				{
+					EntryName: "README.md",
+					EntryMode: "blob",
+					FullPath:  "docs/README.md",
+					EntryIcon: mockIconForFile(`svg-mfi-readme`),
+				},
+			},
+		},
+	}, treeNodes)
+
+	treeNodes, err = GetTreeViewNodes(ctx, curRepoLink, renderedIconPool, ctx.Repo.GitRepo, ctx.Repo.Commit, "docs", "README.md")
+	assert.NoError(t, err)
+	assert.Equal(t, []*TreeViewNode{
+		{
+			EntryName: "README.md",
+			EntryMode: "blob",
+			FullPath:  "docs/README.md",
+			EntryIcon: mockIconForFile(`svg-mfi-readme`),
+		},
+	}, treeNodes)
 }

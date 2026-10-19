@@ -4,21 +4,39 @@
 package validation
 
 import (
-	"net"
+	"net/mail"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
-	"code.gitea.io/gitea/modules/setting"
-
-	"github.com/gobwas/glob"
+	"gitea.dev/modules/glob"
+	"gitea.dev/modules/setting"
 )
 
-var externalTrackerRegex = regexp.MustCompile(`({?)(?:user|repo|index)+?(}?)`)
-
-func isLoopbackIP(ip string) bool {
-	return net.ParseIP(ip).IsLoopback()
+type globalVarsStruct struct {
+	externalTrackerRegex    *regexp.Regexp
+	validUsernamePattern    *regexp.Regexp
+	invalidUsernamePattern  *regexp.Regexp
+	validBadgeSlugPattern   *regexp.Regexp
+	invalidBadgeSlugPattern *regexp.Regexp
+	validEmailHostName      *regexp.Regexp
+	validEmailHostIP        *regexp.Regexp
 }
+
+var globalVars = sync.OnceValue(func() *globalVarsStruct {
+	return &globalVarsStruct{
+		externalTrackerRegex:    regexp.MustCompile(`({?)(?:user|repo|index)+?(}?)`),
+		validUsernamePattern:    regexp.MustCompile(`^[\da-zA-Z][-.\w]*$`),
+		invalidUsernamePattern:  regexp.MustCompile(`[-._]{2,}|[-._]$`), // No consecutive or trailing non-alphanumeric chars
+		validBadgeSlugPattern:   regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`),
+		invalidBadgeSlugPattern: regexp.MustCompile(`[-._]{2,}|[-._]$`),
+		validEmailHostName:      regexp.MustCompile(`^[a-zA-Z0-9][-.\w]*$`),
+		validEmailHostIP:        regexp.MustCompile(`(?i)^\[([0-9.]+|ipv6:[0-9a-f:.]+)\]$`),
+	}
+})
 
 // IsValidURL checks if URL is valid
 func IsValidURL(uri string) bool {
@@ -42,12 +60,7 @@ func IsValidSiteURL(uri string) bool {
 		return false
 	}
 
-	for _, scheme := range setting.Service.ValidSiteURLSchemes {
-		if scheme == u.Scheme {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(setting.Service.ValidSiteURLSchemes, u.Scheme)
 }
 
 // IsEmailDomainListed checks whether the domain of an email address
@@ -57,12 +70,12 @@ func IsEmailDomainListed(globs []glob.Glob, email string) bool {
 		return false
 	}
 
-	n := strings.LastIndex(email, "@")
-	if n <= 0 {
+	localPart, domain, found := strings.CutLast(email, "@")
+	if !found || localPart == "" {
 		return false
 	}
 
-	domain := strings.ToLower(email[n+1:])
+	domain = strings.ToLower(domain)
 
 	for _, g := range globs {
 		if g.Match(domain) {
@@ -73,41 +86,14 @@ func IsEmailDomainListed(globs []glob.Glob, email string) bool {
 	return false
 }
 
-// IsAPIURL checks if URL is current Gitea instance API URL
-func IsAPIURL(uri string) bool {
-	return strings.HasPrefix(strings.ToLower(uri), strings.ToLower(setting.AppURL+"api"))
-}
-
-// IsValidExternalURL checks if URL is valid external URL
-func IsValidExternalURL(uri string) bool {
-	if !IsValidURL(uri) || IsAPIURL(uri) {
-		return false
-	}
-
-	u, err := url.ParseRequestURI(uri)
-	if err != nil {
-		return false
-	}
-
-	// Currently check only if not loopback IP is provided to keep compatibility
-	if isLoopbackIP(u.Hostname()) || strings.ToLower(u.Hostname()) == "localhost" {
-		return false
-	}
-
-	// TODO: Later it should be added to allow local network IP addresses
-	//       only if allowed by special setting
-
-	return true
-}
-
 // IsValidExternalTrackerURLFormat checks if URL matches required syntax for external trackers
 func IsValidExternalTrackerURLFormat(uri string) bool {
-	if !IsValidExternalURL(uri) {
+	if !IsValidURL(uri) {
 		return false
 	}
-
+	vars := globalVars()
 	// check for typoed variables like /{index/ or /[repo}
-	for _, match := range externalTrackerRegex.FindAllStringSubmatch(uri, -1) {
+	for _, match := range vars.externalTrackerRegex.FindAllStringSubmatch(uri, -1) {
 		if (match[1] == "{" || match[2] == "}") && (match[1] != "{" || match[2] != "}") {
 			return false
 		}
@@ -116,14 +102,36 @@ func IsValidExternalTrackerURLFormat(uri string) bool {
 	return true
 }
 
-var (
-	validUsernamePattern   = regexp.MustCompile(`^[\da-zA-Z][-.\w]*$`)
-	invalidUsernamePattern = regexp.MustCompile(`[-._]{2,}|[-._]$`) // No consecutive or trailing non-alphanumeric chars
-)
-
 // IsValidUsername checks if username is valid
 func IsValidUsername(name string) bool {
 	// It is difficult to find a single pattern that is both readable and effective,
 	// but it's easier to use positive and negative checks.
-	return validUsernamePattern.MatchString(name) && !invalidUsernamePattern.MatchString(name)
+	vars := globalVars()
+	return vars.validUsernamePattern.MatchString(name) && !vars.invalidUsernamePattern.MatchString(name)
+}
+
+func IsValidBadgeSlug(slug string) bool {
+	vars := globalVars()
+	return vars.validBadgeSlugPattern.MatchString(slug) && !vars.invalidBadgeSlugPattern.MatchString(slug)
+}
+
+func IsEmailAddressValid(email string) bool {
+	if strings.ContainsFunc(email, func(r rune) bool { return r >= utf8.RuneSelf }) {
+		// At the moment, we don't support UTF8 email address. To support it, need to correctly handle IDN/punycode
+		return false
+	}
+	addr, err := mail.ParseAddress(email)
+	if err != nil || addr.Address != email {
+		// email must be parseable, and the "email" string must be the address, no other parts
+		return false
+	}
+	_, domain, _ := strings.Cut(email, "@")
+	if !globalVars().validEmailHostName.MatchString(domain) && !globalVars().validEmailHostIP.MatchString(domain) {
+		return false
+	}
+	if strings.HasPrefix(domain, "-") || strings.HasSuffix(domain, "-") ||
+		strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return false
+	}
+	return true
 }

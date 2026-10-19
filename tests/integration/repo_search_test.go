@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	code_indexer "code.gitea.io/gitea/modules/indexer/code"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/tests"
+	repo_model "gitea.dev/models/repo"
+	code_indexer "gitea.dev/modules/indexer/code"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/stretchr/testify/assert"
@@ -29,17 +29,17 @@ func resultFilenames(doc *HTMLDoc) []string {
 func TestSearchRepo(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
-	repo, err := repo_model.GetRepositoryByOwnerAndName(db.DefaultContext, "user2", "repo1")
+	repo, err := repo_model.GetRepositoryByOwnerAndName(t.Context(), "user2", "repo1")
 	assert.NoError(t, err)
 
 	code_indexer.UpdateRepoIndexer(repo)
 
 	testSearch(t, "/user2/repo1/search?q=Description&page=1", []string{"README.md"})
 
-	setting.Indexer.IncludePatterns = setting.IndexerGlobFromString("**.txt")
-	setting.Indexer.ExcludePatterns = setting.IndexerGlobFromString("**/y/**")
+	defer test.MockVariableValue(&setting.Indexer.IncludePatterns, setting.IndexerGlobFromString("**.txt"))()
+	defer test.MockVariableValue(&setting.Indexer.ExcludePatterns, setting.IndexerGlobFromString("**/y/**"))()
 
-	repo, err = repo_model.GetRepositoryByOwnerAndName(db.DefaultContext, "user2", "glob")
+	repo, err = repo_model.GetRepositoryByOwnerAndName(t.Context(), "user2", "glob")
 	assert.NoError(t, err)
 
 	code_indexer.UpdateRepoIndexer(repo)
@@ -53,9 +53,9 @@ func TestSearchRepo(t *testing.T) {
 }
 
 func testSearch(t *testing.T, url string, expected []string) {
+	t.Helper()
 	req := NewRequest(t, "GET", url)
 	resp := MakeRequest(t, req, http.StatusOK)
-
 	filenames := resultFilenames(NewHTMLParser(t, resp.Body))
-	assert.EqualValues(t, expected, filenames)
+	assert.Equal(t, expected, filenames, "url=%s", url)
 }

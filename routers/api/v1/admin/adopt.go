@@ -6,12 +6,13 @@ package admin
 import (
 	"net/http"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/context"
-	repo_service "code.gitea.io/gitea/services/repository"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitrepo"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	repo_service "gitea.dev/services/repository"
 )
 
 // ListUnadoptedRepositories lists the unadopted repositories that match the provided names
@@ -30,9 +31,9 @@ func ListUnadoptedRepositories(ctx *context.APIContext) {
 	//   in: query
 	//   description: page size of results
 	//   type: integer
-	// - name: pattern
+	// - name: query
 	//   in: query
-	//   description: pattern of repositories to search for
+	//   description: glob pattern of repositories to search for, in the form owner or owner/repo
 	//   type: string
 	// responses:
 	//   "200":
@@ -46,11 +47,11 @@ func ListUnadoptedRepositories(ctx *context.APIContext) {
 	}
 	repoNames, count, err := repo_service.ListUnadoptedRepositories(ctx, ctx.FormString("query"), &listOptions)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
-	ctx.SetTotalCountHeader(int64(count))
+	ctx.SetTotalCountHeader(count)
 
 	ctx.JSON(http.StatusOK, repoNames)
 }
@@ -80,39 +81,39 @@ func AdoptRepository(ctx *context.APIContext) {
 	//     "$ref": "#/responses/notFound"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
-	ownerName := ctx.PathParam(":username")
-	repoName := ctx.PathParam(":reponame")
+	ownerName := ctx.PathParam("username")
+	repoName := ctx.PathParam("reponame")
 
 	ctxUser, err := user_model.GetUserByName(ctx, ownerName)
 	if err != nil {
 		if user_model.IsErrUserNotExist(err) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	// check not a repo
 	has, err := repo_model.IsRepositoryModelExist(ctx, ctxUser, repoName)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
-	isDir, err := util.IsDir(repo_model.RepoPath(ctxUser.Name, repoName))
+	exist, err := git.IsRepositoryExist(ctx, gitrepo.CodeRepoByName(ctxUser.Name, repoName))
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
-	if has || !isDir {
-		ctx.NotFound()
+	if has || !exist {
+		ctx.APIErrorNotFound()
 		return
 	}
 	if _, err := repo_service.AdoptRepository(ctx, ctx.Doer, ctxUser, repo_service.CreateRepoOptions{
 		Name:      repoName,
 		IsPrivate: true,
 	}); err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -142,37 +143,37 @@ func DeleteUnadoptedRepository(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
-	ownerName := ctx.PathParam(":username")
-	repoName := ctx.PathParam(":reponame")
+	ownerName := ctx.PathParam("username")
+	repoName := ctx.PathParam("reponame")
 
 	ctxUser, err := user_model.GetUserByName(ctx, ownerName)
 	if err != nil {
 		if user_model.IsErrUserNotExist(err) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	// check not a repo
 	has, err := repo_model.IsRepositoryModelExist(ctx, ctxUser, repoName)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
-	isDir, err := util.IsDir(repo_model.RepoPath(ctxUser.Name, repoName))
+	exist, err := git.IsRepositoryExist(ctx, gitrepo.CodeRepoByName(ctxUser.Name, repoName))
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
-	if has || !isDir {
-		ctx.NotFound()
+	if has || !exist {
+		ctx.APIErrorNotFound()
 		return
 	}
 
 	if err := repo_service.DeleteUnadoptedRepository(ctx, ctx.Doer, ctxUser, repoName); err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 

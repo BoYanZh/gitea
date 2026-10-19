@@ -6,9 +6,10 @@ package internal
 import (
 	"strconv"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/indexer"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/timeutil"
 )
 
 // IndexerData data stored in the issue indexer
@@ -25,13 +26,16 @@ type IndexerData struct {
 	// Fields used for filtering
 	IsPull             bool               `json:"is_pull"`
 	IsClosed           bool               `json:"is_closed"`
+	IsArchived         bool               `json:"is_archived"`
 	LabelIDs           []int64            `json:"label_ids"`
 	NoLabel            bool               `json:"no_label"` // True if LabelIDs is empty
 	MilestoneID        int64              `json:"milestone_id"`
-	ProjectID          int64              `json:"project_id"`
-	ProjectColumnID    int64              `json:"project_board_id"` // the key should be kept as project_board_id to keep compatible
+	ProjectIDs         []int64            `json:"project_ids"`
+	NoProject          bool               `json:"no_project"`                   // True if ProjectIDs is empty
+	ProjectColumnMap   map[int64]int64    `json:"project_column_map,omitempty"` // Maps project ID to column ID for each project the issue is in
 	PosterID           int64              `json:"poster_id"`
-	AssigneeID         int64              `json:"assignee_id"`
+	AssigneeIDs        []int64            `json:"assignee_ids"`
+	NoAssignee         bool               `json:"no_assignee"` // True if the issue has no assignees
 	MentionIDs         []int64            `json:"mention_ids"`
 	ReviewedIDs        []int64            `json:"reviewed_ids"`
 	ReviewRequestedIDs []int64            `json:"review_requested_ids"`
@@ -76,13 +80,14 @@ type SearchResult struct {
 type SearchOptions struct {
 	Keyword string // keyword to search
 
-	IsFuzzyKeyword bool // if false the levenshtein distance is 0
+	SearchMode indexer.SearchModeType
 
 	RepoIDs   []int64 // repository IDs which the issues belong to
 	AllPublic bool    // if include all public repositories
 
-	IsPull   optional.Option[bool] // if the issues is a pull request
-	IsClosed optional.Option[bool] // if the issues is closed
+	IsPull     optional.Option[bool] // if the issues is a pull request
+	IsClosed   optional.Option[bool] // if the issues is closed
+	IsArchived optional.Option[bool] // if the repo is archived
 
 	IncludedLabelIDs    []int64 // labels the issues have
 	ExcludedLabelIDs    []int64 // labels the issues don't have
@@ -91,12 +96,11 @@ type SearchOptions struct {
 
 	MilestoneIDs []int64 // milestones the issues have
 
-	ProjectID       optional.Option[int64] // project the issues belong to
-	ProjectColumnID optional.Option[int64] // project column the issues belong to
+	ProjectIDs    []int64 // project the issues belong to. FIXME: ISSUE-MULTIPLE-PROJECTS-FILTER: no multiple project filter support yet. Search logic is wrong.
+	NoProjectOnly bool    // if the issues have no project, if true, ProjectIDs will be ignored
 
-	PosterID optional.Option[int64] // poster of the issues
-
-	AssigneeID optional.Option[int64] // assignee of the issues, zero means no assignee
+	PosterID   string // poster of the issues, "(none)" or "(any)" or a user ID
+	AssigneeID string // assignee of the issues, "(none)" or "(any)" or a user ID
 
 	MentionID optional.Option[int64] // mentioned user of the issues
 

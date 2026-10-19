@@ -6,21 +6,19 @@ package setting
 import (
 	"net/http"
 
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/setting"
-	shared_user "code.gitea.io/gitea/routers/web/shared/user"
-	"code.gitea.io/gitea/services/context"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
 )
 
 const (
-	tplSettingsBlockedUsers base.TplName = "user/settings/blocked_users"
+	tplSettingsBlockedUsers templates.TplName = "user/settings/blocked_users"
 )
 
 func BlockedUsers(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("user.block.list")
 	ctx.Data["PageIsSettingsBlockedUsers"] = true
-	ctx.Data["UserDisabledFeatures"] = user_model.DisabledFeaturesWithLoginType(ctx.Doer)
 
 	shared_user.BlockedUsers(ctx, ctx.Doer)
 	if ctx.Written() {
@@ -31,10 +29,5 @@ func BlockedUsers(ctx *context.Context) {
 }
 
 func BlockedUsersPost(ctx *context.Context) {
-	shared_user.BlockedUsersPost(ctx, ctx.Doer)
-	if ctx.Written() {
-		return
-	}
-
-	ctx.Redirect(setting.AppSubURL + "/user/settings/blocked_users")
+	shared_user.BlockedUsersPost(ctx, ctx.Doer, setting.AppSubURL+"/user/settings/blocked_users")
 }

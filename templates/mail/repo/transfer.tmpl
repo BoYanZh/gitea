@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head>
+	{{template "mail/base/head" .Subject}}
+</head>
+
+{{$url := HTMLFormat "<a href='%[1]s'>%[2]s</a>" .Link .Repo}}
+<body>
+	<p>{{.Subject}}.
+		{{.locale.Tr "mail.repo.transfer.body" $url}}
+	</p>
+	{{template "mail/base/footer"}}
+</body>
+</html>

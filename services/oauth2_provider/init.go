@@ -1,12 +1,12 @@
 // Copyright 2024 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-package oauth2_provider //nolint
+package oauth2_provider
 
 import (
 	"context"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
 )
 
 // Init initializes the oauth source

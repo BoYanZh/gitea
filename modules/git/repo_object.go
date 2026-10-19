@@ -5,10 +5,15 @@
 package git
 
 import (
-	"bytes"
-	"io"
+	"context"
 	"strings"
+
+	"gitea.dev/modules/git/gitcmd"
 )
+
+// MaxGitObjectSize is used to avoid OOM when reading a large git object.
+// GitHub has a limit (100M) for pushing, but Gitea doesn't have such a limit yet.
+var MaxGitObjectSize int64 = 100 * 1024 * 1024
 
 // ObjectType git object type
 type ObjectType string
@@ -31,18 +36,12 @@ func (o ObjectType) Bytes() []byte {
 	return []byte(o)
 }
 
-type EmptyReader struct{}
-
-func (EmptyReader) Read(p []byte) (int, error) {
-	return 0, io.EOF
-}
-
-func (repo *Repository) GetObjectFormat() (ObjectFormat, error) {
-	if repo != nil && repo.objectFormat != nil {
-		return repo.objectFormat, nil
+func (repo *Repository) GetObjectFormat(ctx context.Context) (ObjectFormat, error) {
+	if repo.objectFormatCache != nil {
+		return repo.objectFormatCache, nil
 	}
 
-	str, err := repo.hashObject(EmptyReader{}, false)
+	str, err := repo.hashObjectBytes(ctx, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -51,51 +50,33 @@ func (repo *Repository) GetObjectFormat() (ObjectFormat, error) {
 		return nil, err
 	}
 
-	repo.objectFormat = hash.Type()
+	repo.objectFormatCache = hash.Type()
 
-	return repo.objectFormat, nil
+	return repo.objectFormatCache, nil
 }
 
-// HashObject takes a reader and returns hash for that reader
-func (repo *Repository) HashObject(reader io.Reader) (ObjectID, error) {
-	idStr, err := repo.hashObject(reader, true)
+// HashObjectBytes returns hash for the content
+func (repo *Repository) HashObjectBytes(ctx context.Context, buf []byte) (ObjectID, error) {
+	idStr, err := repo.hashObjectBytes(ctx, buf, true)
 	if err != nil {
 		return nil, err
 	}
 	return NewIDFromString(idStr)
 }
 
-func (repo *Repository) hashObject(reader io.Reader, save bool) (string, error) {
-	var cmd *Command
+func (repo *Repository) hashObjectBytes(ctx context.Context, buf []byte, save bool) (string, error) {
+	var cmd *gitcmd.Command
 	if save {
-		cmd = NewCommand(repo.Ctx, "hash-object", "-w", "--stdin")
+		cmd = gitcmd.NewCommand("hash-object", "-w", "--stdin")
 	} else {
-		cmd = NewCommand(repo.Ctx, "hash-object", "--stdin")
+		cmd = gitcmd.NewCommand("hash-object", "--stdin")
 	}
-	stdout := new(bytes.Buffer)
-	stderr := new(bytes.Buffer)
-	err := cmd.Run(&RunOpts{
-		Dir:    repo.Path,
-		Stdin:  reader,
-		Stdout: stdout,
-		Stderr: stderr,
-	})
+	stdout, _, err := cmd.
+		WithRepo(repo).
+		WithStdinBytes(buf).
+		RunStdString(ctx)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(stdout.String()), nil
-}
-
-// GetRefType gets the type of the ref based on the string
-func (repo *Repository) GetRefType(ref string) ObjectType {
-	if repo.IsTagExist(ref) {
-		return ObjectTag
-	} else if repo.IsBranchExist(ref) {
-		return ObjectBranch
-	} else if repo.IsCommitExist(ref) {
-		return ObjectCommit
-	} else if _, err := repo.GetBlob(ref); err == nil {
-		return ObjectBlob
-	}
-	return ObjectType("invalid")
+	return strings.TrimSpace(stdout), nil
 }

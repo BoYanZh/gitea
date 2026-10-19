@@ -7,18 +7,20 @@ import (
 	"errors"
 	"net/http"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/attachment"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/context/upload"
-	"code.gitea.io/gitea/services/convert"
-	issue_service "code.gitea.io/gitea/services/issue"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/perm"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	attachment_service "gitea.dev/services/attachment"
+	"gitea.dev/services/context"
+	"gitea.dev/services/context/upload"
+	"gitea.dev/services/convert"
+	issue_service "gitea.dev/services/issue"
 )
 
 // GetIssueCommentAttachment gets a single attachment of the comment
@@ -67,11 +69,11 @@ func GetIssueCommentAttachment(ctx *context.APIContext) {
 	}
 	if attachment.CommentID != comment.ID {
 		log.Debug("User requested attachment[%d] is not in comment[%d].", attachment.ID, comment.ID)
-		ctx.NotFound("attachment not in comment")
+		ctx.APIErrorNotFound("attachment not in comment")
 		return
 	}
 
-	ctx.JSON(http.StatusOK, convert.ToAPIAttachment(ctx.Repo.Repository, attachment))
+	ctx.JSON(http.StatusOK, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attachment))
 }
 
 // ListIssueCommentAttachments lists all attachments of the comment
@@ -109,11 +111,11 @@ func ListIssueCommentAttachments(ctx *context.APIContext) {
 	}
 
 	if err := comment.LoadAttachments(ctx); err != nil {
-		ctx.Error(http.StatusInternalServerError, "LoadAttachments", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, convert.ToAPIAttachments(ctx.Repo.Repository, comment.Attachments))
+	ctx.JSON(http.StatusOK, convert.ToAPIAttachments(ctx, ctx.Repo.Repository, comment.Attachments))
 }
 
 // CreateIssueCommentAttachment creates an attachment and saves the given file
@@ -161,6 +163,8 @@ func CreateIssueCommentAttachment(ctx *context.APIContext) {
 	//     "$ref": "#/responses/forbidden"
 	//   "404":
 	//     "$ref": "#/responses/error"
+	//   "413":
+	//     "$ref": "#/responses/error"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 	//   "423":
@@ -179,7 +183,7 @@ func CreateIssueCommentAttachment(ctx *context.APIContext) {
 	// Get uploaded file from request
 	file, header, err := ctx.Req.FormFile("attachment")
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "FormFile", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	defer file.Close()
@@ -189,7 +193,8 @@ func CreateIssueCommentAttachment(ctx *context.APIContext) {
 		filename = query
 	}
 
-	attachment, err := attachment.UploadAttachment(ctx, file, setting.Attachment.AllowedTypes, header.Size, &repo_model.Attachment{
+	uploaderFile := attachment_service.NewLimitedUploaderKnownSize(file, header.Size)
+	attachment, err := attachment_service.UploadAttachmentForIssue(ctx, uploaderFile, &repo_model.Attachment{
 		Name:       filename,
 		UploaderID: ctx.Doer.ID,
 		RepoID:     ctx.Repo.Repository.ID,
@@ -198,28 +203,30 @@ func CreateIssueCommentAttachment(ctx *context.APIContext) {
 	})
 	if err != nil {
 		if upload.IsErrFileTypeForbidden(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else if errors.Is(err, util.ErrContentTooLarge) {
+			ctx.APIError(http.StatusRequestEntityTooLarge, err.Error())
 		} else {
-			ctx.Error(http.StatusInternalServerError, "UploadAttachment", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
 
 	if err := comment.LoadAttachments(ctx); err != nil {
-		ctx.Error(http.StatusInternalServerError, "LoadAttachments", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	if err = issue_service.UpdateComment(ctx, comment, comment.ContentVersion, ctx.Doer, comment.Content); err != nil {
 		if errors.Is(err, user_model.ErrBlockedUser) {
-			ctx.Error(http.StatusForbidden, "UpdateComment", err)
+			ctx.APIError(http.StatusForbidden, err.Error())
 		} else {
-			ctx.ServerError("UpdateComment", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx.Repo.Repository, attachment))
+	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attachment))
 }
 
 // EditIssueCommentAttachment updates the given attachment
@@ -263,6 +270,8 @@ func EditIssueCommentAttachment(ctx *context.APIContext) {
 	//     "$ref": "#/responses/Attachment"
 	//   "404":
 	//     "$ref": "#/responses/error"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
 	//   "423":
 	//     "$ref": "#/responses/repoArchivedError"
 	attach := getIssueCommentAttachmentSafeWrite(ctx)
@@ -270,15 +279,20 @@ func EditIssueCommentAttachment(ctx *context.APIContext) {
 		return
 	}
 
-	form := web.GetForm(ctx).(*api.EditAttachmentOptions)
+	form := web.GetForm[*api.EditAttachmentOptions](ctx)
 	if form.Name != "" {
 		attach.Name = form.Name
 	}
 
-	if err := repo_model.UpdateAttachment(ctx, attach); err != nil {
-		ctx.Error(http.StatusInternalServerError, "UpdateAttachment", attach)
+	if err := attachment_service.UpdateAttachment(ctx, setting.Attachment.AllowedTypes, attach); err != nil {
+		if upload.IsErrFileTypeForbidden(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		ctx.APIErrorInternal(err)
+		return
 	}
-	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx.Repo.Repository, attach))
+	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attach))
 }
 
 // DeleteIssueCommentAttachment delete a given attachment
@@ -324,28 +338,20 @@ func DeleteIssueCommentAttachment(ctx *context.APIContext) {
 	}
 
 	if err := repo_model.DeleteAttachment(ctx, attach, true); err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteAttachment", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.Status(http.StatusNoContent)
 }
 
 func getIssueCommentSafe(ctx *context.APIContext) *issues_model.Comment {
-	comment, err := issues_model.GetCommentByID(ctx, ctx.PathParamInt64("id"))
+	comment, err := issues_model.GetCommentWithRepoID(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("id"))
 	if err != nil {
-		ctx.NotFoundOrServerError("GetCommentByID", issues_model.IsErrCommentNotExist, err)
+		ctx.APIErrorAuto(err)
 		return nil
 	}
-	if err := comment.LoadIssue(ctx); err != nil {
-		ctx.Error(http.StatusInternalServerError, "comment.LoadIssue", err)
-		return nil
-	}
-	if comment.Issue == nil || comment.Issue.RepoID != ctx.Repo.Repository.ID {
-		ctx.Error(http.StatusNotFound, "", "no matching issue comment found")
-		return nil
-	}
-
-	if !ctx.Repo.CanReadIssuesOrPulls(comment.Issue.IsPull) {
+	if !ctx.Repo.Permission.CanReadIssuesOrPulls(comment.Issue.IsPull) {
+		ctx.APIErrorNotFound()
 		return nil
 	}
 
@@ -366,9 +372,9 @@ func getIssueCommentAttachmentSafeWrite(ctx *context.APIContext) *repo_model.Att
 }
 
 func canUserWriteIssueCommentAttachment(ctx *context.APIContext, comment *issues_model.Comment) bool {
-	canEditComment := ctx.IsSigned && (ctx.Doer.ID == comment.PosterID || ctx.IsUserRepoAdmin() || ctx.IsUserSiteAdmin()) && ctx.Repo.CanWriteIssuesOrPulls(comment.Issue.IsPull)
+	canEditComment := issue_service.CanSelfChangeOrAccessContent(ctx.Doer, ctx.Repo.Permission, comment.Issue, comment.PosterID, perm.AccessModeWrite)
 	if !canEditComment {
-		ctx.Error(http.StatusForbidden, "", "user should have permission to edit comment")
+		ctx.APIError(http.StatusForbidden, "user should have permission to edit comment")
 		return false
 	}
 
@@ -378,7 +384,7 @@ func canUserWriteIssueCommentAttachment(ctx *context.APIContext, comment *issues
 func getIssueCommentAttachmentSafeRead(ctx *context.APIContext, comment *issues_model.Comment) *repo_model.Attachment {
 	attachment, err := repo_model.GetAttachmentByID(ctx, ctx.PathParamInt64("attachment_id"))
 	if err != nil {
-		ctx.NotFoundOrServerError("GetAttachmentByID", repo_model.IsErrAttachmentNotExist, err)
+		ctx.APIErrorAuto(err)
 		return nil
 	}
 	if !attachmentBelongsToRepoOrComment(ctx, attachment, comment) {
@@ -390,17 +396,17 @@ func getIssueCommentAttachmentSafeRead(ctx *context.APIContext, comment *issues_
 func attachmentBelongsToRepoOrComment(ctx *context.APIContext, attachment *repo_model.Attachment, comment *issues_model.Comment) bool {
 	if attachment.RepoID != ctx.Repo.Repository.ID {
 		log.Debug("Requested attachment[%d] does not belong to repo[%-v].", attachment.ID, ctx.Repo.Repository)
-		ctx.NotFound("no such attachment in repo")
+		ctx.APIErrorNotFound("no such attachment in repo")
 		return false
 	}
 	if attachment.IssueID == 0 || attachment.CommentID == 0 {
 		log.Debug("Requested attachment[%d] is not in a comment.", attachment.ID)
-		ctx.NotFound("no such attachment in comment")
+		ctx.APIErrorNotFound("no such attachment in comment")
 		return false
 	}
 	if comment != nil && attachment.CommentID != comment.ID {
 		log.Debug("Requested attachment[%d] does not belong to comment[%d].", attachment.ID, comment.ID)
-		ctx.NotFound("no such attachment in comment")
+		ctx.APIErrorNotFound("no such attachment in comment")
 		return false
 	}
 	return true

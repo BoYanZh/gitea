@@ -4,49 +4,39 @@
 package user
 
 import (
-	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models/avatars"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/httpcache"
-	"code.gitea.io/gitea/services/context"
+	"gitea.dev/models/avatars"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/services/context"
 )
 
 func cacheableRedirect(ctx *context.Context, location string) {
 	// here we should not use `setting.StaticCacheTime`, it is pretty long (default: 6 hours)
 	// we must make sure the redirection cache time is short enough, otherwise a user won't see the updated avatar in 6 hours
 	// it's OK to make the cache time short, it is only a redirection, and doesn't cost much to make a new request
-	httpcache.SetCacheControlInHeader(ctx.Resp.Header(), 5*time.Minute)
+	httpcache.SetCacheControlInHeader(ctx.Resp.Header(), &httpcache.CacheControlOptions{MaxAge: 5 * time.Minute})
 	ctx.Redirect(location)
 }
 
-// AvatarByUserName redirect browser to user avatar of requested size
-func AvatarByUserName(ctx *context.Context) {
-	userName := ctx.PathParam(":username")
-	size := int(ctx.PathParamInt64(":size"))
-
-	var user *user_model.User
-	if strings.ToLower(userName) != user_model.GhostUserLowerName {
+// AvatarByUsernameSize redirect browser to user avatar of requested size
+func AvatarByUsernameSize(ctx *context.Context) {
+	username := ctx.PathParam("username")
+	user := user_model.GetSystemUserByName(username)
+	if user == nil {
 		var err error
-		if user, err = user_model.GetUserByName(ctx, userName); err != nil {
-			if user_model.IsErrUserNotExist(err) {
-				ctx.NotFound("GetUserByName", err)
-				return
-			}
-			ctx.ServerError("Invalid user: "+userName, err)
+		if user, err = user_model.GetUserByName(ctx, username); err != nil {
+			ctx.ServerError("GetUserByName", err)
 			return
 		}
-	} else {
-		user = user_model.NewGhostUser()
 	}
-
-	cacheableRedirect(ctx, user.AvatarLinkWithSize(ctx, size))
+	cacheableRedirect(ctx, user.AvatarLinkWithSize(ctx, ctx.PathParamInt("size")))
 }
 
 // AvatarByEmailHash redirects the browser to the email avatar link
 func AvatarByEmailHash(ctx *context.Context) {
-	hash := ctx.PathParam(":hash")
+	hash := ctx.PathParam("hash")
 	email, err := avatars.GetEmailForHash(ctx, hash)
 	if err != nil {
 		ctx.ServerError("invalid avatar hash: "+hash, err)

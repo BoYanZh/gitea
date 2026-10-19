@@ -1,0 +1,147 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package db
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+
+	"xorm.io/xorm"
+	"xorm.io/xorm/names"
+)
+
+func init() {
+	gonicNames := []string{"SSL", "UID"}
+	for _, name := range gonicNames {
+		names.LintGonicMapper[name] = true
+	}
+}
+
+// newXORMEngine returns a new XORM engine from the configuration
+func newXORMEngine() (*xorm.Engine, error) {
+	connOpts := GlobalConnOptions()
+	driver, connStr, err := ConnStr(connOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	engine, err := xorm.NewEngine(driver, connStr)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case connOpts.Type.IsMySQL():
+		engine.Dialect().SetParams(map[string]string{"rowFormat": "DYNAMIC"})
+	case connOpts.Type.IsMSSQL():
+		engine.Dialect().SetParams(map[string]string{"DEFAULT_VARCHAR": "nvarchar"})
+	}
+	engine.SetSchema(connOpts.Schema)
+	return engine, nil
+}
+
+// InitEngine initializes the xorm.Engine and sets it as XORM's default context
+func InitEngine(ctx context.Context) error {
+	xe, err := newXORMEngine()
+	if err != nil {
+		return fmt.Errorf("failed to init database engine: %w", err)
+	}
+
+	xe.SetMapper(names.GonicMapper{})
+	// WARNING: for serv command, MUST remove the output to os.stdout,
+	// so use log file to instead print to stdout.
+	xe.SetLogger(NewXORMLogger(setting.Database.LogSQL))
+	xe.ShowSQL(setting.Database.LogSQL)
+	xe.SetMaxOpenConns(setting.Database.MaxOpenConns)
+	xe.SetMaxIdleConns(setting.Database.MaxIdleConns)
+	xe.SetConnMaxLifetime(setting.Database.ConnMaxLifetime)
+
+	if setting.Database.Type.IsMySQL() {
+		// like PostgreSQL and MSSQL, avoids MariaDB snapshot isolation errors
+		xe.SetDefaultTxOptions(&sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	}
+
+	if setting.Database.SlowQueryThreshold > 0 {
+		xe.AddHook(&EngineHook{
+			Threshold: setting.Database.SlowQueryThreshold,
+			Logger:    log.GetLogger("xorm"),
+		})
+	}
+
+	SetDefaultEngine(ctx, xe)
+	return nil
+}
+
+// SetDefaultEngine sets the default engine for db
+func SetDefaultEngine(ctx context.Context, eng *xorm.Engine) {
+	xormEngine = eng
+	xormEngine.SetDefaultContext(ctx)
+}
+
+// UnsetDefaultEngine closes and unsets the default engine
+// We hope the SetDefaultEngine and UnsetDefaultEngine can be paired, but it's impossible now,
+// there are many calls to InitEngine -> SetDefaultEngine directly to overwrite the `xormEngine` and `xormContext` without close
+// Global database engine related functions are all racy and there is no graceful close right now.
+func UnsetDefaultEngine() {
+	if xormEngine != nil {
+		_ = xormEngine.Close()
+		xormEngine = nil
+	}
+}
+
+// InitEngineWithMigration initializes a new xorm.Engine and sets it as the XORM's default context
+// This function must never call .Sync() if the provided migration function fails.
+// When called from the "doctor" command, the migration function is a version check
+// that prevents the doctor from fixing anything in the database if the migration level
+// is different from the expected value.
+func InitEngineWithMigration(ctx context.Context, migrateFunc func(context.Context, EngineMigration) error) (err error) {
+	if err = InitEngine(ctx); err != nil {
+		return err
+	}
+
+	if err = xormEngine.Ping(); err != nil {
+		return err
+	}
+
+	preprocessDatabaseCollation(xormEngine)
+
+	if setting.Database.Type.IsMSSQL() {
+		enableMSSQLReadCommittedSnapshot(ctx, xormEngine)
+	}
+
+	// We have to run migrateFunc here in case the user is re-running installation on a previously created DB.
+	// If we do not then table schemas will be changed and there will be conflicts when the migrations run properly.
+	//
+	// Installation should only be being re-run if users want to recover an old database.
+	// However, we should think carefully about should we support re-install on an installed instance,
+	// as there may be other problems due to secret reinitialization.
+	if err = migrateFunc(ctx, xormEngine); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
+	if err = SyncAllTables(); err != nil {
+		return fmt.Errorf("sync database struct error: %w", err)
+	}
+
+	for _, initFunc := range registeredInitFuncs {
+		if err := initFunc(); err != nil {
+			return fmt.Errorf("initFunc failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// enableMSSQLReadCommittedSnapshot stops MSSQL reads waiting on writers, like PostgreSQL and MySQL
+func enableMSSQLReadCommittedSnapshot(ctx context.Context, engine EngineMigration) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second) // ALTER waits for all other connections to close
+	defer cancel()
+	if _, err := engine.Context(ctx).Exec("IF (SELECT is_read_committed_snapshot_on FROM sys.databases WHERE database_id = DB_ID()) = 0 ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON"); err != nil {
+		log.Error("Unable to set READ_COMMITTED_SNAPSHOT=ON: %v", err)
+	}
+}

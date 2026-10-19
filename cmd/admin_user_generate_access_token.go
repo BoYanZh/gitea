@@ -4,50 +4,50 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	user_model "code.gitea.io/gitea/models/user"
+	auth_model "gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
 
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
-var microcmdUserGenerateAccessToken = &cli.Command{
-	Name:  "generate-access-token",
-	Usage: "Generate an access token for a specific user",
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:    "username",
-			Aliases: []string{"u"},
-			Usage:   "Username",
+func newUserGenerateAccessTokenCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "generate-access-token",
+		Usage: "Generate an access token for a specific user",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "username",
+				Aliases: []string{"u"},
+				Usage:   "Username",
+			},
+			&cli.StringFlag{
+				Name:    "token-name",
+				Aliases: []string{"t"},
+				Usage:   "Token name",
+				Value:   "gitea-admin",
+			},
+			&cli.BoolFlag{
+				Name:  "raw",
+				Usage: "Display only the token value",
+			},
+			&cli.StringFlag{
+				Name:  "scopes",
+				Value: "all",
+				Usage: `Comma separated list of scopes to apply to access token, examples: "all", "public-only,read:issue", "write:repository,write:user"`,
+			},
 		},
-		&cli.StringFlag{
-			Name:    "token-name",
-			Aliases: []string{"t"},
-			Usage:   "Token name",
-			Value:   "gitea-admin",
-		},
-		&cli.BoolFlag{
-			Name:  "raw",
-			Usage: "Display only the token value",
-		},
-		&cli.StringFlag{
-			Name:  "scopes",
-			Value: "",
-			Usage: "Comma separated list of scopes to apply to access token",
-		},
-	},
-	Action: runGenerateAccessToken,
+		Action: runGenerateAccessToken,
+	}
 }
 
-func runGenerateAccessToken(c *cli.Context) error {
+func runGenerateAccessToken(ctx context.Context, c *cli.Command) error {
 	if !c.IsSet("username") {
-		return errors.New("You must provide a username to generate a token for")
+		return errors.New("you must provide a username to generate a token for")
 	}
-
-	ctx, cancel := installSignals()
-	defer cancel()
 
 	if err := initDB(ctx); err != nil {
 		return err
@@ -77,6 +77,9 @@ func runGenerateAccessToken(c *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("invalid access token scope provided: %w", err)
 	}
+	if !accessTokenScope.HasPermissionScope() {
+		return errors.New("access token does not have any permission")
+	}
 	t.Scope = accessTokenScope
 
 	// create the token
@@ -85,9 +88,9 @@ func runGenerateAccessToken(c *cli.Context) error {
 	}
 
 	if c.Bool("raw") {
-		fmt.Printf("%s\n", t.Token)
+		cprintln(c, t.Token)
 	} else {
-		fmt.Printf("Access token was successfully created: %s\n", t.Token)
+		cprintf(c, "Access token was successfully created: %s\n", t.Token)
 	}
 
 	return nil

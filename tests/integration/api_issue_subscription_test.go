@@ -8,14 +8,13 @@ import (
 	"net/http"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -40,14 +39,13 @@ func TestAPIIssueSubscriptions(t *testing.T) {
 		req := NewRequest(t, "GET", fmt.Sprintf("/api/v1/repos/%s/%s/issues/%d/subscriptions/check", issueRepo.OwnerName, issueRepo.Name, issue.Index)).
 			AddTokenAuth(token)
 		resp := MakeRequest(t, req, http.StatusOK)
-		wi := new(api.WatchInfo)
-		DecodeJSON(t, resp, wi)
+		wi := DecodeJSON(t, resp, &api.WatchInfo{})
 
-		assert.EqualValues(t, isWatching, wi.Subscribed)
-		assert.EqualValues(t, !isWatching, wi.Ignored)
-		assert.EqualValues(t, issue.APIURL(db.DefaultContext)+"/subscriptions", wi.URL)
+		assert.Equal(t, isWatching, wi.Subscribed)
+		assert.Equal(t, !isWatching, wi.Ignored)
+		assert.Equal(t, issue.APIURL(t.Context())+"/subscriptions", wi.URL)
 		assert.EqualValues(t, issue.CreatedUnix, wi.CreatedAt.Unix())
-		assert.EqualValues(t, issueRepo.APIURL(), wi.RepositoryURL)
+		assert.Equal(t, issueRepo.APIURL(), wi.RepositoryURL)
 	}
 
 	testSubscription(issue1, true)

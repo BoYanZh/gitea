@@ -5,13 +5,12 @@ package lfs
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/modules/json"
+	"gitea.dev/modules/json"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -33,7 +32,7 @@ func TestBasicTransferAdapter(t *testing.T) {
 		if strings.Contains(url, "download-request") {
 			assert.Equal(t, "GET", req.Method)
 
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewBufferString("dummy"))}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("dummy"))}
 		} else if strings.Contains(url, "upload-request") {
 			assert.Equal(t, "PUT", req.Method)
 			assert.Equal(t, "application/octet-stream", req.Header.Get("Content-Type"))
@@ -94,9 +93,9 @@ func TestBasicTransferAdapter(t *testing.T) {
 		}
 
 		for n, c := range cases {
-			_, err := a.Download(context.Background(), c.link)
+			_, err := a.Download(t.Context(), c.link)
 			if len(c.expectederror) > 0 {
-				assert.True(t, strings.Contains(err.Error(), c.expectederror), "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
+				assert.Contains(t, err.Error(), c.expectederror, "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
 			} else {
 				assert.NoError(t, err, "case %d", n)
 			}
@@ -127,13 +126,22 @@ func TestBasicTransferAdapter(t *testing.T) {
 		}
 
 		for n, c := range cases {
-			err := a.Upload(context.Background(), c.link, p, bytes.NewBufferString("dummy"))
+			err := a.Upload(t.Context(), c.link, p, strings.NewReader("dummy"))
 			if len(c.expectederror) > 0 {
-				assert.True(t, strings.Contains(err.Error(), c.expectederror), "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
+				assert.Contains(t, err.Error(), c.expectederror, "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
 			} else {
 				assert.NoError(t, err, "case %d", n)
 			}
 		}
+	})
+
+	t.Run("Upload created", func(t *testing.T) {
+		client := &http.Client{Transport: RoundTripFunc(func(req *http.Request) *http.Response {
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(""))}
+		})}
+		adapter := &BasicTransferAdapter{client: client}
+		err := adapter.Upload(t.Context(), &Link{Href: "https://upload-created-request.io"}, p, strings.NewReader("dummy"))
+		assert.NoError(t, err)
 	})
 
 	t.Run("Verify", func(t *testing.T) {
@@ -160,9 +168,9 @@ func TestBasicTransferAdapter(t *testing.T) {
 		}
 
 		for n, c := range cases {
-			err := a.Verify(context.Background(), c.link, p)
+			err := a.Verify(t.Context(), c.link, p)
 			if len(c.expectederror) > 0 {
-				assert.True(t, strings.Contains(err.Error(), c.expectederror), "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
+				assert.Contains(t, err.Error(), c.expectederror, "case %d: '%s' should contain '%s'", n, err.Error(), c.expectederror)
 			} else {
 				assert.NoError(t, err, "case %d", n)
 			}

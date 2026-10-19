@@ -10,13 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/perm"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/models/perm"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
 	"golang.org/x/crypto/ssh"
 	"xorm.io/builder"
@@ -37,7 +38,7 @@ const (
 // PublicKey represents a user or deploy SSH public key.
 type PublicKey struct {
 	ID            int64           `xorm:"pk autoincr"`
-	OwnerID       int64           `xorm:"INDEX NOT NULL"`
+	OwnerID       int64           `xorm:"INDEX NOT NULL"` // deploy-key doesn't have owner
 	Name          string          `xorm:"NOT NULL"`
 	Fingerprint   string          `xorm:"INDEX NOT NULL"`
 	Content       string          `xorm:"MEDIUMTEXT NOT NULL"`
@@ -64,17 +65,15 @@ func (key *PublicKey) AfterLoad() {
 
 // OmitEmail returns content of public key without email address.
 func (key *PublicKey) OmitEmail() string {
-	return strings.Join(strings.Split(key.Content, " ")[:2], " ")
+	fields := strings.Split(key.Content, " ") // format: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... comment
+	if len(fields) < 2 {
+		setting.PanicInDevOrTesting("invalid public key %d content: %s", key.ID, key.Content)
+		return "" // not a valid public key, it shouldn't really happen, the value is managed internally
+	}
+	return strings.Join(fields[:2], " ")
 }
 
-// AuthorizedString returns formatted public key string for authorized_keys file.
-//
-// TODO: Consider dropping this function
-func (key *PublicKey) AuthorizedString() string {
-	return AuthorizedStringForKey(key)
-}
-
-func addKey(ctx context.Context, key *PublicKey) (err error) {
+func addPublicKey(ctx context.Context, key *PublicKey) (err error) {
 	if len(key.Fingerprint) == 0 {
 		key.Fingerprint, err = CalcFingerprint(key.Content)
 		if err != nil {
@@ -90,8 +89,38 @@ func addKey(ctx context.Context, key *PublicKey) (err error) {
 	return appendAuthorizedKeysToFile(key)
 }
 
+// FindOrAddDeployPublicKey returns the shared public key that deploy keys of the given content link to, adding it on first use.
+func FindOrAddDeployPublicKey(ctx context.Context, content string) (*PublicKey, error) {
+	fingerprint, err := CalcFingerprint(content)
+	if err != nil {
+		return nil, err
+	}
+
+	pkey, exist, err := db.Get[PublicKey](ctx, builder.Eq{"fingerprint": fingerprint})
+	if err != nil {
+		return nil, err
+	} else if exist {
+		if pkey.Type != KeyTypeDeploy {
+			return nil, ErrKeyAlreadyExist{0, fingerprint, ""}
+		}
+		return pkey, nil
+	}
+
+	pkey = &PublicKey{
+		Mode:        perm.AccessModeNone,
+		Type:        KeyTypeDeploy,
+		Name:        "(DeployKey)",
+		Content:     content,
+		Fingerprint: fingerprint,
+	}
+	if err = addPublicKey(ctx, pkey); err != nil {
+		return nil, fmt.Errorf("addPublicKey: %w", err)
+	}
+	return pkey, nil
+}
+
 // AddPublicKey adds new public key to database and authorized_keys file.
-func AddPublicKey(ctx context.Context, ownerID int64, name, content string, authSourceID int64) (*PublicKey, error) {
+func AddPublicKey(ctx context.Context, ownerID int64, name, content string, authSourceID int64, verified bool) (*PublicKey, error) {
 	log.Trace(content)
 
 	fingerprint, err := CalcFingerprint(content)
@@ -99,40 +128,37 @@ func AddPublicKey(ctx context.Context, ownerID int64, name, content string, auth
 		return nil, err
 	}
 
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer committer.Close()
+	return db.WithTx2(ctx, func(ctx context.Context) (*PublicKey, error) {
+		if err := checkKeyFingerprint(ctx, fingerprint); err != nil {
+			return nil, err
+		}
 
-	if err := checkKeyFingerprint(ctx, fingerprint); err != nil {
-		return nil, err
-	}
+		// Key name of same user cannot be duplicated.
+		has, err := db.GetEngine(ctx).
+			Where("owner_id = ? AND name = ?", ownerID, name).
+			Get(new(PublicKey))
+		if err != nil {
+			return nil, err
+		} else if has {
+			return nil, ErrKeyNameAlreadyUsed{ownerID, name}
+		}
 
-	// Key name of same user cannot be duplicated.
-	has, err := db.GetEngine(ctx).
-		Where("owner_id = ? AND name = ?", ownerID, name).
-		Get(new(PublicKey))
-	if err != nil {
-		return nil, err
-	} else if has {
-		return nil, ErrKeyNameAlreadyUsed{ownerID, name}
-	}
+		key := &PublicKey{
+			OwnerID:       ownerID,
+			Name:          name,
+			Fingerprint:   fingerprint,
+			Content:       content,
+			Mode:          perm.AccessModeWrite,
+			Type:          KeyTypeUser,
+			LoginSourceID: authSourceID,
+			Verified:      verified,
+		}
+		if err = addPublicKey(ctx, key); err != nil {
+			return nil, fmt.Errorf("addKey: %w", err)
+		}
 
-	key := &PublicKey{
-		OwnerID:       ownerID,
-		Name:          name,
-		Fingerprint:   fingerprint,
-		Content:       content,
-		Mode:          perm.AccessModeWrite,
-		Type:          KeyTypeUser,
-		LoginSourceID: authSourceID,
-	}
-	if err = addKey(ctx, key); err != nil {
-		return nil, fmt.Errorf("addKey: %w", err)
-	}
-
-	return key, committer.Commit()
+		return key, nil
+	})
 }
 
 // GetPublicKeyByID returns public key by given ID.
@@ -149,12 +175,16 @@ func GetPublicKeyByID(ctx context.Context, keyID int64) (*PublicKey, error) {
 	return key, nil
 }
 
-// SearchPublicKeyByContent searches content as prefix (leak e-mail part)
-// and returns public key found.
-func SearchPublicKeyByContent(ctx context.Context, content string) (*PublicKey, error) {
+func SearchPublicKeyForSSH(ctx context.Context, sshPubKey string) (*PublicKey, error) {
+	// this function is designed to only accept SSH public keys,
+	// because there might be different methods to calculate the fingerprint in the future (at the moment: "SHA256:...")
+	fingerprint, err := CalcFingerprint(sshPubKey)
+	if err != nil {
+		return nil, err
+	}
 	key := new(PublicKey)
 	has, err := db.GetEngine(ctx).
-		Where("content like ?", content+"%").
+		Where("fingerprint = ?", fingerprint).
 		Get(key)
 	if err != nil {
 		return nil, err
@@ -164,12 +194,12 @@ func SearchPublicKeyByContent(ctx context.Context, content string) (*PublicKey, 
 	return key, nil
 }
 
-// SearchPublicKeyByContentExact searches content
-// and returns public key found.
-func SearchPublicKeyByContentExact(ctx context.Context, content string) (*PublicKey, error) {
+func SearchPrincipalKey(ctx context.Context, principalKey string) (*PublicKey, error) {
+	// FIXME: this function is wrong, and there is no index on the content column
+	// In the future, the existing principal keys should be migrated to use the fingerprint ("principal:{name}") instead of the content
 	key := new(PublicKey)
 	has, err := db.GetEngine(ctx).
-		Where("content = ?", content).
+		Where("content = ? AND type = ?", principalKey, KeyTypePrincipal).
 		Get(key)
 	if err != nil {
 		return nil, err
@@ -186,6 +216,10 @@ type FindPublicKeyOptions struct {
 	KeyTypes      []KeyType
 	NotKeytype    KeyType
 	LoginSourceID int64
+}
+
+func (opts FindPublicKeyOptions) ToOrders() string {
+	return "id"
 }
 
 func (opts FindPublicKeyOptions) ToConds() builder.Cond {
@@ -288,37 +322,28 @@ func PublicKeyIsExternallyManaged(ctx context.Context, id int64) (bool, error) {
 
 // deleteKeysMarkedForDeletion returns true if ssh keys needs update
 func deleteKeysMarkedForDeletion(ctx context.Context, keys []string) (bool, error) {
-	// Start session
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer committer.Close()
-
-	// Delete keys marked for deletion
-	var sshKeysNeedUpdate bool
-	for _, KeyToDelete := range keys {
-		key, err := SearchPublicKeyByContent(ctx, KeyToDelete)
-		if err != nil {
-			log.Error("SearchPublicKeyByContent: %v", err)
-			continue
+	return db.WithTx2(ctx, func(ctx context.Context) (bool, error) {
+		// Delete keys marked for deletion
+		var sshKeysNeedUpdate bool
+		for _, sshKeyToDelete := range keys {
+			key, err := SearchPublicKeyForSSH(ctx, sshKeyToDelete)
+			if err != nil {
+				log.Error("SearchPublicKeyForSSH: %v", err)
+				continue
+			}
+			if _, err = db.DeleteByID[PublicKey](ctx, key.ID); err != nil {
+				log.Error("DeleteByID[PublicKey]: %v", err)
+				continue
+			}
+			sshKeysNeedUpdate = true
 		}
-		if _, err = db.DeleteByID[PublicKey](ctx, key.ID); err != nil {
-			log.Error("DeleteByID[PublicKey]: %v", err)
-			continue
-		}
-		sshKeysNeedUpdate = true
-	}
 
-	if err := committer.Commit(); err != nil {
-		return false, err
-	}
-
-	return sshKeysNeedUpdate, nil
+		return sshKeysNeedUpdate, nil
+	})
 }
 
 // AddPublicKeysBySource add a users public keys. Returns true if there are changes.
-func AddPublicKeysBySource(ctx context.Context, usr *user_model.User, s *auth.Source, sshPublicKeys []string) bool {
+func AddPublicKeysBySource(ctx context.Context, usr *user_model.User, s *auth.Source, sshPublicKeys []string, verified bool) bool {
 	var sshKeysNeedUpdate bool
 	for _, sshKey := range sshPublicKeys {
 		var err error
@@ -337,7 +362,7 @@ func AddPublicKeysBySource(ctx context.Context, usr *user_model.User, s *auth.So
 			marshalled = marshalled[:len(marshalled)-1]
 			sshKeyName := fmt.Sprintf("%s-%s", s.Name, ssh.FingerprintSHA256(out))
 
-			if _, err := AddPublicKey(ctx, usr.ID, sshKeyName, marshalled, s.ID); err != nil {
+			if _, err := AddPublicKey(ctx, usr.ID, sshKeyName, marshalled, s.ID, verified); err != nil {
 				if IsErrKeyAlreadyExist(err) {
 					log.Trace("AddPublicKeysBySource[%s]: Public SSH Key %s already exists for user", sshKeyName, usr.Name)
 				} else {
@@ -355,13 +380,13 @@ func AddPublicKeysBySource(ctx context.Context, usr *user_model.User, s *auth.So
 	return sshKeysNeedUpdate
 }
 
-// SynchronizePublicKeys updates a users public keys. Returns true if there are changes.
-func SynchronizePublicKeys(ctx context.Context, usr *user_model.User, s *auth.Source, sshPublicKeys []string) bool {
+// SynchronizePublicKeys updates a user's public keys. Returns true if there are changes.
+func SynchronizePublicKeys(ctx context.Context, usr *user_model.User, s *auth.Source, sshPublicKeys []string, verified bool) bool {
 	var sshKeysNeedUpdate bool
 
 	log.Trace("synchronizePublicKeys[%s]: Handling Public SSH Key synchronization for user %s", s.Name, usr.Name)
 
-	// Get Public Keys from DB with current LDAP source
+	// Get Public Keys from DB with the current auth source
 	var giteaKeys []string
 	keys, err := db.Find[PublicKey](ctx, FindPublicKeyOptions{
 		OwnerID:       usr.ID,
@@ -401,7 +426,7 @@ func SynchronizePublicKeys(ctx context.Context, usr *user_model.User, s *auth.So
 			newKeys = append(newKeys, key)
 		}
 	}
-	if AddPublicKeysBySource(ctx, usr, s, newKeys) {
+	if AddPublicKeysBySource(ctx, usr, s, newKeys, verified) {
 		sshKeysNeedUpdate = true
 	}
 

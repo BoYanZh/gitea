@@ -6,19 +6,24 @@ package org
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/modules/base"
-	shared_user "code.gitea.io/gitea/routers/web/shared/user"
-	"code.gitea.io/gitea/services/context"
+	"gitea.dev/modules/templates"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
 )
 
 const (
-	tplSettingsBlockedUsers base.TplName = "org/settings/blocked_users"
+	tplSettingsBlockedUsers templates.TplName = "org/settings/blocked_users"
 )
 
 func BlockedUsers(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("user.block.list")
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsBlockedUsers"] = true
+
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerError("RenderUserOrgHeader", err)
+		return
+	}
 
 	shared_user.BlockedUsers(ctx, ctx.ContextUser)
 	if ctx.Written() {
@@ -29,10 +34,5 @@ func BlockedUsers(ctx *context.Context) {
 }
 
 func BlockedUsersPost(ctx *context.Context) {
-	shared_user.BlockedUsersPost(ctx, ctx.ContextUser)
-	if ctx.Written() {
-		return
-	}
-
-	ctx.Redirect(ctx.ContextUser.OrganisationLink() + "/settings/blocked_users")
+	shared_user.BlockedUsersPost(ctx, ctx.ContextUser, ctx.ContextUser.OrganisationLink()+"/settings/blocked_users")
 }

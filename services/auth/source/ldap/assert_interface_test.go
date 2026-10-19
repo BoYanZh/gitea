@@ -4,9 +4,9 @@
 package ldap_test
 
 import (
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/services/auth"
-	"code.gitea.io/gitea/services/auth/source/ldap"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/services/auth"
+	"gitea.dev/services/auth/source/ldap"
 )
 
 // This test file exists to assert that our Source exposes the interfaces that we expect
@@ -15,13 +15,11 @@ import (
 type sourceInterface interface {
 	auth.PasswordAuthenticator
 	auth.SynchronizableSource
-	auth.LocalTwoFASkipper
 	auth_model.SSHKeyProvider
 	auth_model.Config
 	auth_model.SkipVerifiable
 	auth_model.HasTLSer
 	auth_model.UseTLSer
-	auth_model.SourceSettable
 }
 
-var _ (sourceInterface) = &ldap.Source{}
+var _ sourceInterface = &ldap.Source{}

@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,20 +32,19 @@ func testRepoGenerate(t *testing.T, session *TestSession, templateID, templateOw
 
 	// Step2: click the "Use this template" button
 	htmlDoc := NewHTMLParser(t, resp.Body)
-	link, exists := htmlDoc.doc.Find("a.ui.button[href^=\"/repo/create\"]").Attr("href")
+	link, exists := htmlDoc.doc.Find(`a.ui.button[href^="/repo/create"]`).Attr("href")
 	assert.True(t, exists, "The template has changed")
 	req = NewRequest(t, "GET", link)
 	resp = session.MakeRequest(t, req, http.StatusOK)
 
-	// Step3: fill the form of the create
+	// Step3: fill the form on the "create" page
 	htmlDoc = NewHTMLParser(t, resp.Body)
-	link, exists = htmlDoc.doc.Find("form.ui.form[action^=\"/repo/create\"]").Attr("action")
+	link, exists = htmlDoc.doc.Find(`form.ui.form[action^="/repo/create"]`).Attr("action")
 	assert.True(t, exists, "The template has changed")
-	_, exists = htmlDoc.doc.Find(fmt.Sprintf(".owner.dropdown .item[data-value=\"%d\"]", generateOwner.ID)).Attr("data-value")
-	assert.True(t, exists, fmt.Sprintf("Generate owner '%s' is not present in select box", generateOwnerName))
+	_, exists = htmlDoc.doc.Find(fmt.Sprintf(`#repo_owner_dropdown .item[data-value="%d"]`, generateOwner.ID)).Attr("data-value")
+	assert.True(t, exists, "Generate owner '%s' is not present in select box", generateOwnerName)
 	req = NewRequestWithValues(t, "POST", link, map[string]string{
-		"_csrf":         htmlDoc.GetCSRF(),
-		"uid":           fmt.Sprintf("%d", generateOwner.ID),
+		"uid":           strconv.FormatInt(generateOwner.ID, 10),
 		"repo_name":     generateRepoName,
 		"repo_template": templateID,
 		"git_content":   "true",

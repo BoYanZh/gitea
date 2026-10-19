@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"testing"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/contexttest"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/contexttest"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -58,7 +58,7 @@ func TestRepoEdit(t *testing.T) {
 	web.SetForm(ctx, &opts)
 	Edit(ctx)
 
-	assert.EqualValues(t, http.StatusOK, ctx.Resp.Status())
+	assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 	unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
 		ID: 1,
 	}, unittest.Cond("name = ? AND is_archived = 1", *opts.Name))
@@ -78,7 +78,7 @@ func TestRepoEditNameChange(t *testing.T) {
 
 	web.SetForm(ctx, &opts)
 	Edit(ctx)
-	assert.EqualValues(t, http.StatusOK, ctx.Resp.Status())
+	assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 
 	unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{
 		ID: 1,

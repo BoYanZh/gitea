@@ -11,9 +11,9 @@ import (
 	"text/template"
 	"time"
 
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/log"
 
-	shellquote "github.com/kballard/go-shellquote"
+	"github.com/kballard/go-shellquote"
 )
 
 // Mailer represents mail service.
@@ -28,6 +28,9 @@ type Mailer struct {
 	SendAsPlainText      bool                `ini:"SEND_AS_PLAIN_TEXT"`
 	SubjectPrefix        string              `ini:"SUBJECT_PREFIX"`
 	OverrideHeader       map[string][]string `ini:"-"`
+
+	// Embed attachment images as inline base64 img src attribute
+	EmbedAttachmentImages bool
 
 	// SMTP sender
 	Protocol             string `ini:"PROTOCOL"`
@@ -73,14 +76,7 @@ func loadMailerFrom(rootCfg ConfigProvider) {
 	// Handle Deprecations and map on to new configuration
 	// DEPRECATED should not be removed because users maybe upgrade from lower version to the latest version
 	// if these are removed, the warning will not be shown
-	deprecatedSetting(rootCfg, "mailer", "MAILER_TYPE", "mailer", "PROTOCOL", "v1.19.0")
-	if sec.HasKey("MAILER_TYPE") && !sec.HasKey("PROTOCOL") {
-		if sec.Key("MAILER_TYPE").String() == "sendmail" {
-			sec.Key("PROTOCOL").MustString("sendmail")
-		}
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "HOST", "mailer", "SMTP_ADDR", "v1.19.0")
+	deprecatedSetting(rootCfg, "mailer", "HOST", "mailer", "SMTP_ADDR")
 	if sec.HasKey("HOST") && !sec.HasKey("SMTP_ADDR") {
 		givenHost := sec.Key("HOST").String()
 		addr, port, err := net.SplitHostPort(givenHost)
@@ -92,64 +88,25 @@ func loadMailerFrom(rootCfg ConfigProvider) {
 		if addr == "" {
 			addr = "127.0.0.1"
 		}
-		sec.Key("SMTP_ADDR").MustString(addr)
-		sec.Key("SMTP_PORT").MustString(port)
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "IS_TLS_ENABLED", "mailer", "PROTOCOL", "v1.19.0")
-	if sec.HasKey("IS_TLS_ENABLED") && !sec.HasKey("PROTOCOL") {
-		if sec.Key("IS_TLS_ENABLED").MustBool() {
-			sec.Key("PROTOCOL").MustString("smtps")
-		} else {
-			sec.Key("PROTOCOL").MustString("smtp+starttls")
-		}
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "DISABLE_HELO", "mailer", "ENABLE_HELO", "v1.19.0")
-	if sec.HasKey("DISABLE_HELO") && !sec.HasKey("ENABLE_HELO") {
-		sec.Key("ENABLE_HELO").MustBool(!sec.Key("DISABLE_HELO").MustBool())
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "SKIP_VERIFY", "mailer", "FORCE_TRUST_SERVER_CERT", "v1.19.0")
-	if sec.HasKey("SKIP_VERIFY") && !sec.HasKey("FORCE_TRUST_SERVER_CERT") {
-		sec.Key("FORCE_TRUST_SERVER_CERT").MustBool(sec.Key("SKIP_VERIFY").MustBool())
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "USE_CERTIFICATE", "mailer", "USE_CLIENT_CERT", "v1.19.0")
-	if sec.HasKey("USE_CERTIFICATE") && !sec.HasKey("USE_CLIENT_CERT") {
-		sec.Key("USE_CLIENT_CERT").MustBool(sec.Key("USE_CERTIFICATE").MustBool())
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "CERT_FILE", "mailer", "CLIENT_CERT_FILE", "v1.19.0")
-	if sec.HasKey("CERT_FILE") && !sec.HasKey("CLIENT_CERT_FILE") {
-		sec.Key("CERT_FILE").MustString(sec.Key("CERT_FILE").String())
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "KEY_FILE", "mailer", "CLIENT_KEY_FILE", "v1.19.0")
-	if sec.HasKey("KEY_FILE") && !sec.HasKey("CLIENT_KEY_FILE") {
-		sec.Key("KEY_FILE").MustString(sec.Key("KEY_FILE").String())
-	}
-
-	deprecatedSetting(rootCfg, "mailer", "ENABLE_HTML_ALTERNATIVE", "mailer", "SEND_AS_PLAIN_TEXT", "v1.19.0")
-	if sec.HasKey("ENABLE_HTML_ALTERNATIVE") && !sec.HasKey("SEND_AS_PLAIN_TEXT") {
-		sec.Key("SEND_AS_PLAIN_TEXT").MustBool(!sec.Key("ENABLE_HTML_ALTERNATIVE").MustBool(false))
+		sec.Key("SMTP_ADDR").MustString(addr) // FIXME: INI-MUST-SIDE-EFFECT
+		sec.Key("SMTP_PORT").MustString(port) // FIXME: INI-MUST-SIDE-EFFECT
 	}
 
 	if sec.HasKey("PROTOCOL") && sec.Key("PROTOCOL").String() == "smtp+startls" {
-		log.Error("Deprecated fallback `[mailer]` `PROTOCOL = smtp+startls` present. Use `[mailer]` `PROTOCOL = smtp+starttls`` instead. This fallback will be removed in v1.19.0")
+		log.Error("Deprecated fallback `[mailer]` `PROTOCOL = smtp+startls` present. Use `[mailer]` `PROTOCOL = smtp+starttls` instead.")
 		sec.Key("PROTOCOL").SetValue("smtp+starttls")
 	}
 
 	// Set default values & validate
-	sec.Key("NAME").MustString(AppName)
+	sec.Key("NAME").MustString(AppName) // FIXME: INI-MUST-SIDE-EFFECT
 	sec.Key("PROTOCOL").In("", []string{"smtp", "smtps", "smtp+starttls", "smtp+unix", "sendmail", "dummy"})
-	sec.Key("ENABLE_HELO").MustBool(true)
-	sec.Key("FORCE_TRUST_SERVER_CERT").MustBool(false)
-	sec.Key("USE_CLIENT_CERT").MustBool(false)
-	sec.Key("SENDMAIL_PATH").MustString("sendmail")
-	sec.Key("SENDMAIL_TIMEOUT").MustDuration(5 * time.Minute)
-	sec.Key("SENDMAIL_CONVERT_CRLF").MustBool(true)
-	sec.Key("FROM").MustString(sec.Key("USER").String())
+	sec.Key("ENABLE_HELO").MustBool(true)                     // FIXME: INI-MUST-SIDE-EFFECT
+	sec.Key("FORCE_TRUST_SERVER_CERT").MustBool(false)        // FIXME: INI-MUST-SIDE-EFFECT
+	sec.Key("USE_CLIENT_CERT").MustBool(false)                // FIXME: INI-MUST-SIDE-EFFECT
+	sec.Key("SENDMAIL_PATH").MustString("sendmail")           // FIXME: INI-MUST-SIDE-EFFECT
+	sec.Key("SENDMAIL_TIMEOUT").MustDuration(5 * time.Minute) // FIXME: INI-MUST-SIDE-EFFECT
+	sec.Key("SENDMAIL_CONVERT_CRLF").MustBool(true)           // FIXME: INI-MUST-SIDE-EFFECT
+	sec.Key("FROM").MustString(sec.Key("USER").String())      // FIXME: INI-MUST-SIDE-EFFECT
 
 	// Now map the values on to the MailService
 	MailService = &Mailer{}
@@ -255,8 +212,6 @@ func loadMailerFrom(rootCfg ConfigProvider) {
 		MailService.OverrideEnvelopeFrom = true
 		MailService.EnvelopeFrom = parsed.Address
 	}
-
-	log.Info("Mail Service Enabled")
 }
 
 func loadRegisterMailFrom(rootCfg ConfigProvider) {
@@ -267,7 +222,6 @@ func loadRegisterMailFrom(rootCfg ConfigProvider) {
 		return
 	}
 	Service.RegisterEmailConfirm = true
-	log.Info("Register Mail Service Enabled")
 }
 
 func loadNotifyMailFrom(rootCfg ConfigProvider) {
@@ -278,7 +232,6 @@ func loadNotifyMailFrom(rootCfg ConfigProvider) {
 		return
 	}
 	Service.EnableNotifyMail = true
-	log.Info("Notify Mail Service Enabled")
 }
 
 func tryResolveAddr(addr string) []net.IPAddr {

@@ -1,0 +1,38 @@
+// Copyright 2025 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"gitea.dev/services/context"
+	repo_service "gitea.dev/services/repository"
+)
+
+func acceptTransfer(ctx *context.Context) {
+	err := repo_service.AcceptTransferOwnership(ctx, ctx.Repo.Repository, ctx.Doer)
+	if err == nil {
+		ctx.Flash.Success(ctx.Tr("repo.settings.transfer.success"))
+		ctx.JSONRedirect(ctx.Repo.Repository.Link())
+		return
+	}
+	handleRepoActionError(ctx, err)
+}
+
+func rejectTransfer(ctx *context.Context) {
+	err := repo_service.RejectRepositoryTransfer(ctx, ctx.Repo.Repository, ctx.Doer)
+	if err == nil {
+		ctx.Flash.Success(ctx.Tr("repo.settings.transfer.rejected"))
+		ctx.JSONRedirect(ctx.Repo.Repository.Link())
+		return
+	}
+	handleRepoActionError(ctx, err)
+}
+
+func ActionTransfer(ctx *context.Context) {
+	switch ctx.PathParam("action") {
+	case "accept_transfer":
+		acceptTransfer(ctx)
+	case "reject_transfer":
+		rejectTransfer(ctx)
+	}
+}

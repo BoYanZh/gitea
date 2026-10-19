@@ -4,97 +4,127 @@
 package common
 
 import (
-	go_context "context"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"code.gitea.io/gitea/modules/cache"
-	"code.gitea.io/gitea/modules/httplib"
-	"code.gitea.io/gitea/modules/process"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/web/middleware"
-	"code.gitea.io/gitea/modules/web/routing"
-	"code.gitea.io/gitea/services/context"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/gtprof"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/public"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/web/routing"
+	"gitea.dev/services/context"
 
-	"gitea.com/go-chi/session"
 	"github.com/chi-middleware/proxy"
 	"github.com/go-chi/chi/v5"
 )
 
 // ProtocolMiddlewares returns HTTP protocol related middlewares, and it provides a global panic recovery
 func ProtocolMiddlewares() (handlers []any) {
-	// make sure chi uses EscapedPath(RawPath) as RoutePath, then "%2f" could be handled correctly
-	handlers = append(handlers, func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			ctx := chi.RouteContext(req.Context())
-			if req.URL.RawPath == "" {
-				ctx.RoutePath = req.URL.EscapedPath()
-			} else {
-				ctx.RoutePath = req.URL.RawPath
-			}
-			next.ServeHTTP(resp, req)
-		})
-	})
+	// the order is important
+	handlers = append(handlers, ChiRoutePathHandler())   // make sure chi has correct paths
+	handlers = append(handlers, RequestContextHandler()) //	prepare the context and panic recovery
+	handlers = append(handlers, SecurityHeadersHandler())
 
-	// prepare the ContextData and panic recovery
-	handlers = append(handlers, func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			defer func() {
-				if err := recover(); err != nil {
-					RenderPanicErrorPage(resp, req, err) // it should never panic
-				}
-			}()
-			req = req.WithContext(middleware.WithContextData(req.Context()))
-			req = req.WithContext(go_context.WithValue(req.Context(), httplib.RequestContextKey, req))
-			next.ServeHTTP(resp, req)
-		})
-	})
-
-	// wrap the request and response, use the process context and add it to the process manager
-	handlers = append(handlers, func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			ctx, _, finished := process.GetManager().AddTypedContext(req.Context(), fmt.Sprintf("%s: %s", req.Method, req.RequestURI), process.RequestProcessType, true)
-			defer finished()
-			next.ServeHTTP(context.WrapResponseWriter(resp), req.WithContext(cache.WithCacheContext(ctx)))
-		})
-	})
-
-	if setting.ReverseProxyLimit > 0 {
-		opt := proxy.NewForwardedHeadersOptions().
-			WithForwardLimit(setting.ReverseProxyLimit).
-			ClearTrustedProxies()
-		for _, n := range setting.ReverseProxyTrustedProxies {
-			if !strings.Contains(n, "/") {
-				opt.AddTrustedProxy(n)
-			} else {
-				opt.AddTrustedNetwork(n)
-			}
-		}
-		handlers = append(handlers, proxy.ForwardedHeaders(opt))
+	if setting.ReverseProxyLimit > 0 && len(setting.ReverseProxyTrustedProxies) > 0 {
+		handlers = append(handlers, ForwardedHeadersHandler(setting.ReverseProxyLimit, setting.ReverseProxyTrustedProxies))
 	}
 
-	if setting.IsRouteLogEnabled() {
-		handlers = append(handlers, routing.NewLoggerHandler())
-	}
+	handlers = append(handlers, routing.NewRequestInfoHandler())
 
 	if setting.IsAccessLogEnabled() {
 		handlers = append(handlers, context.AccessLogger())
 	}
 
+	if !setting.IsProd {
+		handlers = append(handlers, public.ViteDevMiddleware)
+	}
+
 	return handlers
 }
 
-func Sessioner() func(next http.Handler) http.Handler {
-	return session.Sessioner(session.Options{
-		Provider:       setting.SessionConfig.Provider,
-		ProviderConfig: setting.SessionConfig.ProviderConfig,
-		CookieName:     setting.SessionConfig.CookieName,
-		CookiePath:     setting.SessionConfig.CookiePath,
-		Gclifetime:     setting.SessionConfig.Gclifetime,
-		Maxlifetime:    setting.SessionConfig.Maxlifetime,
-		Secure:         setting.SessionConfig.Secure,
-		SameSite:       setting.SessionConfig.SameSite,
-		Domain:         setting.SessionConfig.Domain,
-	})
+// SecurityHeadersHandler sets headers globally for every response that leaves Gitea.
+func SecurityHeadersHandler() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			if setting.Security.XContentTypeOptions != "unset" {
+				resp.Header().Set("X-Content-Type-Options", setting.Security.XContentTypeOptions)
+			}
+			if setting.Security.XFrameOptions != "unset" {
+				resp.Header().Set("X-Frame-Options", setting.Security.XFrameOptions)
+			}
+			next.ServeHTTP(resp, req)
+		})
+	}
+}
+
+func RequestContextHandler() func(h http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(respOrig http.ResponseWriter, req *http.Request) {
+			// this response writer might not be the same as the one in context.Base.Resp
+			// because there might be a "gzip writer" in the middle, so the "written size" here is the compressed size
+			respWriter := context.WrapResponseWriter(respOrig)
+
+			profDesc := fmt.Sprintf("HTTP: %s %s", req.Method, req.RequestURI)
+			ctx, finished := reqctx.NewRequestContext(req.Context(), profDesc)
+			defer finished()
+
+			ctx, span := gtprof.GetTracer().Start(ctx, gtprof.TraceSpanHTTP)
+			req = req.WithContext(ctx)
+			defer func() {
+				chiCtx := chi.RouteContext(req.Context())
+				span.SetAttributeString(gtprof.TraceAttrHTTPRoute, chiCtx.RoutePattern())
+				span.End()
+			}()
+
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					renderPanicErrorPage(respWriter, req, recovered) // it should never panic, and it handles the stack trace internally
+				}
+			}()
+
+			ctx = cache.WithCacheContext(req.Context())
+			req = httplib.RequestWithContext(req, reqctx.FromContext(ctx))
+			next.ServeHTTP(respWriter, req)
+		})
+	}
+}
+
+func ChiRoutePathHandler() func(h http.Handler) http.Handler {
+	// make sure chi uses EscapedPath(RawPath) as RoutePath, then "%2f" could be handled correctly
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			chiCtx := chi.RouteContext(req.Context())
+			if req.URL.RawPath == "" {
+				chiCtx.RoutePath = req.URL.EscapedPath()
+			} else {
+				chiCtx.RoutePath = req.URL.RawPath
+			}
+			next.ServeHTTP(resp, req)
+		})
+	}
+}
+
+func ForwardedHeadersHandler(limit int, trustedProxies []string) func(h http.Handler) http.Handler {
+	opt := proxy.NewForwardedHeadersOptions().WithForwardLimit(limit).ClearTrustedProxies()
+	for _, n := range trustedProxies {
+		if !strings.Contains(n, "/") {
+			opt.AddTrustedProxy(n)
+		} else {
+			opt.AddTrustedNetwork(n)
+		}
+	}
+	return proxy.ForwardedHeaders(opt)
+}
+
+func MustInitSessioner() func(next http.Handler) http.Handler {
+	middleware, err := session.Sessioner()
+	if err != nil {
+		log.Fatal("common.Sessioner failed: %v", err)
+	}
+	return middleware
 }

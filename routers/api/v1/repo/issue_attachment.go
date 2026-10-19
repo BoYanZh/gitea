@@ -4,19 +4,21 @@
 package repo
 
 import (
+	"errors"
 	"net/http"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/attachment"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/context/upload"
-	"code.gitea.io/gitea/services/convert"
-	issue_service "code.gitea.io/gitea/services/issue"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	attachment_service "gitea.dev/services/attachment"
+	"gitea.dev/services/context"
+	"gitea.dev/services/context/upload"
+	"gitea.dev/services/convert"
+	issue_service "gitea.dev/services/issue"
 )
 
 // GetIssueAttachment gets a single attachment of the issue
@@ -65,7 +67,7 @@ func GetIssueAttachment(ctx *context.APIContext) {
 		return
 	}
 
-	ctx.JSON(http.StatusOK, convert.ToAPIAttachment(ctx.Repo.Repository, attach))
+	ctx.JSON(http.StatusOK, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attach))
 }
 
 // ListIssueAttachments lists all attachments of the issue
@@ -104,7 +106,7 @@ func ListIssueAttachments(ctx *context.APIContext) {
 	}
 
 	if err := issue.LoadAttributes(ctx); err != nil {
-		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -154,6 +156,8 @@ func CreateIssueAttachment(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "404":
 	//     "$ref": "#/responses/error"
+	//   "413":
+	//     "$ref": "#/responses/error"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 	//   "423":
@@ -171,7 +175,7 @@ func CreateIssueAttachment(ctx *context.APIContext) {
 	// Get uploaded file from request
 	file, header, err := ctx.Req.FormFile("attachment")
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "FormFile", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	defer file.Close()
@@ -181,7 +185,8 @@ func CreateIssueAttachment(ctx *context.APIContext) {
 		filename = query
 	}
 
-	attachment, err := attachment.UploadAttachment(ctx, file, setting.Attachment.AllowedTypes, header.Size, &repo_model.Attachment{
+	uploaderFile := attachment_service.NewLimitedUploaderKnownSize(file, header.Size)
+	attachment, err := attachment_service.UploadAttachmentForIssue(ctx, uploaderFile, &repo_model.Attachment{
 		Name:       filename,
 		UploaderID: ctx.Doer.ID,
 		RepoID:     ctx.Repo.Repository.ID,
@@ -189,9 +194,11 @@ func CreateIssueAttachment(ctx *context.APIContext) {
 	})
 	if err != nil {
 		if upload.IsErrFileTypeForbidden(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else if errors.Is(err, util.ErrContentTooLarge) {
+			ctx.APIError(http.StatusRequestEntityTooLarge, err.Error())
 		} else {
-			ctx.Error(http.StatusInternalServerError, "UploadAttachment", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
@@ -199,11 +206,11 @@ func CreateIssueAttachment(ctx *context.APIContext) {
 	issue.Attachments = append(issue.Attachments, attachment)
 
 	if err := issue_service.ChangeContent(ctx, issue, ctx.Doer, issue.Content, issue.ContentVersion); err != nil {
-		ctx.Error(http.StatusInternalServerError, "ChangeContent", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx.Repo.Repository, attachment))
+	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attachment))
 }
 
 // EditIssueAttachment updates the given attachment
@@ -247,6 +254,8 @@ func EditIssueAttachment(ctx *context.APIContext) {
 	//     "$ref": "#/responses/Attachment"
 	//   "404":
 	//     "$ref": "#/responses/error"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
 	//   "423":
 	//     "$ref": "#/responses/repoArchivedError"
 
@@ -256,16 +265,21 @@ func EditIssueAttachment(ctx *context.APIContext) {
 	}
 
 	// do changes to attachment. only meaningful change is name.
-	form := web.GetForm(ctx).(*api.EditAttachmentOptions)
+	form := web.GetForm[*api.EditAttachmentOptions](ctx)
 	if form.Name != "" {
 		attachment.Name = form.Name
 	}
 
-	if err := repo_model.UpdateAttachment(ctx, attachment); err != nil {
-		ctx.Error(http.StatusInternalServerError, "UpdateAttachment", err)
+	if err := attachment_service.UpdateAttachment(ctx, setting.Attachment.AllowedTypes, attachment); err != nil {
+		if upload.IsErrFileTypeForbidden(err) {
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		ctx.APIErrorInternal(err)
+		return
 	}
 
-	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx.Repo.Repository, attachment))
+	ctx.JSON(http.StatusCreated, convert.ToAPIAttachment(ctx, ctx.Repo.Repository, attachment))
 }
 
 // DeleteIssueAttachment delete a given attachment
@@ -312,7 +326,7 @@ func DeleteIssueAttachment(ctx *context.APIContext) {
 	}
 
 	if err := repo_model.DeleteAttachment(ctx, attachment, true); err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteAttachment", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -322,7 +336,7 @@ func DeleteIssueAttachment(ctx *context.APIContext) {
 func getIssueFromContext(ctx *context.APIContext) *issues_model.Issue {
 	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("index"))
 	if err != nil {
-		ctx.NotFoundOrServerError("GetIssueByIndex", issues_model.IsErrIssueNotExist, err)
+		ctx.APIErrorAuto(err)
 		return nil
 	}
 
@@ -347,7 +361,7 @@ func getIssueAttachmentSafeWrite(ctx *context.APIContext) *repo_model.Attachment
 func getIssueAttachmentSafeRead(ctx *context.APIContext, issue *issues_model.Issue) *repo_model.Attachment {
 	attachment, err := repo_model.GetAttachmentByID(ctx, ctx.PathParamInt64("attachment_id"))
 	if err != nil {
-		ctx.NotFoundOrServerError("GetAttachmentByID", repo_model.IsErrAttachmentNotExist, err)
+		ctx.APIErrorAuto(err)
 		return nil
 	}
 	if !attachmentBelongsToRepoOrIssue(ctx, attachment, issue) {
@@ -357,9 +371,9 @@ func getIssueAttachmentSafeRead(ctx *context.APIContext, issue *issues_model.Iss
 }
 
 func canUserWriteIssueAttachment(ctx *context.APIContext, issue *issues_model.Issue) bool {
-	canEditIssue := ctx.IsSigned && (ctx.Doer.ID == issue.PosterID || ctx.IsUserRepoAdmin() || ctx.IsUserSiteAdmin() || ctx.Repo.CanWriteIssuesOrPulls(issue.IsPull))
+	canEditIssue := ctx.IsSigned && (ctx.Doer.ID == issue.PosterID || ctx.IsUserRepoAdmin() || ctx.IsUserSiteAdmin() || ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull))
 	if !canEditIssue {
-		ctx.Error(http.StatusForbidden, "", "user should have permission to write issue")
+		ctx.APIError(http.StatusForbidden, "user should have permission to write issue")
 		return false
 	}
 
@@ -369,16 +383,16 @@ func canUserWriteIssueAttachment(ctx *context.APIContext, issue *issues_model.Is
 func attachmentBelongsToRepoOrIssue(ctx *context.APIContext, attachment *repo_model.Attachment, issue *issues_model.Issue) bool {
 	if attachment.RepoID != ctx.Repo.Repository.ID {
 		log.Debug("Requested attachment[%d] does not belong to repo[%-v].", attachment.ID, ctx.Repo.Repository)
-		ctx.NotFound("no such attachment in repo")
+		ctx.APIErrorNotFound("no such attachment in repo")
 		return false
 	}
-	if attachment.IssueID == 0 {
-		log.Debug("Requested attachment[%d] is not in an issue.", attachment.ID)
-		ctx.NotFound("no such attachment in issue")
+	if attachment.IssueID == 0 || attachment.CommentID != 0 {
+		log.Debug("Requested attachment[%d] is not an issue attachment.", attachment.ID)
+		ctx.APIErrorNotFound("no such attachment in issue")
 		return false
 	} else if issue != nil && attachment.IssueID != issue.ID {
 		log.Debug("Requested attachment[%d] does not belong to issue[%d, #%d].", attachment.ID, issue.ID, issue.Index)
-		ctx.NotFound("no such attachment in issue")
+		ctx.APIErrorNotFound("no such attachment in issue")
 		return false
 	}
 	return true

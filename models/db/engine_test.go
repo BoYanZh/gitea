@@ -7,14 +7,15 @@ import (
 	"path/filepath"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/setting"
 
-	_ "code.gitea.io/gitea/cmd" // for TestPrimaryKeys
+	_ "gitea.dev/cmd" // for TestPrimaryKeys
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDumpDatabase(t *testing.T) {
@@ -26,32 +27,32 @@ func TestDumpDatabase(t *testing.T) {
 		ID      int64 `xorm:"pk autoincr"`
 		Version int64
 	}
-	assert.NoError(t, db.GetEngine(db.DefaultContext).Sync(new(Version)))
+	assert.NoError(t, db.GetEngine(t.Context()).Sync(new(Version)))
 
 	for _, dbType := range setting.SupportedDatabaseTypes {
-		assert.NoError(t, db.DumpDatabase(filepath.Join(dir, dbType+".sql"), dbType))
+		assert.NoError(t, db.DumpDatabase(filepath.Join(dir, dbType+".sql"), setting.DatabaseType(dbType)))
 	}
 }
 
 func TestDeleteOrphanedObjects(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
 
-	countBefore, err := db.GetEngine(db.DefaultContext).Count(&issues_model.PullRequest{})
+	countBefore, err := db.GetEngine(t.Context()).Count(&issues_model.PullRequest{})
 	assert.NoError(t, err)
 
-	_, err = db.GetEngine(db.DefaultContext).Insert(&issues_model.PullRequest{IssueID: 1000}, &issues_model.PullRequest{IssueID: 1001}, &issues_model.PullRequest{IssueID: 1003})
+	_, err = db.GetEngine(t.Context()).Insert(&issues_model.PullRequest{IssueID: 1000}, &issues_model.PullRequest{IssueID: 1001}, &issues_model.PullRequest{IssueID: 1003})
 	assert.NoError(t, err)
 
-	orphaned, err := db.CountOrphanedObjects(db.DefaultContext, "pull_request", "issue", "pull_request.issue_id=issue.id")
+	orphaned, err := db.CountOrphanedObjects(t.Context(), "pull_request", "issue", "pull_request.issue_id=issue.id")
 	assert.NoError(t, err)
 	assert.EqualValues(t, 3, orphaned)
 
-	err = db.DeleteOrphanedObjects(db.DefaultContext, "pull_request", "issue", "pull_request.issue_id=issue.id")
+	err = db.DeleteOrphanedObjects(t.Context(), "pull_request", "issue", "pull_request.issue_id=issue.id")
 	assert.NoError(t, err)
 
-	countAfter, err := db.GetEngine(db.DefaultContext).Count(&issues_model.PullRequest{})
+	countAfter, err := db.GetEngine(t.Context()).Count(&issues_model.PullRequest{})
 	assert.NoError(t, err)
-	assert.EqualValues(t, countBefore, countAfter)
+	assert.Equal(t, countBefore, countAfter)
 }
 
 func TestPrimaryKeys(t *testing.T) {
@@ -59,19 +60,17 @@ func TestPrimaryKeys(t *testing.T) {
 	//   https://github.com/go-gitea/gitea/issues/21086
 	//   https://github.com/go-gitea/gitea/issues/16802
 	// To avoid creating tables without primary key again, this test will check them.
-	// Import "code.gitea.io/gitea/cmd" to make sure each db.RegisterModel in init functions has been called.
+	// Import "gitea.dev/cmd" to make sure each db.RegisterModel in init functions has been called.
 
 	beans, err := db.NamesToBean()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	whitelist := map[string]string{
 		"the_table_name_to_skip_checking": "Write a note here to explain why",
 	}
 
 	for _, bean := range beans {
-		table, err := db.TableInfo(bean)
+		table, err := db.GetXORMEngineForTesting().TableInfo(bean)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,8 +78,6 @@ func TestPrimaryKeys(t *testing.T) {
 			t.Logf("ignore %q because %q", table.Name, why)
 			continue
 		}
-		if len(table.PrimaryKeys) == 0 {
-			t.Errorf("table %q has no primary key", table.Name)
-		}
+		assert.NotEmpty(t, table.PrimaryKeys, "table %q has no primary key", table.Name)
 	}
 }

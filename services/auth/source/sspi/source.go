@@ -4,8 +4,8 @@
 package sspi
 
 import (
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/modules/json"
+	"gitea.dev/models/auth"
+	"gitea.dev/modules/json"
 )
 
 //   _________ ___________________.___
@@ -17,6 +17,8 @@ import (
 
 // Source holds configuration for SSPI single sign-on.
 type Source struct {
+	auth.ConfigBase `json:"-"`
+
 	AutoCreateUsers      bool
 	AutoActivateUsers    bool
 	StripDomainNames     bool

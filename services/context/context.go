@@ -6,46 +6,53 @@ package context
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
-	"code.gitea.io/gitea/models/unit"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/cache"
-	"code.gitea.io/gitea/modules/gitrepo"
-	"code.gitea.io/gitea/modules/httpcache"
-	"code.gitea.io/gitea/modules/session"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/templates"
-	"code.gitea.io/gitea/modules/translation"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/modules/web/middleware"
-	web_types "code.gitea.io/gitea/modules/web/types"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/reqctx"
+	"gitea.dev/modules/session"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/translation"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/validation"
+	"gitea.dev/modules/web"
+	"gitea.dev/modules/web/middleware"
+	web_types "gitea.dev/modules/web/types"
 )
 
 // Render represents a template render
 type Render interface {
 	TemplateLookup(tmpl string, templateCtx context.Context) (templates.TemplateExecutor, error)
-	HTML(w io.Writer, status int, name string, data any, templateCtx context.Context) error
+	HTML(w io.Writer, status int, name templates.TplName, data any, templateCtx context.Context) error
 }
 
-// Context represents context of a request.
+// Context represents context of a web request.
+// ATTENTION: This struct should never be manually constructed in routes/services,
+// it has many internal details which should be carefully prepared by the framework.
+// If it is abused, it would cause strange bugs like panic/resource-leak.
 type Context struct {
 	*Base
 
 	TemplateContext TemplateContext
 
-	Render   Render
-	PageData map[string]any // data used by JavaScript modules in one page, it's `window.config.pageData`
+	Render Render
+
+	// PageData is used by JavaScript modules, it is `window.config.pageData`.
+	// Deprecated: it was introduced for refactoring some legacy JS code, it should not be used in new code anymore.
+	PageData map[string]any
 
 	Cache   cache.StringCache
-	Csrf    CSRFProtector
 	Flash   *middleware.Flash
 	Session session.Store
 
@@ -62,11 +69,12 @@ type Context struct {
 	Package *Package
 }
 
-type TemplateContext map[string]any
-
 func init() {
+	web.RegisterResponseStatusProvider[*Base](func(req *http.Request) web_types.ResponseStatusProvider {
+		return reqctx.MustContextValue[*Base](req.Context(), BaseContextKey)
+	})
 	web.RegisterResponseStatusProvider[*Context](func(req *http.Request) web_types.ResponseStatusProvider {
-		return req.Context().Value(WebContextKey).(*Context)
+		return reqctx.MustContextValue[*Context](req.Context(), WebContextKey)
 	})
 }
 
@@ -74,33 +82,19 @@ type webContextKeyType struct{}
 
 var WebContextKey = webContextKeyType{}
 
-func GetWebContext(req *http.Request) *Context {
-	ctx, _ := req.Context().Value(WebContextKey).(*Context)
-	return ctx
+func GetWebContext(ctx context.Context) *Context {
+	webCtx, _ := ctx.Value(WebContextKey).(*Context)
+	return webCtx
 }
 
-// ValidateContext is a special context for form validation middleware. It may be different from other contexts.
-type ValidateContext struct {
-	*Base
-}
-
-// GetValidateContext gets a context for middleware form validation
-func GetValidateContext(req *http.Request) (ctx *ValidateContext) {
-	if ctxAPI, ok := req.Context().Value(apiContextKey).(*APIContext); ok {
-		ctx = &ValidateContext{Base: ctxAPI.Base}
-	} else if ctxWeb, ok := req.Context().Value(WebContextKey).(*Context); ok {
-		ctx = &ValidateContext{Base: ctxWeb.Base}
-	} else {
-		panic("invalid context, expect either APIContext or Context")
-	}
-	return ctx
-}
-
-func NewTemplateContextForWeb(ctx *Context) TemplateContext {
-	tmplCtx := NewTemplateContext(ctx)
-	tmplCtx["Locale"] = ctx.Base.Locale
+func NewTemplateContextForWeb(ctx reqctx.RequestContext, req *http.Request, locale translation.Locale) TemplateContext {
+	tmplCtx := NewTemplateContext(ctx, req)
+	tmplCtx["Locale"] = locale
 	tmplCtx["AvatarUtils"] = templates.NewAvatarUtils(ctx)
-	tmplCtx["RootData"] = ctx.Data
+	tmplCtx["RenderUtils"] = templates.NewRenderUtils(ctx)
+	tmplCtx["MiscUtils"] = templates.NewMiscUtils(ctx)
+	tmplCtx["ActionsUtils"] = templates.NewActionsUtils(ctx)
+	tmplCtx["RootData"] = ctx.GetData()
 	tmplCtx["Consts"] = map[string]any{
 		"RepoUnitTypeCode":            unit.TypeCode,
 		"RepoUnitTypeIssues":          unit.TypeIssues,
@@ -124,37 +118,42 @@ func NewWebContext(base *Base, render Render, session session.Store) *Context {
 
 		Cache: cache.GetCache(),
 		Link:  setting.AppSubURL + strings.TrimSuffix(base.Req.URL.EscapedPath(), "/"),
-		Repo:  &Repository{PullRequest: &PullRequest{}},
+		Repo:  &Repository{},
 		Org:   &Organization{},
 	}
-	ctx.TemplateContext = NewTemplateContextForWeb(ctx)
+	ctx.TemplateContext = NewTemplateContextForWeb(ctx, ctx.Base.Req, ctx.Base.Locale)
 	ctx.Flash = &middleware.Flash{DataStore: ctx, Values: url.Values{}}
+	ctx.SetContextValue(WebContextKey, ctx)
+	httplib.MarkRequestSupportPublicURL(ctx)
 	return ctx
+}
+
+func ContexterInstallPage(data map[string]any) func(next http.Handler) http.Handler {
+	rnd := templates.PageRenderer()
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			base := NewBaseContext(resp, req)
+			ctx := NewWebContext(base, rnd, session.GetContextSession(req))
+			ctx.Data.MergeFrom(middleware.CommonTemplateContextData())
+			ctx.Data.MergeFrom(reqctx.ContextData{
+				"Title":         ctx.Locale.Tr("install.install"),
+				"PageIsInstall": true,
+				"AllLangs":      translation.AllLangs(),
+			})
+			ctx.Data.MergeFrom(data)
+			next.ServeHTTP(resp, ctx.Req)
+		})
+	}
 }
 
 // Contexter initializes a classic context for a request.
 func Contexter() func(next http.Handler) http.Handler {
-	rnd := templates.HTMLRenderer()
-	csrfOpts := CsrfOptions{
-		Secret:         hex.EncodeToString(setting.GetGeneralTokenSigningSecret()),
-		Cookie:         setting.CSRFCookieName,
-		Secure:         setting.SessionConfig.Secure,
-		CookieHTTPOnly: setting.CSRFCookieHTTPOnly,
-		CookieDomain:   setting.SessionConfig.Domain,
-		CookiePath:     setting.SessionConfig.CookiePath,
-		SameSite:       setting.SessionConfig.SameSite,
-	}
-	if !setting.IsProd {
-		CsrfTokenRegenerationInterval = 5 * time.Second // in dev, re-generate the tokens more aggressively for debug purpose
-	}
+	rnd := templates.PageRenderer()
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			base, baseCleanUp := NewBaseContext(resp, req)
-			defer baseCleanUp()
+			base := NewBaseContext(resp, req)
 			ctx := NewWebContext(base, rnd, session.GetContextSession(req))
-
 			ctx.Data.MergeFrom(middleware.CommonTemplateContextData())
-			ctx.Data["Context"] = ctx // TODO: use "ctx" in template and remove this
 			ctx.Data["CurrentURL"] = setting.AppSubURL + req.URL.RequestURI()
 			ctx.Data["Link"] = ctx.Link
 
@@ -162,23 +161,10 @@ func Contexter() func(next http.Handler) http.Handler {
 			ctx.PageData = map[string]any{}
 			ctx.Data["PageData"] = ctx.PageData
 
-			ctx.Base.AppendContextValue(WebContextKey, ctx)
-			ctx.Base.AppendContextValueFunc(gitrepo.RepositoryContextKey, func() any { return ctx.Repo.GitRepo })
-
-			ctx.Csrf = NewCSRFProtector(csrfOpts)
-
-			// Get the last flash message from cookie
-			lastFlashCookie := middleware.GetSiteCookie(ctx.Req, CookieNameFlash)
+			// get the last flash message from cookie
+			lastFlashCookie, lastFlashMsg := middleware.GetSiteCookieFlashMessage(ctx, ctx.Req, CookieNameFlash)
 			if vals, _ := url.ParseQuery(lastFlashCookie); len(vals) > 0 {
-				// store last Flash message into the template data, to render it
-				ctx.Data["Flash"] = &middleware.Flash{
-					DataStore:  ctx,
-					Values:     vals,
-					ErrorMsg:   vals.Get("error"),
-					SuccessMsg: vals.Get("success"),
-					InfoMsg:    vals.Get("info"),
-					WarningMsg: vals.Get("warning"),
-				}
+				ctx.Data["Flash"] = lastFlashMsg // store last Flash message into the template data, to render it
 			}
 
 			// if there are new messages in the ctx.Flash, write them into cookie
@@ -190,25 +176,27 @@ func Contexter() func(next http.Handler) http.Handler {
 				}
 			})
 
-			// If request sends files, parse them here otherwise the Query() can't be parsed and the CsrfToken will be invalid.
-			if ctx.Req.Method == "POST" && strings.Contains(ctx.Req.Header.Get("Content-Type"), "multipart/form-data") {
-				if err := ctx.Req.ParseMultipartForm(setting.Attachment.MaxSize << 20); err != nil && !strings.Contains(err.Error(), "EOF") { // 32MB max size
-					ctx.ServerError("ParseMultipartForm", err)
+			// FIXME: GLOBAL-PARSE-FORM: this ParseMultipartForm was used for parsing the csrf token from multipart/form-data
+			// We have dropped the csrf token, so ideally this global ParseMultipartForm should be removed.
+			// When removing this, we need to avoid regressions in the handler functions because Golang's http framework is quite fragile
+			// and developers sometimes need to manually parse the form before accessing some values.
+			if ctx.Req.Method == http.MethodPost && strings.Contains(ctx.Req.Header.Get("Content-Type"), "multipart/form-data") {
+				if !ctx.ParseMultipartForm() {
 					return
 				}
 			}
 
-			httpcache.SetCacheControlInHeader(ctx.Resp.Header(), 0, "no-transform")
-			ctx.Resp.Header().Set(`X-Frame-Options`, setting.CORSConfig.XFrameOptions)
+			httpcache.SetCacheControlInHeader(ctx.Resp.Header(), &httpcache.CacheControlOptions{})
 
 			ctx.Data["SystemConfig"] = setting.Config()
+
+			ctx.Data["ShowTwoFactorRequiredMessage"] = ctx.DoerNeedTwoFactorAuth()
 
 			// FIXME: do we really always need these setting? There should be someway to have to avoid having to always set these
 			ctx.Data["DisableMigrations"] = setting.Repository.DisableMigrations
 			ctx.Data["DisableStars"] = setting.Repository.DisableStars
 			ctx.Data["EnableActions"] = setting.Actions.Enabled && !unit.TypeActions.UnitGlobalDisabled()
 
-			ctx.Data["ManifestData"] = setting.ManifestData
 			ctx.Data["AllLangs"] = translation.AllLangs()
 
 			next.ServeHTTP(ctx.Resp, ctx.Req)
@@ -216,17 +204,27 @@ func Contexter() func(next http.Handler) http.Handler {
 	}
 }
 
+func (ctx *Context) DoerNeedTwoFactorAuth() bool {
+	if !setting.TwoFactorAuthEnforced {
+		return false
+	}
+	return ctx.Session.Get(session.KeyUserHasTwoFactorAuth) == false
+}
+
 // HasError returns true if error occurs in form validation.
 // Attention: this function changes ctx.Data and ctx.Flash
 // If HasError is called, then before Redirect, the error message should be stored by ctx.Flash.Error(ctx.GetErrMsg()) again.
 func (ctx *Context) HasError() bool {
-	hasErr, ok := ctx.Data["HasError"]
-	if !ok {
+	hasErr, _ := ctx.Data["HasError"].(bool)
+	hasErr = hasErr || ctx.Flash.ErrorMsg != ""
+	if !hasErr {
 		return false
 	}
-	ctx.Flash.ErrorMsg = ctx.GetErrMsg()
+	if ctx.Flash.ErrorMsg == "" {
+		ctx.Flash.ErrorMsg = ctx.GetErrMsg()
+	}
 	ctx.Data["Flash"] = ctx.Flash
-	return hasErr.(bool)
+	return hasErr
 }
 
 // GetErrMsg returns error message in form validation.
@@ -246,13 +244,63 @@ func (ctx *Context) JSONOK() {
 	ctx.JSON(http.StatusOK, map[string]any{"ok": true}) // this is only a dummy response, frontend seldom uses it
 }
 
-func (ctx *Context) JSONError(msg any) {
-	switch v := msg.(type) {
+func buildJsonErrorMap[T string | template.HTML](msg T) map[string]any {
+	switch v := any(msg).(type) {
 	case string:
-		ctx.JSON(http.StatusBadRequest, map[string]any{"errorMessage": v, "renderFormat": "text"})
+		return map[string]any{"errorMessage": v, "renderFormat": "text"}
 	case template.HTML:
-		ctx.JSON(http.StatusBadRequest, map[string]any{"errorMessage": v, "renderFormat": "html"})
-	default:
-		panic(fmt.Sprintf("unsupported type: %T", msg))
+		return map[string]any{"errorMessage": v, "renderFormat": "html"}
 	}
+	panic(fmt.Sprintf("unsupported type: %T", msg))
+}
+
+func (ctx *Context) JSONErrorAuto(err error) {
+	if errTr := util.ErrorAsTranslatable(err); errTr != nil {
+		msg := errTr.Translate(ctx.Locale)
+		ctx.JSON(http.StatusBadRequest, buildJsonErrorMap(msg))
+		return
+	}
+	errMsg, httpCode := util.ErrorUnwrapForUser(err)
+	if errMsg != "" {
+		ctx.JSON(httpCode, buildJsonErrorMap(errMsg))
+		return
+	}
+
+	logLevel := util.Iif(httplib.IsClientOrNetworkError(ctx, err), log.DEBUG, log.ERROR)
+	log.Log(1, logLevel, "JSONErrorAuto: server internal error: %v", err)
+
+	userErrorMsg := ctx.buildUserErrorMessage("internal server error", err)
+	ctx.JSON(http.StatusInternalServerError, buildJsonErrorMap(userErrorMsg))
+}
+
+func (ctx *Context) JSONError[T string | template.HTML](msg T) {
+	ctx.JSON(http.StatusBadRequest, buildJsonErrorMap(msg))
+}
+
+func (ctx *Context) JSONErrorWithField[T string | template.HTML](msg T, field string) {
+	m := buildJsonErrorMap(msg)
+	m["errorFields"] = []string{field}
+	ctx.JSON(http.StatusBadRequest, m)
+}
+
+func (ctx *Context) JSONErrorNotFound(optMsg ...string) {
+	msg := util.OptionalArg(optMsg)
+	if msg == "" {
+		msg = ctx.Locale.TrString("error.not_found")
+	}
+	ctx.JSON(http.StatusNotFound, buildJsonErrorMap(msg))
+}
+
+func GetFetchActionForm[T middleware.Form](ctx *Context) (ret T) {
+	if web.IsFormSet(ctx) {
+		panic("don't mix fetch-action form validation with template-based form validation")
+	}
+	form, errs := middleware.BindFormValidate[T](ctx.Req, validation.Binder())
+	errorMessage, fieldName, _ := middleware.BuildValidationErrorForUser(form, ctx.Locale, errs)
+	if errorMessage != "" {
+		ctx.Resp.Header().Set("Content-Type", "application/json")
+		ctx.JSONErrorWithField(errorMessage, fieldName)
+		return ret
+	}
+	return form
 }

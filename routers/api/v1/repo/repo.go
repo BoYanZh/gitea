@@ -5,6 +5,7 @@
 package repo
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -12,31 +13,36 @@ import (
 	"strings"
 	"time"
 
-	actions_model "code.gitea.io/gitea/models/actions"
-	activities_model "code.gitea.io/gitea/models/activities"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/organization"
-	"code.gitea.io/gitea/models/perm"
-	access_model "code.gitea.io/gitea/models/perm/access"
-	repo_model "code.gitea.io/gitea/models/repo"
-	unit_model "code.gitea.io/gitea/models/unit"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/gitrepo"
-	"code.gitea.io/gitea/modules/label"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/optional"
-	repo_module "code.gitea.io/gitea/modules/repository"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/validation"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	actions_service "code.gitea.io/gitea/services/actions"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
-	"code.gitea.io/gitea/services/issue"
-	repo_service "code.gitea.io/gitea/services/repository"
+	activities_model "gitea.dev/models/activities"
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	unit_model "gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/label"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/optional"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/validation"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	actions_service "gitea.dev/services/actions"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	feed_service "gitea.dev/services/feed"
+	"gitea.dev/services/issue"
+	"gitea.dev/services/migrations"
+	mirror_service "gitea.dev/services/mirror"
+	repo_service "gitea.dev/services/repository"
 )
 
 // Search repositories via options
@@ -130,11 +136,8 @@ func Search(ctx *context.APIContext) {
 	//     "$ref": "#/responses/validationError"
 
 	private := ctx.IsSigned && (ctx.FormString("private") == "" || ctx.FormBool("private"))
-	if ctx.PublicOnly {
-		private = false
-	}
 
-	opts := &repo_model.SearchRepoOptions{
+	opts := repo_model.SearchRepoOptions{
 		ListOptions:        utils.GetListOptions(ctx),
 		Actor:              ctx.Doer,
 		Keyword:            ctx.FormTrim("q"),
@@ -171,7 +174,7 @@ func Search(ctx *context.APIContext) {
 		opts.Collaborate = optional.Some(true)
 	case "":
 	default:
-		ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("Invalid search mode: \"%s\"", mode))
+		ctx.APIError(http.StatusUnprocessableEntity, "invalid search mode")
 		return
 	}
 
@@ -183,24 +186,11 @@ func Search(ctx *context.APIContext) {
 		opts.IsPrivate = optional.Some(ctx.FormBool("is_private"))
 	}
 
-	sortMode := ctx.FormString("sort")
-	if len(sortMode) > 0 {
-		sortOrder := ctx.FormString("order")
-		if len(sortOrder) == 0 {
-			sortOrder = "asc"
-		}
-		if searchModeMap, ok := repo_model.OrderByMap[sortOrder]; ok {
-			if orderBy, ok := searchModeMap[sortMode]; ok {
-				opts.OrderBy = orderBy
-			} else {
-				ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("Invalid sort mode: \"%s\"", sortMode))
-				return
-			}
-		} else {
-			ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("Invalid sort order: \"%s\"", sortOrder))
-			return
-		}
+	orderBy, ok := utils.ResolveSortOrder(ctx, repo_model.OrderByMap, "")
+	if !ok {
+		return
 	}
+	opts.OrderBy = orderBy
 
 	repos, count, err := repo_model.SearchRepository(ctx, opts)
 	if err != nil {
@@ -220,7 +210,7 @@ func Search(ctx *context.APIContext) {
 			})
 			return
 		}
-		permission, err := access_model.GetUserRepoPermission(ctx, repo, ctx.Doer)
+		permission, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, api.SearchError{
 				OK:    false,
@@ -229,7 +219,7 @@ func Search(ctx *context.APIContext) {
 		}
 		results[i] = convert.ToRepo(ctx, repo, permission)
 	}
-	ctx.SetLinkHeader(int(count), opts.PageSize)
+	ctx.SetLinkHeader(count, opts.PageSize)
 	ctx.SetTotalCountHeader(count)
 	ctx.JSON(http.StatusOK, api.SearchResults{
 		OK:   true,
@@ -245,7 +235,7 @@ func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.Cre
 
 	// If the readme template does not exist, a 400 will be returned.
 	if opt.AutoInit && len(opt.Readme) > 0 && !slices.Contains(repo_module.Readmes, opt.Readme) {
-		ctx.Error(http.StatusBadRequest, "", fmt.Errorf("readme template does not exist, available templates: %v", repo_module.Readmes))
+		ctx.APIError(http.StatusBadRequest, fmt.Sprintf("readme template does not exist, available templates: %v", repo_module.Readmes))
 		return
 	}
 
@@ -261,17 +251,19 @@ func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.Cre
 		DefaultBranch:    opt.DefaultBranch,
 		TrustModel:       repo_model.ToTrustModel(opt.TrustModel),
 		IsTemplate:       opt.Template,
-		ObjectFormatName: opt.ObjectFormatName,
+		ObjectFormatName: string(opt.ObjectFormatName),
 	})
 	if err != nil {
 		if repo_model.IsErrRepoAlreadyExist(err) {
-			ctx.Error(http.StatusConflict, "", "The repository with the same name already exists.")
+			ctx.APIError(http.StatusConflict, "The repository with the same name already exists.")
 		} else if db.IsErrNameReserved(err) ||
 			db.IsErrNamePatternNotAllowed(err) ||
 			label.IsErrTemplateLoad(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
+		} else if errors.Is(err, util.ErrPermissionDenied) {
+			ctx.APIError(http.StatusForbidden, err.Error())
 		} else {
-			ctx.Error(http.StatusInternalServerError, "CreateRepository", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
@@ -279,7 +271,7 @@ func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.Cre
 	// reload repo from db to get a real state after creation
 	repo, err = repo_model.GetRepositoryByID(ctx, repo.ID)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetRepositoryByID", err)
+		ctx.APIErrorInternal(err)
 	}
 
 	ctx.JSON(http.StatusCreated, convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeOwner}))
@@ -287,7 +279,7 @@ func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.Cre
 
 // Create one repository of mine
 func Create(ctx *context.APIContext) {
-	// swagger:operation POST /user/repos repository user createCurrentUserRepo
+	// swagger:operation POST /user/repos user createCurrentUserRepo
 	// ---
 	// summary: Create a repository
 	// consumes:
@@ -308,10 +300,10 @@ func Create(ctx *context.APIContext) {
 	//     description: The repository with the same name already exists.
 	//   "422":
 	//     "$ref": "#/responses/validationError"
-	opt := web.GetForm(ctx).(*api.CreateRepoOption)
+	opt := web.GetForm[*api.CreateRepoOption](ctx)
 	if ctx.Doer.IsOrganization() {
 		// Shouldn't reach this condition, but just in case.
-		ctx.Error(http.StatusUnprocessableEntity, "", "not allowed creating repository for organization")
+		ctx.APIError(http.StatusUnprocessableEntity, "not allowed creating repository for organization")
 		return
 	}
 	CreateUserRepo(ctx, ctx.Doer, *opt)
@@ -329,7 +321,7 @@ func Generate(ctx *context.APIContext) {
 	// parameters:
 	// - name: template_owner
 	//   in: path
-	//   description: name of the template repository owner
+	//   description: owner of the template repository
 	//   type: string
 	//   required: true
 	// - name: template_repo
@@ -352,15 +344,15 @@ func Generate(ctx *context.APIContext) {
 	//     description: The repository with the same name already exists.
 	//   "422":
 	//     "$ref": "#/responses/validationError"
-	form := web.GetForm(ctx).(*api.GenerateRepoOption)
+	form := web.GetForm[*api.GenerateRepoOption](ctx)
 
 	if !ctx.Repo.Repository.IsTemplate {
-		ctx.Error(http.StatusUnprocessableEntity, "", "this is not a template repo")
+		ctx.APIError(http.StatusUnprocessableEntity, "this is not a template repo")
 		return
 	}
 
 	if ctx.Doer.IsOrganization() {
-		ctx.Error(http.StatusUnprocessableEntity, "", "not allowed creating repository for organization")
+		ctx.APIError(http.StatusUnprocessableEntity, "not allowed creating repository for organization")
 		return
 	}
 
@@ -379,7 +371,7 @@ func Generate(ctx *context.APIContext) {
 	}
 
 	if !opts.IsValid() {
-		ctx.Error(http.StatusUnprocessableEntity, "", "must select at least one template item")
+		ctx.APIError(http.StatusUnprocessableEntity, "must select at least one template item")
 		return
 	}
 
@@ -395,22 +387,22 @@ func Generate(ctx *context.APIContext) {
 				return
 			}
 
-			ctx.Error(http.StatusInternalServerError, "GetUserByName", err)
+			ctx.APIErrorInternal(err)
 			return
 		}
 
 		if !ctx.Doer.IsAdmin && !ctxUser.IsOrganization() {
-			ctx.Error(http.StatusForbidden, "", "Only admin can generate repository for other user.")
+			ctx.APIError(http.StatusForbidden, "Only admin can generate repository for other user.")
 			return
 		}
 
 		if !ctx.Doer.IsAdmin {
 			canCreate, err := organization.OrgFromUser(ctxUser).CanCreateOrgRepo(ctx, ctx.Doer.ID)
 			if err != nil {
-				ctx.ServerError("CanCreateOrgRepo", err)
+				ctx.APIErrorInternal(err)
 				return
 			} else if !canCreate {
-				ctx.Error(http.StatusForbidden, "", "Given user is not allowed to create repository in organization.")
+				ctx.APIError(http.StatusForbidden, "Given user is not allowed to create repository in organization.")
 				return
 			}
 		}
@@ -419,12 +411,12 @@ func Generate(ctx *context.APIContext) {
 	repo, err := repo_service.GenerateRepository(ctx, ctx.Doer, ctxUser, ctx.Repo.Repository, opts)
 	if err != nil {
 		if repo_model.IsErrRepoAlreadyExist(err) {
-			ctx.Error(http.StatusConflict, "", "The repository with the same name already exists.")
+			ctx.APIError(http.StatusConflict, "The repository with the same name already exists.")
 		} else if db.IsErrNameReserved(err) ||
 			db.IsErrNamePatternNotAllowed(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 		} else {
-			ctx.Error(http.StatusInternalServerError, "CreateRepository", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
@@ -494,31 +486,11 @@ func CreateOrgRepo(ctx *context.APIContext) {
 	//     "$ref": "#/responses/notFound"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
-	opt := web.GetForm(ctx).(*api.CreateRepoOption)
-	org, err := organization.GetOrgByName(ctx, ctx.PathParam(":org"))
-	if err != nil {
-		if organization.IsErrOrgNotExist(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "GetOrgByName", err)
-		}
+	opt := web.GetForm[*api.CreateRepoOption](ctx)
+	orgName := ctx.PathParam("org")
+	org := prepareDoerCreateRepoInOrg(ctx, orgName)
+	if ctx.Written() {
 		return
-	}
-
-	if !organization.HasOrgOrUserVisible(ctx, org.AsUser(), ctx.Doer) {
-		ctx.NotFound("HasOrgOrUserVisible", nil)
-		return
-	}
-
-	if !ctx.Doer.IsAdmin {
-		canCreate, err := org.CanCreateOrgRepo(ctx, ctx.Doer.ID)
-		if err != nil {
-			ctx.Error(http.StatusInternalServerError, "CanCreateOrgRepo", err)
-			return
-		} else if !canCreate {
-			ctx.Error(http.StatusForbidden, "", "Given user is not allowed to create repository in organization.")
-			return
-		}
 	}
 	CreateUserRepo(ctx, org.AsUser(), *opt)
 }
@@ -548,7 +520,7 @@ func Get(ctx *context.APIContext) {
 	//     "$ref": "#/responses/notFound"
 
 	if err := ctx.Repo.Repository.LoadAttributes(ctx); err != nil {
-		ctx.Error(http.StatusInternalServerError, "Repository.LoadAttributes", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -575,22 +547,21 @@ func GetByID(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	repo, err := repo_model.GetRepositoryByID(ctx, ctx.PathParamInt64(":id"))
+	repo, err := repo_model.GetRepositoryByID(ctx, ctx.PathParamInt64("id"))
 	if err != nil {
 		if repo_model.IsErrRepoNotExist(err) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 		} else {
-			ctx.Error(http.StatusInternalServerError, "GetRepositoryByID", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
-
-	permission, err := access_model.GetUserRepoPermission(ctx, repo, ctx.Doer)
+	permission, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetUserRepoPermission", err)
+		ctx.APIErrorInternal(err)
 		return
 	} else if !permission.HasAnyUnitAccess() {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 	ctx.JSON(http.StatusOK, convert.ToRepo(ctx, repo, permission))
@@ -629,13 +600,14 @@ func Edit(ctx *context.APIContext) {
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
-	opts := *web.GetForm(ctx).(*api.EditRepoOption)
+	opts := *web.GetForm[*api.EditRepoOption](ctx)
 
 	if err := updateBasicProperties(ctx, opts); err != nil {
 		return
 	}
 
 	if err := updateRepoUnits(ctx, opts); err != nil {
+		ctx.APIErrorAuto(err)
 		return
 	}
 
@@ -645,7 +617,11 @@ func Edit(ctx *context.APIContext) {
 		}
 	}
 
-	if opts.MirrorInterval != nil || opts.EnablePrune != nil {
+	if opts.MirrorInterval != nil ||
+		opts.EnablePrune != nil ||
+		opts.MirrorUsername != nil ||
+		opts.MirrorPassword != nil ||
+		opts.MirrorToken != nil {
 		if err := updateMirror(ctx, opts); err != nil {
 			return
 		}
@@ -653,7 +629,7 @@ func Edit(ctx *context.APIContext) {
 
 	repo, err := repo_model.GetRepositoryByID(ctx, ctx.Repo.Repository.ID)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -669,17 +645,17 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 		newRepoName = *opts.Name
 	}
 	// Check if repository name has been changed and not just a case change
-	if repo.LowerName != strings.ToLower(newRepoName) {
+	if !strings.EqualFold(repo.LowerName, newRepoName) {
 		if err := repo_service.ChangeRepositoryName(ctx, ctx.Doer, repo, newRepoName); err != nil {
 			switch {
 			case repo_model.IsErrRepoAlreadyExist(err):
-				ctx.Error(http.StatusUnprocessableEntity, fmt.Sprintf("repo name is already taken [name: %s]", newRepoName), err)
+				ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			case db.IsErrNameReserved(err):
-				ctx.Error(http.StatusUnprocessableEntity, fmt.Sprintf("repo name is reserved [name: %s]", newRepoName), err)
+				ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			case db.IsErrNamePatternNotAllowed(err):
-				ctx.Error(http.StatusUnprocessableEntity, fmt.Sprintf("repo name's pattern is not allowed [name: %s, pattern: %s]", newRepoName, err.(db.ErrNamePatternNotAllowed).Pattern), err)
+				ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			default:
-				ctx.Error(http.StatusUnprocessableEntity, "ChangeRepositoryName", err)
+				ctx.APIError(http.StatusUnprocessableEntity, fmt.Sprintf("ChangeRepositoryName: %v", err))
 			}
 			return err
 		}
@@ -703,7 +679,7 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 		// Visibility of forked repository is forced sync with base repository.
 		if repo.IsFork {
 			if err := repo.GetBaseRepo(ctx); err != nil {
-				ctx.Error(http.StatusInternalServerError, "Unable to load base repository", err)
+				ctx.APIErrorInternal(err)
 				return err
 			}
 			*opts.Private = repo.BaseRepo.IsPrivate
@@ -712,8 +688,8 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 		visibilityChanged = repo.IsPrivate != *opts.Private
 		// when ForcePrivate enabled, you could change public repo to private, but only admin users can change private to public
 		if visibilityChanged && setting.Repository.ForcePrivate && !*opts.Private && !ctx.Doer.IsAdmin {
-			err := fmt.Errorf("cannot change private repository to public")
-			ctx.Error(http.StatusUnprocessableEntity, "Force Private enabled", err)
+			err := errors.New("cannot change private repository to public")
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			return err
 		}
 
@@ -726,39 +702,46 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 
 	if ctx.Repo.GitRepo == nil && !repo.IsEmpty {
 		var err error
-		ctx.Repo.GitRepo, err = gitrepo.OpenRepository(ctx, repo)
+		ctx.Repo.GitRepo, err = git.RepositoryFromRequestContextOrOpen(ctx, repo)
 		if err != nil {
-			ctx.Error(http.StatusInternalServerError, "Unable to OpenRepository", err)
+			ctx.APIErrorInternal(err)
 			return err
 		}
-		defer ctx.Repo.GitRepo.Close()
 	}
 
 	// Default branch only updated if changed and exist or the repository is empty
 	updateRepoLicense := false
-	if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch && (repo.IsEmpty || ctx.Repo.GitRepo.IsBranchExist(*opts.DefaultBranch)) {
+	oldDefaultBranch := ""
+	if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch && (repo.IsEmpty || git.IsBranchExist(ctx, ctx.Repo.Repository, *opts.DefaultBranch)) {
+		oldDefaultBranch = repo.DefaultBranch
+		repo.DefaultBranch = *opts.DefaultBranch
 		if !repo.IsEmpty {
-			if err := gitrepo.SetDefaultBranch(ctx, ctx.Repo.Repository, *opts.DefaultBranch); err != nil {
-				if !git.IsErrUnsupportedVersion(err) {
-					ctx.Error(http.StatusInternalServerError, "SetDefaultBranch", err)
-					return err
-				}
+			if err := git.SetDefaultBranch(ctx, repo, repo.DefaultBranch); err != nil {
+				ctx.APIErrorInternal(err)
+				return err
 			}
 			updateRepoLicense = true
 		}
-		repo.DefaultBranch = *opts.DefaultBranch
 	}
 
 	if err := repo_service.UpdateRepository(ctx, repo, visibilityChanged); err != nil {
-		ctx.Error(http.StatusInternalServerError, "UpdateRepository", err)
+		ctx.APIErrorInternal(err)
 		return err
+	}
+
+	if oldDefaultBranch != "" {
+		actions_service.SwitchSchedulesToDefaultBranch(ctx, repo, oldDefaultBranch)
+	}
+
+	if visibilityChanged {
+		audit.Record(ctx, audit_model.RepositoryVisibility, repo, "visibility", repo.IsPrivate)
 	}
 
 	if updateRepoLicense {
 		if err := repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterOptions{
 			RepoID: ctx.Repo.Repository.ID,
 		}); err != nil {
-			ctx.Error(http.StatusInternalServerError, "AddRepoToLicenseUpdaterQueue", err)
+			ctx.APIErrorInternal(err)
 			return err
 		}
 	}
@@ -769,29 +752,21 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 
 // updateRepoUnits updates repo units: Issue settings, Wiki settings, PR settings
 func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
-	owner := ctx.Repo.Owner
 	repo := ctx.Repo.Repository
 
 	var units []repo_model.RepoUnit
 	var deleteUnitTypes []unit_model.Type
 
-	currHasIssues := repo.UnitEnabled(ctx, unit_model.TypeIssues)
-	newHasIssues := currHasIssues
-	if opts.HasIssues != nil {
-		newHasIssues = *opts.HasIssues
-	}
-	if currHasIssues || newHasIssues {
-		if newHasIssues && opts.ExternalTracker != nil && !unit_model.TypeExternalTracker.UnitGlobalDisabled() {
-			// Check that values are valid
-			if !validation.IsValidExternalURL(opts.ExternalTracker.ExternalTrackerURL) {
-				err := fmt.Errorf("External tracker URL not valid")
-				ctx.Error(http.StatusUnprocessableEntity, "Invalid external tracker URL", err)
-				return err
+	if opts.HasIssues != nil && *opts.HasIssues {
+		if opts.ExternalTracker != nil && !unit_model.TypeExternalTracker.UnitGlobalDisabled() {
+			if (opts.InternalTracker == nil || opts.ExternalTracker.ExternalTrackerURL != "") && !validation.IsValidURL(opts.ExternalTracker.ExternalTrackerURL) {
+				return util.ErrorWrap(util.ErrUnprocessableContent, "external tracker URL not valid")
 			}
-			if len(opts.ExternalTracker.ExternalTrackerFormat) != 0 && !validation.IsValidExternalTrackerURLFormat(opts.ExternalTracker.ExternalTrackerFormat) {
-				err := fmt.Errorf("External tracker URL format not valid")
-				ctx.Error(http.StatusUnprocessableEntity, "Invalid external tracker URL format", err)
-				return err
+			if opts.InternalTracker != nil && (opts.ExternalTracker.ExternalTrackerStyle == "" || opts.ExternalTracker.ExternalTrackerStyle == markup.IssueNameStyleNumeric) {
+				return util.ErrorWrap(util.ErrUnprocessableContent, "external tracker style Numeric is only used for internal tracker")
+			}
+			if opts.ExternalTracker.ExternalTrackerFormat != "" && !validation.IsValidExternalTrackerURLFormat(opts.ExternalTracker.ExternalTrackerFormat) {
+				return util.ErrorWrap(util.ErrUnprocessableContent, "External tracker URL format not valid")
 			}
 
 			units = append(units, repo_model.RepoUnit{
@@ -804,8 +779,10 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 					ExternalTrackerRegexpPattern: opts.ExternalTracker.ExternalTrackerRegexpPattern,
 				},
 			})
-			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
-		} else if newHasIssues && opts.ExternalTracker == nil && !unit_model.TypeIssues.UnitGlobalDisabled() {
+		} else {
+			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
+		}
+		if (opts.ExternalTracker == nil || opts.InternalTracker != nil) && !unit_model.TypeIssues.UnitGlobalDisabled() {
 			// Default to built-in tracker
 			var config *repo_model.IssuesConfig
 
@@ -831,29 +808,20 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 				Type:   unit_model.TypeIssues,
 				Config: config,
 			})
-			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
-		} else if !newHasIssues {
-			if !unit_model.TypeExternalTracker.UnitGlobalDisabled() {
-				deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
-			}
-			if !unit_model.TypeIssues.UnitGlobalDisabled() {
-				deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
-			}
+		} else {
+			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
 		}
 	}
-
-	currHasWiki := repo.UnitEnabled(ctx, unit_model.TypeWiki)
-	newHasWiki := currHasWiki
-	if opts.HasWiki != nil {
-		newHasWiki = *opts.HasWiki
+	if opts.HasIssues != nil && !*opts.HasIssues {
+		deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalTracker)
+		deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeIssues)
 	}
-	if currHasWiki || newHasWiki {
-		if newHasWiki && opts.ExternalWiki != nil && !unit_model.TypeExternalWiki.UnitGlobalDisabled() {
+
+	if opts.HasWiki != nil {
+		if *opts.HasWiki && opts.ExternalWiki != nil && !unit_model.TypeExternalWiki.UnitGlobalDisabled() {
 			// Check that values are valid
-			if !validation.IsValidExternalURL(opts.ExternalWiki.ExternalWikiURL) {
-				err := fmt.Errorf("External wiki URL not valid")
-				ctx.Error(http.StatusUnprocessableEntity, "", "Invalid external wiki URL")
-				return err
+			if !validation.IsValidURL(opts.ExternalWiki.ExternalWikiURL) {
+				return util.ErrorWrap(util.ErrUnprocessableContent, "external wiki URL not valid")
 			}
 
 			units = append(units, repo_model.RepoUnit{
@@ -864,7 +832,7 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 				},
 			})
 			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeWiki)
-		} else if newHasWiki && opts.ExternalWiki == nil && !unit_model.TypeWiki.UnitGlobalDisabled() {
+		} else if *opts.HasWiki && opts.ExternalWiki == nil && !unit_model.TypeWiki.UnitGlobalDisabled() {
 			config := &repo_model.UnitConfig{}
 			units = append(units, repo_model.RepoUnit{
 				RepoID: repo.ID,
@@ -872,7 +840,7 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 				Config: config,
 			})
 			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalWiki)
-		} else if !newHasWiki {
+		} else if !*opts.HasWiki {
 			if !unit_model.TypeExternalWiki.UnitGlobalDisabled() {
 				deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeExternalWiki)
 			}
@@ -882,92 +850,74 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 		}
 	}
 
-	currHasPullRequests := repo.UnitEnabled(ctx, unit_model.TypePullRequests)
-	newHasPullRequests := currHasPullRequests
-	if opts.HasPullRequests != nil {
-		newHasPullRequests = *opts.HasPullRequests
-	}
-	if currHasPullRequests || newHasPullRequests {
-		if newHasPullRequests && !unit_model.TypePullRequests.UnitGlobalDisabled() {
-			// We do allow setting individual PR settings through the API, so
-			// we get the config settings and then set them
-			// if those settings were provided in the opts.
-			unit, err := repo.GetUnit(ctx, unit_model.TypePullRequests)
-			var config *repo_model.PullRequestsConfig
-			if err != nil {
-				// Unit type doesn't exist so we make a new config file with default values
-				config = &repo_model.PullRequestsConfig{
-					IgnoreWhitespaceConflicts:     false,
-					AllowMerge:                    true,
-					AllowRebase:                   true,
-					AllowRebaseMerge:              true,
-					AllowSquash:                   true,
-					AllowFastForwardOnly:          true,
-					AllowManualMerge:              true,
-					AutodetectManualMerge:         false,
-					AllowRebaseUpdate:             true,
-					DefaultDeleteBranchAfterMerge: false,
-					DefaultMergeStyle:             repo_model.MergeStyleMerge,
-					DefaultAllowMaintainerEdit:    false,
-				}
-			} else {
-				config = unit.PullRequestsConfig()
-			}
-
-			if opts.IgnoreWhitespaceConflicts != nil {
-				config.IgnoreWhitespaceConflicts = *opts.IgnoreWhitespaceConflicts
-			}
-			if opts.AllowMerge != nil {
-				config.AllowMerge = *opts.AllowMerge
-			}
-			if opts.AllowRebase != nil {
-				config.AllowRebase = *opts.AllowRebase
-			}
-			if opts.AllowRebaseMerge != nil {
-				config.AllowRebaseMerge = *opts.AllowRebaseMerge
-			}
-			if opts.AllowSquash != nil {
-				config.AllowSquash = *opts.AllowSquash
-			}
-			if opts.AllowFastForwardOnly != nil {
-				config.AllowFastForwardOnly = *opts.AllowFastForwardOnly
-			}
-			if opts.AllowManualMerge != nil {
-				config.AllowManualMerge = *opts.AllowManualMerge
-			}
-			if opts.AutodetectManualMerge != nil {
-				config.AutodetectManualMerge = *opts.AutodetectManualMerge
-			}
-			if opts.AllowRebaseUpdate != nil {
-				config.AllowRebaseUpdate = *opts.AllowRebaseUpdate
-			}
-			if opts.DefaultDeleteBranchAfterMerge != nil {
-				config.DefaultDeleteBranchAfterMerge = *opts.DefaultDeleteBranchAfterMerge
-			}
-			if opts.DefaultMergeStyle != nil {
-				config.DefaultMergeStyle = repo_model.MergeStyle(*opts.DefaultMergeStyle)
-			}
-			if opts.DefaultAllowMaintainerEdit != nil {
-				config.DefaultAllowMaintainerEdit = *opts.DefaultAllowMaintainerEdit
-			}
-
+	if opts.HasCode != nil && !unit_model.TypeCode.UnitGlobalDisabled() {
+		if *opts.HasCode {
 			units = append(units, repo_model.RepoUnit{
 				RepoID: repo.ID,
-				Type:   unit_model.TypePullRequests,
-				Config: config,
+				Type:   unit_model.TypeCode,
+				Config: &repo_model.UnitConfig{},
 			})
-		} else if !newHasPullRequests && !unit_model.TypePullRequests.UnitGlobalDisabled() {
-			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypePullRequests)
+		} else {
+			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeCode)
 		}
 	}
 
-	currHasProjects := repo.UnitEnabled(ctx, unit_model.TypeProjects)
-	newHasProjects := currHasProjects
-	if opts.HasProjects != nil {
-		newHasProjects = *opts.HasProjects
+	if !unit_model.TypePullRequests.UnitGlobalDisabled() {
+		mustDeletePullRequestUnit := opts.HasPullRequests != nil && !*opts.HasPullRequests
+		mustInsertPullRequestUnit := opts.HasPullRequests != nil && *opts.HasPullRequests
+		if mustDeletePullRequestUnit {
+			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypePullRequests)
+		} else {
+			// We do allow setting individual PR settings through the API,
+			// so we get the config settings and then set them if those settings were provided in the opts.
+			unit, err := repo.GetUnit(ctx, unit_model.TypePullRequests)
+			if err != nil && !errors.Is(err, util.ErrNotExist) {
+				return err
+			}
+			if unit == nil {
+				// Unit doesn't exist yet but is being enabled, create with defaults
+				unit = new(repo_model.DefaultPullRequestsUnit(repo.ID))
+			}
+
+			changed := new(false)
+			config := unit.PullRequestsConfig()
+			optional.AssignPtrValue(changed, &config.IgnoreWhitespaceConflicts, opts.IgnoreWhitespaceConflicts)
+			optional.AssignPtrValue(changed, &config.AllowMerge, opts.AllowMerge)
+			optional.AssignPtrValue(changed, &config.AllowRebase, opts.AllowRebase)
+			optional.AssignPtrValue(changed, &config.AllowRebaseMerge, opts.AllowRebaseMerge)
+			optional.AssignPtrValue(changed, &config.AllowSquash, opts.AllowSquash)
+			optional.AssignPtrValue(changed, &config.AllowFastForwardOnly, opts.AllowFastForwardOnly)
+			optional.AssignPtrValue(changed, &config.AllowManualMerge, opts.AllowManualMerge)
+			optional.AssignPtrValue(changed, &config.AutodetectManualMerge, opts.AutodetectManualMerge)
+			optional.AssignPtrValue(changed, &config.AllowMergeUpdate, opts.AllowMergeUpdate)
+			optional.AssignPtrValue(changed, &config.AllowRebaseUpdate, opts.AllowRebaseUpdate)
+			optional.AssignPtrValue(changed, &config.DefaultDeleteBranchAfterMerge, opts.DefaultDeleteBranchAfterMerge)
+			optional.AssignPtrValue(changed, &config.DefaultAllowMaintainerEdit, opts.DefaultAllowMaintainerEdit)
+			optional.AssignPtrString(changed, &config.DefaultMergeStyle, opts.DefaultMergeStyle)
+			optional.AssignPtrString(changed, &config.DefaultUpdateStyle, opts.DefaultUpdateStyle)
+			optional.AssignPtrString(changed, &config.DefaultSquashMergeMessage, opts.SquashMergeCommitMessage)
+			if opts.SquashMergeCommitMessage != nil && !config.DefaultSquashMergeMessage.IsValid() {
+				return util.NewInvalidArgumentErrorf("invalid squash_merge_commit_message: %s", config.DefaultSquashMergeMessage)
+			}
+			// only validate update-style fields when the caller is actually changing one of them,
+			// so unrelated PATCH calls don't reject historical configs.
+			if opts.AllowMergeUpdate != nil || opts.AllowRebaseUpdate != nil || opts.DefaultUpdateStyle != nil {
+				if err := config.ValidateUpdateSettings(); err != nil {
+					return err
+				}
+			}
+			if *changed || mustInsertPullRequestUnit {
+				units = append(units, repo_model.RepoUnit{
+					RepoID: repo.ID,
+					Type:   unit_model.TypePullRequests,
+					Config: config,
+				})
+			}
+		}
 	}
-	if currHasProjects || newHasProjects {
-		if newHasProjects && !unit_model.TypeProjects.UnitGlobalDisabled() {
+
+	if opts.HasProjects != nil && !unit_model.TypeProjects.UnitGlobalDisabled() {
+		if *opts.HasProjects {
 			unit, err := repo.GetUnit(ctx, unit_model.TypeProjects)
 			var config *repo_model.ProjectsConfig
 			if err != nil {
@@ -987,7 +937,7 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 				Type:   unit_model.TypeProjects,
 				Config: config,
 			})
-		} else if !newHasProjects && !unit_model.TypeProjects.UnitGlobalDisabled() {
+		} else {
 			deleteUnitTypes = append(deleteUnitTypes, unit_model.TypeProjects)
 		}
 	}
@@ -1027,12 +977,9 @@ func updateRepoUnits(ctx *context.APIContext, opts api.EditRepoOption) error {
 
 	if len(units)+len(deleteUnitTypes) > 0 {
 		if err := repo_service.UpdateRepositoryUnits(ctx, repo, units, deleteUnitTypes); err != nil {
-			ctx.Error(http.StatusInternalServerError, "UpdateRepositoryUnits", err)
 			return err
 		}
 	}
-
-	log.Trace("Repository advanced settings updated: %s/%s", owner.Name, repo.Name)
 	return nil
 }
 
@@ -1042,24 +989,24 @@ func updateRepoArchivedState(ctx *context.APIContext, opts api.EditRepoOption) e
 	// archive / un-archive
 	if opts.Archived != nil {
 		if repo.IsMirror {
-			err := fmt.Errorf("repo is a mirror, cannot archive/un-archive")
-			ctx.Error(http.StatusUnprocessableEntity, err.Error(), err)
+			err := errors.New("repo is a mirror, cannot archive/un-archive")
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			return err
 		}
 		if *opts.Archived {
 			if err := repo_model.SetArchiveRepoState(ctx, repo, *opts.Archived); err != nil {
 				log.Error("Tried to archive a repo: %s", err)
-				ctx.Error(http.StatusInternalServerError, "ArchiveRepoState", err)
+				ctx.APIErrorInternal(err)
 				return err
 			}
-			if err := actions_model.CleanRepoScheduleTasks(ctx, repo); err != nil {
+			if err := actions_service.CleanRepoScheduleTasks(ctx, repo); err != nil {
 				log.Error("CleanRepoScheduleTasks for archived repo %s/%s: %v", ctx.Repo.Owner.Name, repo.Name, err)
 			}
 			log.Trace("Repository was archived: %s/%s", ctx.Repo.Owner.Name, repo.Name)
 		} else {
 			if err := repo_model.SetArchiveRepoState(ctx, repo, *opts.Archived); err != nil {
 				log.Error("Tried to un-archive a repo: %s", err)
-				ctx.Error(http.StatusInternalServerError, "ArchiveRepoState", err)
+				ctx.APIErrorInternal(err)
 				return err
 			}
 			if ctx.Repo.Repository.UnitEnabled(ctx, unit_model.TypeActions) {
@@ -1087,7 +1034,7 @@ func updateMirror(ctx *context.APIContext, opts api.EditRepoOption) error {
 	mirror, err := repo_model.GetMirrorByRepoID(ctx, repo.ID)
 	if err != nil {
 		log.Error("Failed to get mirror: %s", err)
-		ctx.Error(http.StatusInternalServerError, "MirrorInterval", err)
+		ctx.APIErrorInternal(err)
 		return err
 	}
 
@@ -1097,14 +1044,14 @@ func updateMirror(ctx *context.APIContext, opts api.EditRepoOption) error {
 		interval, err := time.ParseDuration(*opts.MirrorInterval)
 		if err != nil {
 			log.Error("Wrong format for MirrorInternal Sent: %s", err)
-			ctx.Error(http.StatusUnprocessableEntity, "MirrorInterval", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			return err
 		}
 
 		// Ensure the provided duration is not too short
 		if interval != 0 && interval < setting.Mirror.MinInterval {
 			err := fmt.Errorf("invalid mirror interval: %s is below minimum interval: %s", interval, setting.Mirror.MinInterval)
-			ctx.Error(http.StatusUnprocessableEntity, "MirrorInterval", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			return err
 		}
 
@@ -1120,10 +1067,61 @@ func updateMirror(ctx *context.APIContext, opts api.EditRepoOption) error {
 		log.Trace("Repository %s Mirror[%d] Set EnablePrune: %t", repo.FullName(), mirror.ID, mirror.EnablePrune)
 	}
 
+	authUpdateRequested := opts.MirrorPassword != nil || opts.MirrorToken != nil || opts.MirrorUsername != nil
+	if authUpdateRequested {
+		remoteURL, err := git.ParseRemoteAddressURL(ctx, repo, mirror.GetRemoteName())
+		if err != nil {
+			ctx.APIErrorInternal(err)
+			return err
+		}
+
+		authUsername := ""
+		if opts.MirrorUsername != nil {
+			authUsername = *opts.MirrorUsername
+		} else if remoteURL.User != nil {
+			authUsername = remoteURL.User.Username()
+		}
+
+		authPassword := ""
+		authToken := ""
+		if opts.MirrorPassword != nil {
+			authPassword = *opts.MirrorPassword
+		}
+		if opts.MirrorToken != nil {
+			authToken = *opts.MirrorToken
+		}
+
+		if opts.MirrorPassword == nil && opts.MirrorToken == nil && remoteURL.User != nil && (authUsername == "" || authUsername == remoteURL.User.Username()) {
+			authPassword, _ = remoteURL.User.Password()
+		}
+
+		if authToken != "" {
+			authPassword = authToken
+		}
+
+		composedAddress, err := git.ParseRemoteAddr(repo.OriginalURL, authUsername, authPassword)
+		if err == nil {
+			err = migrations.IsMigrateURLAllowed(composedAddress, ctx.Doer)
+		}
+		if err != nil {
+			handleRemoteAddrError(ctx, err)
+			return err
+		}
+
+		if err := mirror_service.UpdateAddress(ctx, mirror, composedAddress); err != nil {
+			ctx.APIErrorInternal(err)
+			return err
+		}
+
+		if sanitized, err := util.SanitizeURL(repo.OriginalURL); err == nil {
+			mirror.RemoteAddress = sanitized
+		}
+	}
+
 	// finally update the mirror in the DB
 	if err := repo_model.UpdateMirror(ctx, mirror); err != nil {
 		log.Error("Failed to Set Mirror Interval: %s", err)
-		ctx.Error(http.StatusUnprocessableEntity, "MirrorInterval", err)
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 		return err
 	}
 
@@ -1159,21 +1157,12 @@ func Delete(ctx *context.APIContext) {
 	owner := ctx.Repo.Owner
 	repo := ctx.Repo.Repository
 
-	canDelete, err := repo_module.CanUserDelete(ctx, repo, ctx.Doer)
-	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "CanUserDelete", err)
-		return
-	} else if !canDelete {
-		ctx.Error(http.StatusForbidden, "", "Given user is not owner of organization.")
-		return
-	}
-
 	if ctx.Repo.GitRepo != nil {
 		ctx.Repo.GitRepo.Close()
 	}
 
 	if err := repo_service.DeleteRepository(ctx, ctx.Doer, repo, true); err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteRepository", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -1204,7 +1193,7 @@ func GetIssueTemplates(ctx *context.APIContext) {
 	//     "$ref": "#/responses/IssueTemplates"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
-	ret := issue.ParseTemplatesFromDefaultBranch(ctx.Repo.Repository, ctx.Repo.GitRepo)
+	ret := issue.ParseTemplatesFromDefaultBranch(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo)
 	if cnt := len(ret.TemplateErrors); cnt != 0 {
 		ctx.Resp.Header().Add("X-Gitea-Warning", "error occurs when parsing issue template: count="+strconv.Itoa(cnt))
 	}
@@ -1234,7 +1223,7 @@ func GetIssueConfig(ctx *context.APIContext) {
 	//     "$ref": "#/responses/RepoIssueConfig"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
-	issueConfig, _ := issue.GetTemplateConfigFromDefaultBranch(ctx.Repo.Repository, ctx.Repo.GitRepo)
+	issueConfig, _ := issue.GetTemplateConfigFromDefaultBranch(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo)
 	ctx.JSON(http.StatusOK, issueConfig)
 }
 
@@ -1261,7 +1250,7 @@ func ValidateIssueConfig(ctx *context.APIContext) {
 	//     "$ref": "#/responses/RepoIssueConfigValidation"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
-	_, err := issue.GetTemplateConfigFromDefaultBranch(ctx.Repo.Repository, ctx.Repo.GitRepo)
+	_, err := issue.GetTemplateConfigFromDefaultBranch(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo)
 
 	if err == nil {
 		ctx.JSON(http.StatusOK, api.IssueConfigValidation{Valid: true, Message: ""})
@@ -1316,9 +1305,9 @@ func ListRepoActivityFeeds(ctx *context.APIContext) {
 		ListOptions:    listOptions,
 	}
 
-	feeds, count, err := activities_model.GetFeeds(ctx, opts)
+	feeds, count, err := feed_service.GetFeeds(ctx, opts)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetFeeds", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.SetTotalCountHeader(count)

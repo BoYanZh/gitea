@@ -7,15 +7,15 @@ import (
 	"context"
 	"errors"
 	"time"
+	"uuid"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/timeutil"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	webhook_module "gitea.dev/modules/webhook"
 
-	gouuid "github.com/google/uuid"
 	"xorm.io/builder"
 )
 
@@ -119,7 +119,7 @@ func HookTasks(ctx context.Context, hookID int64, page int) ([]*HookTask, error)
 // CreateHookTask creates a new hook task,
 // it handles conversion from Payload to PayloadContent.
 func CreateHookTask(ctx context.Context, t *HookTask) (*HookTask, error) {
-	t.UUID = gouuid.New().String()
+	t.UUID = uuid.New().String()
 	if t.Delivered == 0 {
 		t.Delivered = timeutil.TimeStampNanoNow()
 	}
@@ -198,7 +198,8 @@ func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
 func CleanupHookTaskTable(ctx context.Context, cleanupType HookTaskCleanupType, olderThan time.Duration, numberToKeep int) error {
 	log.Trace("Doing: CleanupHookTaskTable")
 
-	if cleanupType == OlderThan {
+	switch cleanupType {
+	case OlderThan:
 		deleteOlderThan := time.Now().Add(-olderThan).UnixNano()
 		deletes, err := db.GetEngine(ctx).
 			Where("is_delivered = ? and delivered < ?", true, deleteOlderThan).
@@ -207,7 +208,7 @@ func CleanupHookTaskTable(ctx context.Context, cleanupType HookTaskCleanupType, 
 			return err
 		}
 		log.Trace("Deleted %d rows from hook_task", deletes)
-	} else if cleanupType == PerWebhook {
+	case PerWebhook:
 		hookIDs := make([]int64, 0, 10)
 		err := db.GetEngine(ctx).
 			Table("webhook").

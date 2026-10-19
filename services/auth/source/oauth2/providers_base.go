@@ -6,14 +6,21 @@ package oauth2
 import (
 	"html/template"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/svg"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/svg"
 )
 
 // BaseProvider represents a common base for Provider
 type BaseProvider struct {
 	name        string
 	displayName string
+
+	// TODO: maybe some providers also support SSH public keys, then they can set this to true
+	supportSSHPublicKey bool
+}
+
+func (b *BaseProvider) SupportSSHPublicKey() bool {
+	return b.supportSSHPublicKey
 }
 
 // Name provides the technical name for this provider
@@ -35,10 +42,10 @@ func (b *BaseProvider) IconHTML(size int) template.HTML {
 	case "github":
 		svgName = "octicon-mark-github"
 	}
-	svgHTML := svg.RenderHTML(svgName, size, "tw-mr-2")
+	svgHTML := svg.RenderHTML(svgName, size)
 	if svgHTML == "" {
 		log.Error("No SVG icon for oauth2 provider %q", b.name)
-		svgHTML = svg.RenderHTML("gitea-openid", size, "tw-mr-2")
+		svgHTML = svg.RenderHTML("gitea-openid", size)
 	}
 	return svgHTML
 }

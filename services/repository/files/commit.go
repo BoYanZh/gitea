@@ -6,25 +6,16 @@ package files
 import (
 	"context"
 
-	asymkey_model "code.gitea.io/gitea/models/asymkey"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/structs"
+	"gitea.dev/models/asymkey"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/structs"
+	asymkey_service "gitea.dev/services/asymkey"
 )
-
-// CountDivergingCommits determines how many commits a branch is ahead or behind the repository's base branch
-func CountDivergingCommits(ctx context.Context, repo *repo_model.Repository, branch string) (*git.DivergeObject, error) {
-	divergence, err := git.GetDivergingCommits(ctx, repo.RepoPath(), repo.DefaultBranch, branch)
-	if err != nil {
-		return nil, err
-	}
-	return &divergence, nil
-}
 
 // GetPayloadCommitVerification returns the verification information of a commit
 func GetPayloadCommitVerification(ctx context.Context, commit *git.Commit) *structs.PayloadCommitVerification {
 	verification := &structs.PayloadCommitVerification{}
-	commitVerification := asymkey_model.ParseCommitWithSignature(ctx, commit)
+	commitVerification := asymkey_service.ParseCommitWithSignature(ctx, commit)
 	if commit.Signature != nil {
 		verification.Signature = commit.Signature.Signature
 		verification.Payload = commit.Signature.Payload
@@ -38,7 +29,7 @@ func GetPayloadCommitVerification(ctx context.Context, commit *git.Commit) *stru
 	verification.Verified = commitVerification.Verified
 	verification.Reason = commitVerification.Reason
 	if verification.Reason == "" && !verification.Verified {
-		verification.Reason = "gpg.error.not_signed_commit"
+		verification.Reason = asymkey.VerificationReasonCommitNotSigned
 	}
 	return verification
 }

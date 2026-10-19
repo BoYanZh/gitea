@@ -4,14 +4,17 @@
 package utils
 
 import (
+	"html/template"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func TestSanitizeFlashErrorString(t *testing.T) {
+func TestEscapeFlashErrorString(t *testing.T) {
 	tests := []struct {
 		name string
 		arg  string
-		want string
+		want template.HTML
 	}{
 		{
 			name: "no error",
@@ -26,15 +29,14 @@ func TestSanitizeFlashErrorString(t *testing.T) {
 		{
 			name: "line break error",
 			arg:  "some error:\n\nawesome!",
-			want: "some error:<br><br>awesome!",
+			want: "some error:\n\nawesome!",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := SanitizeFlashErrorString(tt.arg); got != tt.want {
-				t.Errorf("SanitizeFlashErrorString() = '%v', want '%v'", got, tt.want)
-			}
+			got := EscapeFlashErrorString(tt.arg)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

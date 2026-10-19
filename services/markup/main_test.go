@@ -6,11 +6,11 @@ package markup
 import (
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
+	"gitea.dev/models/unittest"
 )
 
 func TestMain(m *testing.M) {
 	unittest.MainTest(m, &unittest.TestOptions{
-		FixtureFiles: []string{"user.yml", "repository.yml", "access.yml", "repo_unit.yml"},
+		FixtureFiles: []string{"user.yml", "repository.yml", "access.yml", "repo_unit.yml", "issue.yml"},
 	})
 }

@@ -1,95 +1,40 @@
 <script lang="ts" setup>
+import SvgIcon from './SvgIcon.vue';
 import DiffFileTreeItem from './DiffFileTreeItem.vue';
-import {loadMoreFiles} from '../features/repo-diff.ts';
-import {toggleElem} from '../utils/dom.ts';
-import {diffTreeStore} from '../modules/stores.ts';
+import DiffFileExtensionFilter from './DiffFileExtensionFilter.vue';
+import {onInputDebounce, toggleElem} from '../utils/dom.ts';
+import {diffTreeStore, filterDiffTree, applyFiltersToFileBoxes, extensionFilterToUrl, type DiffFileTreeLocale} from '../modules/diff-file.ts';
 import {setFileFolding} from '../features/file-fold.ts';
-import {computed, onMounted, onUnmounted} from 'vue';
+import {onMounted, onUnmounted, computed, watch} from 'vue';
+import {localUserSettings} from '../modules/user-settings.ts';
+import {registerAsyncHashChangeListener, removeAsyncHashChangeListener} from '../modules/hashchange.ts';
 
 const LOCAL_STORAGE_KEY = 'diff_file_tree_visible';
 
+const props = defineProps<{locale: DiffFileTreeLocale}>();
+
 const store = diffTreeStore();
 
-const fileTree = computed(() => {
-  const result = [];
-  for (const file of store.files) {
-    // Split file into directories
-    const splits = file.Name.split('/');
-    let index = 0;
-    let parent = null;
-    let isFile = false;
-    for (const split of splits) {
-      index += 1;
-      // reached the end
-      if (index === splits.length) {
-        isFile = true;
-      }
-      let newParent = {
-        name: split,
-        children: [],
-        isFile,
-      } as {
-        name: string,
-        children: any[],
-        isFile: boolean,
-        file?: any,
-      };
+const visibleTreeItems = computed(() => filterDiffTree(store)?.Children ?? []);
 
-      if (isFile === true) {
-        newParent.file = file;
-      }
-
-      if (parent) {
-        // check if the folder already exists
-        const existingFolder = parent.children.find(
-          (x) => x.name === split,
-        );
-        if (existingFolder) {
-          newParent = existingFolder;
-        } else {
-          parent.children.push(newParent);
-        }
-      } else {
-        const existingFolder = result.find((x) => x.name === split);
-        if (existingFolder) {
-          newParent = existingFolder;
-        } else {
-          result.push(newParent);
-        }
-      }
-      parent = newParent;
-    }
-  }
-  const mergeChildIfOnlyOneDir = (entries) => {
-    for (const entry of entries) {
-      if (entry.children) {
-        mergeChildIfOnlyOneDir(entry.children);
-      }
-      if (entry.children.length === 1 && entry.children[0].isFile === false) {
-        // Merge it to the parent
-        entry.name = `${entry.name}/${entry.children[0].name}`;
-        entry.children = entry.children[0].children;
-      }
-    }
-  };
-  // Merge folders with just a folder as children in order to
-  // reduce the depth of our tree.
-  mergeChildIfOnlyOneDir(result);
-  return result;
+watch(() => store.filenameFilterQuery, onInputDebounce(() => applyFiltersToFileBoxes(store)));
+watch(() => store.activeExtensions, () => {
+  applyFiltersToFileBoxes(store);
+  window.history.replaceState(null, '', extensionFilterToUrl(store.activeExtensions, window.location.href));
 });
 
 onMounted(() => {
   // Default to true if unset
-  store.fileTreeIsVisible = localStorage.getItem(LOCAL_STORAGE_KEY) !== 'false';
-  document.querySelector('.diff-toggle-file-tree-button').addEventListener('click', toggleVisibility);
-
-  hashChangeListener();
-  window.addEventListener('hashchange', hashChangeListener);
+  store.fileTreeIsVisible = localUserSettings.getBoolean(LOCAL_STORAGE_KEY, true);
+  // while the tree is hidden there is no control to clear a filter restored from the URL
+  if (store.fileTreeIsVisible) applyFiltersToFileBoxes(store); else store.activeExtensions = 'all';
+  document.querySelector('.diff-toggle-file-tree-button')!.addEventListener('click', toggleVisibility);
+  registerAsyncHashChangeListener(hashChangeListener);
 });
 
 onUnmounted(() => {
-  document.querySelector('.diff-toggle-file-tree-button').removeEventListener('click', toggleVisibility);
-  window.removeEventListener('hashchange', hashChangeListener);
+  document.querySelector('.diff-toggle-file-tree-button')!.removeEventListener('click', toggleVisibility);
+  removeAsyncHashChangeListener(hashChangeListener);
 });
 
 function hashChangeListener() {
@@ -102,7 +47,7 @@ function expandSelectedFile() {
   if (store.selectedItem) {
     const box = document.querySelector(store.selectedItem);
     const folded = box?.getAttribute('data-folded') === 'true';
-    if (folded) setFileFolding(box, box.querySelector('.fold-file'), false);
+    if (folded) setFileFolding(box, box.querySelector('.fold-file')!, false);
   }
 }
 
@@ -110,43 +55,133 @@ function toggleVisibility() {
   updateVisibility(!store.fileTreeIsVisible);
 }
 
-function updateVisibility(visible) {
+function updateVisibility(visible: boolean) {
   store.fileTreeIsVisible = visible;
-  localStorage.setItem(LOCAL_STORAGE_KEY, store.fileTreeIsVisible);
+  if (!visible) {
+    store.filenameFilterQuery = '';
+    store.activeExtensions = 'all';
+    applyFiltersToFileBoxes(store);
+  }
+  localUserSettings.setBoolean(LOCAL_STORAGE_KEY, store.fileTreeIsVisible);
   updateState(store.fileTreeIsVisible);
 }
 
-function updateState(visible) {
-  const btn = document.querySelector('.diff-toggle-file-tree-button');
+function updateState(visible: boolean) {
+  const btn = document.querySelector('.diff-toggle-file-tree-button')!;
   const [toShow, toHide] = btn.querySelectorAll('.icon');
-  const tree = document.querySelector('#diff-file-tree');
-  const newTooltip = btn.getAttribute(visible ? 'data-hide-text' : 'data-show-text');
+  const tree = document.querySelector('#diff-file-tree')!;
+  const newTooltip = btn.getAttribute(visible ? 'data-hide-text' : 'data-show-text')!;
   btn.setAttribute('data-tooltip-content', newTooltip);
   toggleElem(tree, visible);
   toggleElem(toShow, !visible);
   toggleElem(toHide, visible);
 }
-
-function loadMoreData() {
-  loadMoreFiles(store.linkLoadMore);
-}
 </script>
 
 <template>
-  <div v-if="store.fileTreeIsVisible" class="diff-file-tree-items">
-    <!-- only render the tree if we're visible. in many cases this is something that doesn't change very often -->
-    <DiffFileTreeItem v-for="item in fileTree" :key="item.name" :item="item"/>
-    <div v-if="store.isIncomplete" class="tw-pt-1">
-      <a :class="['ui', 'basic', 'tiny', 'button', store.isLoadingNewData ? 'disabled' : '']" @click.stop="loadMoreData">{{ store.showMoreMessage }}</a>
+  <!-- only render the tree if we're visible. in many cases this is something that doesn't change very often -->
+  <div v-if="store.fileTreeIsVisible" class="diff-file-tree-wrapper">
+    <div class="diff-file-tree-search-row">
+      <div class="diff-file-search-wrapper">
+        <SvgIcon name="octicon-search" :size="14" class="diff-file-search-icon"/>
+        <input
+          type="text"
+          v-model="store.filenameFilterQuery"
+          class="diff-file-search-input"
+          :placeholder="props.locale.filterFiles"
+          :aria-label="props.locale.filterFiles"
+        >
+        <button
+          v-if="store.filenameFilterQuery"
+          type="button"
+          class="diff-file-search-clear"
+          @click="store.filenameFilterQuery = ''"
+          :aria-label="props.locale.filterFilesClear"
+        >
+          <SvgIcon name="octicon-x" :size="14"/>
+        </button>
+      </div>
+      <DiffFileExtensionFilter :locale="props.locale"/>
+    </div>
+    <div class="diff-file-tree-items">
+      <DiffFileTreeItem v-for="item in visibleTreeItems" :key="item.FullName" :item="item"/>
     </div>
   </div>
 </template>
 
 <style scoped>
+.diff-file-tree-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.diff-file-tree-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 1px; /* match .diff-file-box's top border so this row aligns with .diff-file-header */
+}
+
+.diff-file-search-wrapper {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.diff-file-search-icon {
+  position: absolute;
+  left: 8px;
+  color: var(--color-text-light-2);
+  pointer-events: none;
+}
+
+.diff-file-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 28px;
+  border: 1px solid var(--color-secondary);
+  border-radius: var(--border-radius-medium);
+  background: var(--color-input-background);
+  color: var(--color-text);
+}
+
+.diff-file-search-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.diff-file-search-clear {
+  position: absolute;
+  right: 4px;
+  top: 0;
+  bottom: 0;
+  width: 20px;
+  background: none;
+  border: none;
+  color: var(--color-text-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: auto 0;
+  padding: 0;
+}
+
+.diff-file-search-clear:hover {
+  color: var(--color-text);
+}
+
 .diff-file-tree-items {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  margin-right: .5rem;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
 }
 </style>

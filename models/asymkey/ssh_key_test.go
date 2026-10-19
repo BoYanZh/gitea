@@ -12,12 +12,13 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/models/db"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/setting"
 
 	"github.com/42wim/sshsig"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_SSHParsePublicKey(t *testing.T) {
@@ -42,29 +43,7 @@ func Test_SSHParsePublicKey(t *testing.T) {
 				keyTypeN, lengthN, err := SSHNativeParsePublicKey(tc.content)
 				assert.NoError(t, err)
 				assert.Equal(t, tc.keyType, keyTypeN)
-				assert.EqualValues(t, tc.length, lengthN)
-			})
-			if tc.skipSSHKeygen {
-				return
-			}
-			t.Run("SSHKeygen", func(t *testing.T) {
-				keyTypeK, lengthK, err := SSHKeyGenParsePublicKey(tc.content)
-				if err != nil {
-					// Some servers do not support ecdsa format.
-					if !strings.Contains(err.Error(), "line 1 too long:") {
-						assert.FailNow(t, "%v", err)
-					}
-				}
-				assert.Equal(t, tc.keyType, keyTypeK)
-				assert.EqualValues(t, tc.length, lengthK)
-			})
-			t.Run("SSHParseKeyNative", func(t *testing.T) {
-				keyTypeK, lengthK, err := SSHNativeParsePublicKey(tc.content)
-				if err != nil {
-					assert.FailNow(t, "%v", err)
-				}
-				assert.Equal(t, tc.keyType, keyTypeK)
-				assert.EqualValues(t, tc.length, lengthK)
+				assert.Equal(t, tc.length, lengthN)
 			})
 		})
 	}
@@ -185,14 +164,6 @@ func Test_calcFingerprint(t *testing.T) {
 				fpN, err := calcFingerprintNative(tc.content)
 				assert.NoError(t, err)
 				assert.Equal(t, tc.fp, fpN)
-			})
-			if tc.skipSSHKeygen {
-				return
-			}
-			t.Run("SSHKeygen", func(t *testing.T) {
-				fpK, err := calcFingerprintSSHKeygen(tc.content)
-				assert.NoError(t, err)
-				assert.Equal(t, tc.fp, fpK)
 			})
 		})
 	}
@@ -504,10 +475,34 @@ func runErr(t *testing.T, stdin []byte, args ...string) {
 	}
 }
 
-func Test_PublicKeysAreExternallyManaged(t *testing.T) {
+func TestPublicKeysAreExternallyManaged(t *testing.T) {
 	key1 := unittest.AssertExistsAndLoadBean(t, &PublicKey{ID: 1})
-	externals, err := PublicKeysAreExternallyManaged(db.DefaultContext, []*PublicKey{key1})
+	externals, err := PublicKeysAreExternallyManaged(t.Context(), []*PublicKey{key1})
 	assert.NoError(t, err)
 	assert.Len(t, externals, 1)
 	assert.False(t, externals[0])
+}
+
+func TestSearchPrincipalKeyIgnoresOtherKeyTypes(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	userKey := unittest.AssertExistsAndLoadBean(t, &PublicKey{ID: 1})
+
+	_, err := SearchPrincipalKey(t.Context(), userKey.Content)
+	assert.True(t, IsErrKeyNotExist(err))
+
+	principal := &PublicKey{OwnerID: 1, Name: userKey.Content, Content: userKey.Content, Type: KeyTypePrincipal}
+	require.NoError(t, db.Insert(t.Context(), principal))
+	key, err := SearchPrincipalKey(t.Context(), userKey.Content)
+	require.NoError(t, err)
+	assert.Equal(t, principal.ID, key.ID)
+}
+
+// TestCheckPublicKeyStringOversized tests if oversized SSH2 public key strings are rejected before triggering costly operations.
+func TestCheckPublicKeyStringOversized(t *testing.T) {
+	_, err := parseKeyString(strings.Repeat("a", maxKeyContentBytes+1))
+	assert.ErrorContains(t, err, "SSH public key content is too long")
+
+	content := "---- BEGIN SSH2 PUBLIC KEY ----\n" + strings.Repeat("a", maxKeyContentBase64Bytes+1) + "\n--- END SSH2 PUBLIC KEY ----"
+	_, err = parseKeyString(content)
+	assert.ErrorContains(t, err, "SSH public key base64 is too long")
 }

@@ -4,19 +4,17 @@
 package cmd
 
 import (
-	"context"
 	"os"
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	packages_module "code.gitea.io/gitea/modules/packages"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/storage"
-	packages_service "code.gitea.io/gitea/services/packages"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	packages_module "gitea.dev/modules/packages"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	packages_service "gitea.dev/services/packages"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,7 +29,7 @@ func TestMigratePackages(t *testing.T) {
 	assert.NoError(t, err)
 	defer buf.Close()
 
-	v, f, err := packages_service.CreatePackageAndAddFile(db.DefaultContext, &packages_service.PackageCreationInfo{
+	v, f, err := packages_service.CreatePackageAndAddFile(t.Context(), &packages_service.PackageCreationInfo{
 		PackageInfo: packages_service.PackageInfo{
 			Owner:       creator,
 			PackageType: packages.TypeGeneric,
@@ -53,7 +51,7 @@ func TestMigratePackages(t *testing.T) {
 	assert.NotNil(t, v)
 	assert.NotNil(t, f)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	p := t.TempDir()
 
@@ -70,6 +68,6 @@ func TestMigratePackages(t *testing.T) {
 	entries, err := os.ReadDir(p)
 	assert.NoError(t, err)
 	assert.Len(t, entries, 2)
-	assert.EqualValues(t, "01", entries[0].Name())
-	assert.EqualValues(t, "tmp", entries[1].Name())
+	assert.Equal(t, "01", entries[0].Name())
+	assert.Equal(t, "tmp", entries[1].Name())
 }

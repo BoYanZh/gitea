@@ -4,18 +4,14 @@
 package markdown
 
 import (
-	"context"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/markup"
+	"gitea.dev/modules/markup"
+	"gitea.dev/modules/setting"
 )
 
 func TestMain(m *testing.M) {
-	markup.Init(&markup.ProcessorHelper{
-		IsUsernameMentionable: func(ctx context.Context, username string) bool {
-			return username == "r-lyeh"
-		},
-	})
-	unittest.MainTest(m)
+	setting.SetupGiteaTestEnv()
+	markup.RenderBehaviorForTesting.DisableAdditionalAttributes = true
+	m.Run()
 }

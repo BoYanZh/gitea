@@ -6,42 +6,26 @@ package context
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
 
 	"github.com/stretchr/testify/assert"
 )
 
+func TestMain(m *testing.M) {
+	setting.IsInTesting = true
+	os.Exit(m.Run())
+}
+
 func TestRedirect(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
-
-	cases := []struct {
-		url  string
-		keep bool
-	}{
-		{"http://test", false},
-		{"https://test", false},
-		{"//test", false},
-		{"/://test", true},
-		{"/test", true},
-	}
-	for _, c := range cases {
-		resp := httptest.NewRecorder()
-		b, cleanup := NewBaseContext(resp, req)
-		resp.Header().Add("Set-Cookie", (&http.Cookie{Name: setting.SessionConfig.CookieName, Value: "dummy"}).String())
-		b.Redirect(c.url)
-		cleanup()
-		has := resp.Header().Get("Set-Cookie") == "i_like_gitea=dummy"
-		assert.Equal(t, c.keep, has, "url = %q", c.url)
-	}
-
-	req, _ = http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	resp := httptest.NewRecorder()
-	req.Header.Add("HX-Request", "true")
-	b, cleanup := NewBaseContext(resp, req)
+	req.Header.Add("X-Gitea-Fetch-Action", "1")
+	b := NewBaseContextForTest(t, resp, req)
 	b.Redirect("/other")
-	cleanup()
-	assert.Equal(t, "/other", resp.Header().Get("HX-Redirect"))
-	assert.Equal(t, http.StatusNoContent, resp.Code)
+	assert.Contains(t, resp.Header().Get("Content-Type"), "application/json")
+	assert.JSONEq(t, `{"redirect":"/other"}`, resp.Body.String())
+	assert.Equal(t, http.StatusOK, resp.Code)
 }

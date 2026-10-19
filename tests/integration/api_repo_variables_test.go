@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 )
 
 func TestAPIRepoVariables(t *testing.T) {
@@ -35,11 +35,11 @@ func TestAPIRepoVariables(t *testing.T) {
 			},
 			{
 				Name:           "_",
-				ExpectedStatus: http.StatusNoContent,
+				ExpectedStatus: http.StatusCreated,
 			},
 			{
 				Name:           "TEST_VAR",
-				ExpectedStatus: http.StatusNoContent,
+				ExpectedStatus: http.StatusCreated,
 			},
 			{
 				Name:           "test_var",
@@ -81,7 +81,7 @@ func TestAPIRepoVariables(t *testing.T) {
 		req := NewRequestWithJSON(t, "POST", url, api.CreateVariableOption{
 			Value: "initial_val",
 		}).AddTokenAuth(token)
-		MakeRequest(t, req, http.StatusNoContent)
+		MakeRequest(t, req, http.StatusCreated)
 
 		cases := []struct {
 			Name           string
@@ -138,7 +138,7 @@ func TestAPIRepoVariables(t *testing.T) {
 		req := NewRequestWithJSON(t, "POST", url, api.CreateVariableOption{
 			Value: "initial_val",
 		}).AddTokenAuth(token)
-		MakeRequest(t, req, http.StatusNoContent)
+		MakeRequest(t, req, http.StatusCreated)
 
 		req = NewRequest(t, "DELETE", url).AddTokenAuth(token)
 		MakeRequest(t, req, http.StatusNoContent)

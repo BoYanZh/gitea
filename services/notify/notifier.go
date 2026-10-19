@@ -6,12 +6,14 @@ package notify
 import (
 	"context"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	packages_model "code.gitea.io/gitea/models/packages"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/repository"
+	actions_model "gitea.dev/models/actions"
+	git_model "gitea.dev/models/git"
+	issues_model "gitea.dev/models/issues"
+	packages_model "gitea.dev/models/packages"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/repository"
 )
 
 // Notifier defines an interface to notify receiver
@@ -43,7 +45,7 @@ type Notifier interface {
 	NewPullRequest(ctx context.Context, pr *issues_model.PullRequest, mentions []*user_model.User)
 	MergePullRequest(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest)
 	AutoMergePullRequest(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest)
-	PullRequestSynchronized(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest)
+	PullRequestSynchronized(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest, before, after string)
 	PullRequestReview(ctx context.Context, pr *issues_model.PullRequest, review *issues_model.Review, comment *issues_model.Comment, mentions []*user_model.User)
 	PullRequestCodeComment(ctx context.Context, pr *issues_model.PullRequest, comment *issues_model.Comment, mentions []*user_model.User)
 	PullRequestChangeTargetBranch(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest, oldBranch string)
@@ -74,4 +76,14 @@ type Notifier interface {
 	PackageDelete(ctx context.Context, doer *user_model.User, pd *packages_model.PackageDescriptor)
 
 	ChangeDefaultBranch(ctx context.Context, repo *repo_model.Repository)
+
+	CreateCommitStatus(ctx context.Context, repo *repo_model.Repository, commit *repository.PushCommit, sender *user_model.User, status *git_model.CommitStatus)
+
+	WorkflowRunStatusUpdate(ctx context.Context, repo *repo_model.Repository, sender *user_model.User, run *actions_model.ActionRun)
+
+	WorkflowJobStatusUpdate(ctx context.Context, repo *repo_model.Repository, sender *user_model.User, job *actions_model.ActionRunJob, task *actions_model.ActionTask)
+
+	NotificationCountChange(ctx context.Context, userID int64)
+
+	StopwatchChanged(ctx context.Context, user *user_model.User)
 }

@@ -4,22 +4,21 @@
 package integration
 
 import (
-	stdCtx "context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"path"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/gitrepo"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/services/context"
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/services/context"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -28,48 +27,49 @@ func getUpdateFileOptions() *api.UpdateFileOptions {
 	content := "This is updated text"
 	contentEncoded := base64.StdEncoding.EncodeToString([]byte(content))
 	return &api.UpdateFileOptions{
-		DeleteFileOptions: api.DeleteFileOptions{
-			FileOptions: api.FileOptions{
-				BranchName:    "master",
-				NewBranchName: "master",
-				Message:       "My update of new/file.txt",
-				Author: api.Identity{
-					Name:  "John Doe",
-					Email: "johndoe@example.com",
-				},
-				Committer: api.Identity{
-					Name:  "Anne Doe",
-					Email: "annedoe@example.com",
-				},
+		SHA: "103ff9234cefeee5ec5361d22b49fbb04d385885",
+		FileOptions: api.FileOptions{
+			BranchName:    "master",
+			NewBranchName: "master",
+			Message:       "My update of new/file.txt",
+			Author: api.Identity{
+				Name:  "John Doe",
+				Email: "johndoe@example.com",
 			},
-			SHA: "103ff9234cefeee5ec5361d22b49fbb04d385885",
+			Committer: api.Identity{
+				Name:  "Anne Doe",
+				Email: "annedoe@example.com",
+			},
 		},
 		ContentBase64: contentEncoded,
 	}
 }
 
-func getExpectedFileResponseForUpdate(commitID, treePath, lastCommitSHA string) *api.FileResponse {
+func getExpectedFileResponseForUpdate(info apiFileResponseInfo) *api.FileResponse {
 	sha := "08bd14b2e2852529157324de9c226b3364e76136"
 	encoding := "base64"
 	content := "VGhpcyBpcyB1cGRhdGVkIHRleHQ="
-	selfURL := setting.AppURL + "api/v1/repos/user2/repo1/contents/" + treePath + "?ref=master"
-	htmlURL := setting.AppURL + "user2/repo1/src/branch/master/" + treePath
+	selfURL := setting.AppURL + "api/v1/repos/user2/repo1/contents/" + info.treePath + "?ref=master"
+	htmlURL := setting.AppURL + "user2/repo1/src/branch/master/" + info.treePath
 	gitURL := setting.AppURL + "api/v1/repos/user2/repo1/git/blobs/" + sha
-	downloadURL := setting.AppURL + "user2/repo1/raw/branch/master/" + treePath
-	return &api.FileResponse{
+	downloadURL := setting.AppURL + "user2/repo1/raw/branch/master/" + info.treePath
+	ret := &api.FileResponse{
 		Content: &api.ContentsResponse{
-			Name:          filepath.Base(treePath),
-			Path:          treePath,
-			SHA:           sha,
-			LastCommitSHA: lastCommitSHA,
-			Type:          "file",
-			Size:          20,
-			Encoding:      &encoding,
-			Content:       &content,
-			URL:           &selfURL,
-			HTMLURL:       &htmlURL,
-			GitURL:        &gitURL,
-			DownloadURL:   &downloadURL,
+			Name:              path.Base(info.treePath),
+			Path:              info.treePath,
+			SHA:               sha,
+			LastCommitSHA:     new(info.lastCommitSHA),
+			LastCommitterDate: new(info.lastCommitterWhen),
+			LastAuthorDate:    new(info.lastAuthorWhen),
+			Type:              "file",
+			Mode:              "100644",
+			Size:              20,
+			Encoding:          &encoding,
+			Content:           &content,
+			URL:               &selfURL,
+			HTMLURL:           &htmlURL,
+			GitURL:            &gitURL,
+			DownloadURL:       &downloadURL,
 			Links: &api.FileLinksResponse{
 				Self:    &selfURL,
 				GitURL:  &gitURL,
@@ -78,10 +78,10 @@ func getExpectedFileResponseForUpdate(commitID, treePath, lastCommitSHA string) 
 		},
 		Commit: &api.FileCommitResponse{
 			CommitMeta: api.CommitMeta{
-				URL: setting.AppURL + "api/v1/repos/user2/repo1/git/commits/" + commitID,
-				SHA: commitID,
+				URL: setting.AppURL + "api/v1/repos/user2/repo1/git/commits/" + info.commitID,
+				SHA: info.commitID,
 			},
-			HTMLURL: setting.AppURL + "user2/repo1/commit/" + commitID,
+			HTMLURL: setting.AppURL + "user2/repo1/commit/" + info.commitID,
 			Author: &api.CommitUser{
 				Identity: api.Identity{
 					Name:  "John Doe",
@@ -103,6 +103,8 @@ func getExpectedFileResponseForUpdate(commitID, treePath, lastCommitSHA string) 
 			Payload:   "",
 		},
 	}
+	normalizeFileContentResponseCommitTime(ret.Content)
+	return ret
 }
 
 func TestAPIUpdateFile(t *testing.T) {
@@ -135,18 +137,24 @@ func TestAPIUpdateFile(t *testing.T) {
 			req := NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &updateFileOptions).
 				AddTokenAuth(token2)
 			resp := MakeRequest(t, req, http.StatusOK)
-			gitRepo, _ := gitrepo.OpenRepository(stdCtx.Background(), repo1)
-			commitID, _ := gitRepo.GetBranchCommitID(updateFileOptions.NewBranchName)
-			lasCommit, _ := gitRepo.GetCommitByPath(treePath)
-			expectedFileResponse := getExpectedFileResponseForUpdate(commitID, treePath, lasCommit.ID.String())
-			var fileResponse api.FileResponse
-			DecodeJSON(t, resp, &fileResponse)
-			assert.EqualValues(t, expectedFileResponse.Content, fileResponse.Content)
-			assert.EqualValues(t, expectedFileResponse.Commit.SHA, fileResponse.Commit.SHA)
-			assert.EqualValues(t, expectedFileResponse.Commit.HTMLURL, fileResponse.Commit.HTMLURL)
-			assert.EqualValues(t, expectedFileResponse.Commit.Author.Email, fileResponse.Commit.Author.Email)
-			assert.EqualValues(t, expectedFileResponse.Commit.Author.Name, fileResponse.Commit.Author.Name)
-			gitRepo.Close()
+			gitRepo, _ := git.OpenRepository(t.Context(), repo1)
+			defer gitRepo.Close()
+			commitID, _ := gitRepo.GetBranchCommitID(t.Context(), updateFileOptions.NewBranchName)
+			lasCommit, _ := gitRepo.GetCommitByPath(t.Context(), treePath)
+			expectedFileResponse := getExpectedFileResponseForUpdate(apiFileResponseInfo{
+				commitID:          commitID,
+				treePath:          treePath,
+				lastCommitSHA:     lasCommit.ID.String(),
+				lastCommitterWhen: lasCommit.Committer.When,
+				lastAuthorWhen:    lasCommit.Author.When,
+			})
+			fileResponse := DecodeJSON(t, resp, &api.FileResponse{})
+			normalizeFileContentResponseCommitTime(fileResponse.Content)
+			assert.Equal(t, expectedFileResponse.Content, fileResponse.Content)
+			assert.Equal(t, expectedFileResponse.Commit.SHA, fileResponse.Commit.SHA)
+			assert.Equal(t, expectedFileResponse.Commit.HTMLURL, fileResponse.Commit.HTMLURL)
+			assert.Equal(t, expectedFileResponse.Commit.Author.Email, fileResponse.Commit.Author.Email)
+			assert.Equal(t, expectedFileResponse.Commit.Author.Name, fileResponse.Commit.Author.Name)
 		}
 
 		// Test updating a file in a new branch
@@ -159,15 +167,23 @@ func TestAPIUpdateFile(t *testing.T) {
 		req := NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &updateFileOptions).
 			AddTokenAuth(token2)
 		resp := MakeRequest(t, req, http.StatusOK)
-		var fileResponse api.FileResponse
-		DecodeJSON(t, resp, &fileResponse)
+		fileResponse := DecodeJSON(t, resp, &api.FileResponse{})
 		expectedSHA := "08bd14b2e2852529157324de9c226b3364e76136"
 		expectedHTMLURL := fmt.Sprintf(setting.AppURL+"user2/repo1/src/branch/new_branch/update/file%d.txt", fileID)
 		expectedDownloadURL := fmt.Sprintf(setting.AppURL+"user2/repo1/raw/branch/new_branch/update/file%d.txt", fileID)
-		assert.EqualValues(t, expectedSHA, fileResponse.Content.SHA)
-		assert.EqualValues(t, expectedHTMLURL, *fileResponse.Content.HTMLURL)
-		assert.EqualValues(t, expectedDownloadURL, *fileResponse.Content.DownloadURL)
-		assert.EqualValues(t, updateFileOptions.Message+"\n", fileResponse.Commit.Message)
+		assert.Equal(t, expectedSHA, fileResponse.Content.SHA)
+		assert.Equal(t, expectedHTMLURL, *fileResponse.Content.HTMLURL)
+		assert.Equal(t, expectedDownloadURL, *fileResponse.Content.DownloadURL)
+		assert.Equal(t, updateFileOptions.Message+"\n", fileResponse.Commit.Message)
+
+		// Test updating a file without SHA (should create the file)
+		updateFileOptions = getUpdateFileOptions()
+		updateFileOptions.SHA = ""
+		req = NewRequestWithJSON(t, "PUT", "/api/v1/repos/user2/repo1/contents/update-create.txt", &updateFileOptions).AddTokenAuth(token2)
+		resp = MakeRequest(t, req, http.StatusCreated)
+		fileResponse = DecodeJSON(t, resp, &api.FileResponse{})
+		assert.Equal(t, "08bd14b2e2852529157324de9c226b3364e76136", fileResponse.Content.SHA)
+		assert.Equal(t, setting.AppURL+"user2/repo1/raw/branch/master/update-create.txt", *fileResponse.Content.DownloadURL)
 
 		// Test updating a file and renaming it
 		updateFileOptions = getUpdateFileOptions()
@@ -180,13 +196,13 @@ func TestAPIUpdateFile(t *testing.T) {
 		req = NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &updateFileOptions).
 			AddTokenAuth(token2)
 		resp = MakeRequest(t, req, http.StatusOK)
-		DecodeJSON(t, resp, &fileResponse)
+		fileResponse = DecodeJSON(t, resp, &api.FileResponse{})
 		expectedSHA = "08bd14b2e2852529157324de9c226b3364e76136"
 		expectedHTMLURL = fmt.Sprintf(setting.AppURL+"user2/repo1/src/branch/master/rename/update/file%d.txt", fileID)
 		expectedDownloadURL = fmt.Sprintf(setting.AppURL+"user2/repo1/raw/branch/master/rename/update/file%d.txt", fileID)
-		assert.EqualValues(t, expectedSHA, fileResponse.Content.SHA)
-		assert.EqualValues(t, expectedHTMLURL, *fileResponse.Content.HTMLURL)
-		assert.EqualValues(t, expectedDownloadURL, *fileResponse.Content.DownloadURL)
+		assert.Equal(t, expectedSHA, fileResponse.Content.SHA)
+		assert.Equal(t, expectedHTMLURL, *fileResponse.Content.HTMLURL)
+		assert.Equal(t, expectedDownloadURL, *fileResponse.Content.DownloadURL)
 
 		// Test updating a file without a message
 		updateFileOptions = getUpdateFileOptions()
@@ -198,9 +214,9 @@ func TestAPIUpdateFile(t *testing.T) {
 		req = NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &updateFileOptions).
 			AddTokenAuth(token2)
 		resp = MakeRequest(t, req, http.StatusOK)
-		DecodeJSON(t, resp, &fileResponse)
+		fileResponse = DecodeJSON(t, resp, &api.FileResponse{})
 		expectedMessage := "Update " + treePath + "\n"
-		assert.EqualValues(t, expectedMessage, fileResponse.Commit.Message)
+		assert.Equal(t, expectedMessage, fileResponse.Commit.Message)
 
 		// Test updating a file with the wrong SHA
 		fileID++
@@ -212,12 +228,11 @@ func TestAPIUpdateFile(t *testing.T) {
 		req = NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &updateFileOptions).
 			AddTokenAuth(token2)
 		resp = MakeRequest(t, req, http.StatusUnprocessableEntity)
-		expectedAPIError := context.APIError{
+		expectedAPIError := &context.APIError{
 			Message: "sha does not match [given: " + updateFileOptions.SHA + ", expected: " + correctSHA + "]",
 			URL:     setting.API.SwaggerURL,
 		}
-		var apiError context.APIError
-		DecodeJSON(t, resp, &apiError)
+		apiError := DecodeJSON(t, resp, &context.APIError{})
 		assert.Equal(t, expectedAPIError, apiError)
 
 		// Test creating a file in repo1 by user4 who does not have write access

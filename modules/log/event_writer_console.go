@@ -4,8 +4,9 @@
 package log
 
 import (
-	"io"
 	"os"
+
+	"gitea.dev/modules/util"
 )
 
 type WriterConsoleOption struct {
@@ -18,19 +19,13 @@ type eventWriterConsole struct {
 
 var _ EventWriter = (*eventWriterConsole)(nil)
 
-type nopCloser struct {
-	io.Writer
-}
-
-func (nopCloser) Close() error { return nil }
-
 func NewEventWriterConsole(name string, mode WriterMode) EventWriter {
 	w := &eventWriterConsole{EventWriterBaseImpl: NewEventWriterBase(name, "console", mode)}
-	opt := mode.WriterOption.(WriterConsoleOption)
+	opt := mode.WriterOption.(WriterConsoleOption) //nolint:forcetypeassert // a console writer is only created with WriterConsoleOption
 	if opt.Stderr {
-		w.OutputWriteCloser = nopCloser{os.Stderr}
+		w.OutputWriteCloser = util.NopCloser{Writer: os.Stderr}
 	} else {
-		w.OutputWriteCloser = nopCloser{os.Stdout}
+		w.OutputWriteCloser = util.NopCloser{Writer: os.Stdout}
 	}
 	return w
 }

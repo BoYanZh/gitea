@@ -4,27 +4,28 @@
 package feed
 
 import (
-	"fmt"
-	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/services/context"
+	"gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
 
 	"github.com/gorilla/feeds"
 )
 
 // ShowFileFeed shows tags and/or releases on the repo as RSS / Atom feed
 func ShowFileFeed(ctx *context.Context, repo *repo.Repository, formatType string) {
+	if !checkRepoFeedTokenScope(ctx) {
+		return
+	}
 	fileName := ctx.Repo.TreePath
 	if len(fileName) == 0 {
 		return
 	}
-	commits, err := ctx.Repo.GitRepo.CommitsByFileAndRange(
+	commits, _, err := ctx.Repo.GitRepo.CommitsByFileAndRange(ctx,
 		git.CommitsByFileAndRangeOptions{
-			Revision: ctx.Repo.RefName,
+			Revision: ctx.Repo.RefFullName.ShortName(), // FIXME: legacy code used ShortName
 			File:     fileName,
 			Page:     1,
 		})
@@ -33,9 +34,9 @@ func ShowFileFeed(ctx *context.Context, repo *repo.Repository, formatType string
 		return
 	}
 
-	title := fmt.Sprintf("Latest commits for file %s", ctx.Repo.TreePath)
+	title := "Latest commits for file " + ctx.Repo.TreePath
 
-	link := &feeds.Link{Href: repo.HTMLURL() + "/" + ctx.Repo.BranchNameSubURL() + "/" + util.PathEscapeSegments(ctx.Repo.TreePath)}
+	link := &feeds.Link{Href: repo.HTMLURL() + "/" + ctx.Repo.RefTypeNameSubURL() + "/" + util.PathEscapeSegments(ctx.Repo.TreePath)}
 
 	feed := &feeds.Feed{
 		Title:       title,
@@ -47,14 +48,15 @@ func ShowFileFeed(ctx *context.Context, repo *repo.Repository, formatType string
 	for _, commit := range commits {
 		feed.Items = append(feed.Items, &feeds.Item{
 			Id:    commit.ID.String(),
-			Title: strings.TrimSpace(strings.Split(commit.Message(), "\n")[0]),
+			Title: commit.MessageTitle(),
 			Link:  &feeds.Link{Href: repo.HTMLURL() + "/commit/" + commit.ID.String()},
 			Author: &feeds.Author{
 				Name:  commit.Author.Name,
 				Email: commit.Author.Email,
 			},
-			Description: commit.Message(),
-			Content:     commit.Message(),
+			Description: commit.MessageUTF8(), // TODO: description can be shorten content
+			Content:     commit.MessageUTF8(),
+			Created:     commit.Committer.When,
 		})
 	}
 

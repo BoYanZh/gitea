@@ -1,40 +1,36 @@
-import $ from 'jquery';
-import {updateIssuesMeta} from './repo-issue.ts';
-import {toggleElem, hideElem, isElemHidden} from '../utils/dom.ts';
-import {htmlEscape} from 'escape-goat';
+import {toggleElem, queryElems} from '../utils/dom.ts';
+import {html, htmlRaw} from '../utils/html.ts';
 import {confirmModal} from './comp/ConfirmModal.ts';
-import {showErrorToast} from '../modules/toast.ts';
 import {createSortable} from '../modules/sortable.ts';
 import {DELETE, POST} from '../modules/fetch.ts';
-import {parseDom} from '../utils.ts';
+import {fomanticQuery} from '../modules/fomantic/base.ts';
+import {performFetchAction} from '../modules/fetch-action.ts';
+import {registerGlobalInitFunc} from '../modules/observer.ts';
+import type {SortableEvent} from 'sortablejs';
 
-function initRepoIssueListCheckboxes() {
-  const issueSelectAll = document.querySelector('.issue-checkbox-all');
-  if (!issueSelectAll) return; // logged out state
-  const issueCheckboxes = document.querySelectorAll('.issue-checkbox');
+type IssuePoster = {avatar_link: string, full_name: string, username: string};
+type ProcessedIssuePoster = {type: 'html', html: string};
+type IssuePosterResponse = {results: IssuePoster[]};
+
+function initRepoIssueListCheckboxes(issueSelectAll: HTMLInputElement) {
+  const container = issueSelectAll.closest('.page-content')!;
+  const issueCheckboxes = container.querySelectorAll<HTMLInputElement>('.issue-checkbox');
+  const issueFilters = container.querySelector<HTMLElement>('#issue-filters')!;
+  const issueActions = container.querySelector<HTMLElement>('#issue-actions')!;
 
   const syncIssueSelectionState = () => {
     const checkedCheckboxes = Array.from(issueCheckboxes).filter((el) => el.checked);
     const anyChecked = Boolean(checkedCheckboxes.length);
     const allChecked = anyChecked && checkedCheckboxes.length === issueCheckboxes.length;
 
-    if (allChecked) {
-      issueSelectAll.checked = true;
-      issueSelectAll.indeterminate = false;
-    } else if (anyChecked) {
-      issueSelectAll.checked = false;
-      issueSelectAll.indeterminate = true;
-    } else {
-      issueSelectAll.checked = false;
-      issueSelectAll.indeterminate = false;
-    }
+    issueSelectAll.checked = allChecked;
+    issueSelectAll.indeterminate = anyChecked && !allChecked;
     // if any issue is selected, show the action panel, otherwise show the filter panel
-    toggleElem($('#issue-filters'), !anyChecked);
-    toggleElem($('#issue-actions'), anyChecked);
+    toggleElem(issueFilters, !anyChecked);
+    toggleElem(issueActions, anyChecked);
     // there are two panels but only one select-all checkbox, so move the checkbox to the visible panel
-    const panels = document.querySelectorAll('#issue-filters, #issue-actions');
-    const visiblePanel = Array.from(panels).find((el) => !isElemHidden(el));
-    const toolbarLeft = visiblePanel.querySelector('.issue-list-toolbar-left');
+    const visiblePanel = anyChecked ? issueActions : issueFilters;
+    const toolbarLeft = visiblePanel.querySelector('.issue-list-toolbar-left')!;
     toolbarLeft.prepend(issueSelectAll);
   };
 
@@ -49,146 +45,120 @@ function initRepoIssueListCheckboxes() {
     syncIssueSelectionState();
   });
 
-  $('.issue-action').on('click', async function (e) {
-    e.preventDefault();
+  queryElems(container, '.issue-action', (el) => el.addEventListener('click',
+    async (e: MouseEvent) => {
+      e.preventDefault();
 
-    const url = this.getAttribute('data-url');
-    let action = this.getAttribute('data-action');
-    let elementId = this.getAttribute('data-element-id');
-    let issueIDs = [];
-    for (const el of document.querySelectorAll('.issue-checkbox:checked')) {
-      issueIDs.push(el.getAttribute('data-issue-id'));
-    }
-    issueIDs = issueIDs.join(',');
-    if (!issueIDs) return;
+      const url = el.getAttribute('data-url')!;
+      let action = el.getAttribute('data-action')!;
+      const elementId = el.getAttribute('data-element-id')!;
+      const issueIDs = Array.from(container.querySelectorAll('.issue-checkbox:checked'), (el) => el.getAttribute('data-issue-id')!).join(',');
+      if (!issueIDs) return;
 
-    // for assignee
-    if (elementId === '0' && url.endsWith('/assignee')) {
-      elementId = '';
-      action = 'clear';
-    }
-
-    // for toggle
-    if (action === 'toggle' && e.altKey) {
-      action = 'toggle-alt';
-    }
-
-    // for delete
-    if (action === 'delete') {
-      const confirmText = e.target.getAttribute('data-action-delete-confirm');
-      if (!await confirmModal(confirmText, {confirmButtonColor: 'red'})) {
-        return;
+      // for label toggle
+      if (action === 'toggle' && e.altKey) {
+        action = 'toggle-alt';
       }
-    }
 
-    try {
-      await updateIssuesMeta(url, action, issueIDs, elementId);
-      window.location.reload();
-    } catch (err) {
-      showErrorToast(err.responseJSON?.error ?? err.message);
-    }
-  });
+      // for delete
+      if (action === 'delete') {
+        const confirmText = el.getAttribute('data-action-delete-confirm')!;
+        if (!await confirmModal({content: confirmText, confirmButtonColor: 'red'})) {
+          return;
+        }
+      }
+
+      const data = new URLSearchParams({action, issue_ids: issueIDs, id: elementId});
+      await performFetchAction(el, {method: 'post', url, data});
+    },
+  ));
 }
 
-function initRepoIssueListAuthorDropdown() {
-  const $searchDropdown = $('.user-remote-search');
-  if (!$searchDropdown.length) return;
-
-  let searchUrl = $searchDropdown[0].getAttribute('data-search-url');
-  const actionJumpUrl = $searchDropdown[0].getAttribute('data-action-jump-url');
-  const selectedUserId = $searchDropdown[0].getAttribute('data-selected-user-id');
-  if (!searchUrl.includes('?')) searchUrl += '?';
+function initDropdownUserRemoteSearch(el: Element) {
+  let searchUrl = el.getAttribute('data-search-url');
+  const actionJumpUrl = el.getAttribute('data-action-jump-url')!;
+  let selectedUsername = el.getAttribute('data-selected-username') || '';
+  const $searchDropdown = fomanticQuery(el);
+  const elMenu = el.querySelector('.menu')!;
+  const elSearchInput = el.querySelector<HTMLInputElement>('.ui.search input')!;
+  const elItemFromInput = el.querySelector('.menu > .item-from-input')!;
 
   $searchDropdown.dropdown('setting', {
     fullTextSearch: true,
     selectOnKeydown: false,
-    apiSettings: {
-      cache: false,
-      url: `${searchUrl}&q={query}`,
-      onResponse(resp) {
-        // the content is provided by backend IssuePosters handler
-        const processedResults = []; // to be used by dropdown to generate menu items
-        for (const item of resp.results) {
-          let html = `<img class="ui avatar tw-align-middle" src="${htmlEscape(item.avatar_link)}" aria-hidden="true" alt="" width="20" height="20"><span class="gt-ellipsis">${htmlEscape(item.username)}</span>`;
-          if (item.full_name) html += `<span class="search-fullname tw-ml-2">${htmlEscape(item.full_name)}</span>`;
-          processedResults.push({value: item.user_id, name: html});
-        }
-        resp.results = processedResults;
-        return resp;
-      },
-    },
-    action: (_text, value) => {
-      window.location.href = actionJumpUrl.replace('{user_id}', encodeURIComponent(value));
-    },
-    onShow: () => {
-      $searchDropdown.dropdown('filter', ' '); // trigger a search on first show
+    action: (_text: string, value: string) => {
+      window.location.assign(actionJumpUrl.replace('{username}', () => encodeURIComponent(value)));
     },
   });
 
-  // we want to generate the dropdown menu items by ourselves, replace its internal setup functions
-  const dropdownSetup = {...$searchDropdown.dropdown('internal', 'setup')};
-  const dropdownTemplates = $searchDropdown.dropdown('setting', 'templates');
-  $searchDropdown.dropdown('internal', 'setup', dropdownSetup);
-  dropdownSetup.menu = function (values) {
-    const menu = $searchDropdown.find('> .menu')[0];
-    // remove old dynamic items
-    for (const el of menu.querySelectorAll(':scope > .dynamic-item')) {
-      el.remove();
-    }
-
-    const newMenuHtml = dropdownTemplates.menu(values, $searchDropdown.dropdown('setting', 'fields'), true /* html */, $searchDropdown.dropdown('setting', 'className'));
-    if (newMenuHtml) {
-      const newMenuItems = parseDom(newMenuHtml, 'text/html').querySelectorAll('body > div');
-      for (const newMenuItem of newMenuItems) {
-        newMenuItem.classList.add('dynamic-item');
-      }
-      const div = document.createElement('div');
-      div.classList.add('divider', 'dynamic-item');
-      menu.append(div, ...newMenuItems);
-    }
-    $searchDropdown.dropdown('refresh');
-    // defer our selection to the next tick, because dropdown will set the selection item after this `menu` function
-    setTimeout(() => {
-      for (const el of menu.querySelectorAll('.item.active, .item.selected')) {
-        el.classList.remove('active', 'selected');
-      }
-      menu.querySelector(`.item[data-value="${selectedUserId}"]`)?.classList.add('selected');
-    }, 0);
+  const selectUsername = (username: string) => {
+    queryElems(elMenu, '.item.active, .item.selected', (el) => el.classList.remove('active', 'selected'));
+    elMenu.querySelector(`.item[data-value="${CSS.escape(username)}"]`)?.classList.add('selected');
   };
+
+  const processedResults: ProcessedIssuePoster[] = []; // to be used by dropdown to generate menu items
+  const syncItemFromInput = () => {
+    const inputVal = elSearchInput.value.trim();
+    elItemFromInput.setAttribute('data-value', inputVal);
+    elItemFromInput.textContent = inputVal;
+    const showItemFromInput = !processedResults.length && inputVal !== '';
+    toggleElem(elItemFromInput, showItemFromInput);
+    selectUsername(showItemFromInput ? inputVal : selectedUsername);
+  };
+
+  elSearchInput.value = selectedUsername;
+  if (!searchUrl) {
+    elSearchInput.addEventListener('input', syncItemFromInput);
+    return;
+  }
+
+  if (!searchUrl.includes('?')) searchUrl += '?';
+  $searchDropdown.dropdown('setting', {
+    onMenuUpdated: () => syncItemFromInput(),
+    apiSettings: {
+      url: `${searchUrl}&q={query}`,
+      onResponse(resp: IssuePosterResponse) {
+        // the content is provided by backend IssuePosters handler
+        processedResults.length = 0;
+        for (const item of resp.results) {
+          const htmlAvatar = html`<img class="ui avatar tw-align-middle" src="${item.avatar_link}" aria-hidden="true" alt width="20" height="20">`;
+          const htmlFullName = item.full_name ? html`<span class="username-fullname">(${item.full_name})</span>` : '';
+          const htmlItemInner = html`<span class="username-display">${htmlRaw(htmlAvatar)}<span>${item.username}</span>${htmlRaw(htmlFullName)}</span>`;
+          if (selectedUsername.toLowerCase() === item.username.toLowerCase()) selectedUsername = item.username;
+          const htmlItem = html`<div class="item" data-value="${item.username}">${htmlRaw(htmlItemInner)}</div>`;
+          processedResults.push({type: 'html', html: htmlItem});
+        }
+        return {results: processedResults};
+      },
+    },
+  });
 }
 
 function initPinRemoveButton() {
   for (const button of document.querySelectorAll('.issue-card-unpin')) {
     button.addEventListener('click', async (event) => {
-      const el = event.currentTarget;
+      const el = event.currentTarget as HTMLElement;
       const id = Number(el.getAttribute('data-issue-id'));
 
       // Send the unpin request
-      const response = await DELETE(el.getAttribute('data-unpin-url'));
+      const response = await DELETE(el.getAttribute('data-unpin-url')!);
       if (response.ok) {
         // Delete the tooltip
         el._tippy.destroy();
         // Remove the Card
-        el.closest(`div.issue-card[data-issue-id="${id}"]`).remove();
+        el.closest(`div.issue-card[data-issue-id="${CSS.escape(String(id))}"]`)!.remove();
       }
     });
   }
 }
 
-async function pinMoveEnd(e) {
-  const url = e.item.getAttribute('data-move-url');
+async function pinMoveEnd(e: SortableEvent) {
+  const url = e.item.getAttribute('data-move-url')!;
   const id = Number(e.item.getAttribute('data-issue-id'));
-  await POST(url, {data: {id, position: e.newIndex + 1}});
+  await POST(url, {data: {id, position: e.newIndex! + 1}});
 }
 
-async function initIssuePinSort() {
-  const pinDiv = document.querySelector('#issue-pins');
-
-  if (pinDiv === null) return;
-
-  // If the User is not a Repo Admin, we don't need to proceed
-  if (!pinDiv.hasAttribute('data-is-repo-admin')) return;
-
+function initIssuePinSort(pinDiv: HTMLElement) {
   initPinRemoveButton();
 
   // If only one issue pinned, we don't need to make this Sortable
@@ -196,50 +166,16 @@ async function initIssuePinSort() {
 
   createSortable(pinDiv, {
     group: 'shared',
-    onEnd: pinMoveEnd, // eslint-disable-line @typescript-eslint/no-misused-promises
-  });
-}
-
-function initArchivedLabelFilter() {
-  const archivedLabelEl = document.querySelector('#archived-filter-checkbox');
-  if (!archivedLabelEl) {
-    return;
-  }
-
-  const url = new URL(window.location.href);
-  const archivedLabels = document.querySelectorAll('[data-is-archived]');
-
-  if (!archivedLabels.length) {
-    hideElem('.archived-label-filter');
-    return;
-  }
-  const selectedLabels = (url.searchParams.get('labels') || '')
-    .split(',')
-    .map((id) => id < 0 ? `${~id + 1}` : id); // selectedLabels contains -ve ids, which are excluded so convert any -ve value id to +ve
-
-  const archivedElToggle = () => {
-    for (const label of archivedLabels) {
-      const id = label.getAttribute('data-label-id');
-      toggleElem(label, archivedLabelEl.checked || selectedLabels.includes(id));
-    }
-  };
-
-  archivedElToggle();
-  archivedLabelEl.addEventListener('change', () => {
-    archivedElToggle();
-    if (archivedLabelEl.checked) {
-      url.searchParams.set('archived', 'true');
-    } else {
-      url.searchParams.delete('archived');
-    }
-    window.location.href = url.href;
+    onEnd: (e) => {
+      (async () => {
+        await pinMoveEnd(e);
+      })();
+    },
   });
 }
 
 export function initRepoIssueList() {
-  if (!document.querySelectorAll('.page-content.repository.issue-list, .page-content.repository.milestone-issue-list').length) return;
-  initRepoIssueListCheckboxes();
-  initRepoIssueListAuthorDropdown();
-  initIssuePinSort();
-  initArchivedLabelFilter();
+  registerGlobalInitFunc('initRepoIssueListCheckboxes', initRepoIssueListCheckboxes);
+  registerGlobalInitFunc('initDropdownUserRemoteSearch', initDropdownUserRemoteSearch);
+  registerGlobalInitFunc('initIssuePinSort', initIssuePinSort);
 }

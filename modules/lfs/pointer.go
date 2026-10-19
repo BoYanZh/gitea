@@ -10,20 +10,20 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
+
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
+// spec: https://github.com/git-lfs/git-lfs/blob/master/docs/spec.md
 const (
-	blobSizeCutoff = 1024
+	MetaFileMaxSize = 1024 // spec says the maximum size of a pointer file must be smaller than 1024
 
-	// MetaFileIdentifier is the string appearing at the first line of LFS pointer files.
-	// https://github.com/git-lfs/git-lfs/blob/master/docs/spec.md
-	MetaFileIdentifier = "version https://git-lfs.github.com/spec/v1"
+	MetaFileIdentifier = "version https://git-lfs.github.com/spec/v1" // the first line of a pointer file
 
-	// MetaFileOidPrefix appears in LFS pointer files on a line before the sha256 hash.
-	MetaFileOidPrefix = "oid sha256:"
+	MetaFileOidPrefix = "oid sha256:" // spec says the only supported hash is sha256 at the moment
 )
 
 var (
@@ -39,7 +39,7 @@ var (
 
 // ReadPointer tries to read LFS pointer data from the reader
 func ReadPointer(reader io.Reader) (Pointer, error) {
-	buf := make([]byte, blobSizeCutoff)
+	buf := make([]byte, MetaFileMaxSize)
 	n, err := io.ReadFull(reader, buf)
 	if err != nil && err != io.ErrUnexpectedEOF {
 		return Pointer{}, err
@@ -48,8 +48,6 @@ func ReadPointer(reader io.Reader) (Pointer, error) {
 
 	return ReadPointerFromBuffer(buf)
 }
-
-var oidPattern = regexp.MustCompile(`^[a-f\d]{64}$`)
 
 // ReadPointerFromBuffer will return a pointer if the provided byte slice is a pointer file or an error otherwise.
 func ReadPointerFromBuffer(buf []byte) (Pointer, error) {
@@ -65,8 +63,9 @@ func ReadPointerFromBuffer(buf []byte) (Pointer, error) {
 		return p, ErrInvalidStructure
 	}
 
+	// spec says "key/value pairs MUST be sorted alphabetically in ascending order (version is exception and must be the first)"
 	oid := strings.TrimPrefix(splitLines[1], MetaFileOidPrefix)
-	if len(oid) != 64 || !oidPattern.MatchString(oid) {
+	if !isValidOid(oid) {
 		return p, ErrInvalidOIDFormat
 	}
 	size, err := strconv.ParseInt(strings.TrimPrefix(splitLines[2], "size "), 10, 64)
@@ -80,13 +79,24 @@ func ReadPointerFromBuffer(buf []byte) (Pointer, error) {
 	return p, nil
 }
 
+func isValidOid(oid string) bool {
+	if len(oid) != 64 {
+		return false
+	}
+	for i := range len(oid) {
+		c := oid[i]
+		valid := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !valid {
+			return false
+		}
+	}
+	return true
+}
+
 // IsValid checks if the pointer has a valid structure.
 // It doesn't check if the pointed-to-content exists.
 func (p Pointer) IsValid() bool {
-	if len(p.Oid) != 64 {
-		return false
-	}
-	if !oidPattern.MatchString(p.Oid) {
+	if !isValidOid(p.Oid) {
 		return false
 	}
 	if p.Size < 0 {
@@ -103,10 +113,13 @@ func (p Pointer) StringContent() string {
 
 // RelativePath returns the relative storage path of the pointer
 func (p Pointer) RelativePath() string {
-	if len(p.Oid) < 5 {
-		return p.Oid
+	if !isValidOid(p.Oid) {
+		setting.PanicInDevOrTesting("invalid LFS OID: %s", p.Oid)
+		return "invalid-lfs-oid-" + util.PathJoinRelX(p.Oid)
 	}
-
+	// HINT: LFS-INTERNAL-PATH-PATTERN: this path pattern is only used by Gitea internally,
+	// It isn't the same as the path pattern used by Git LFS, which is: <oid[0:2]>/<oid[2:4]>/<oid>
+	// However, there are other parts of Gitea that rely on such path pattern.
 	return path.Join(p.Oid[0:2], p.Oid[2:4], p.Oid[4:])
 }
 

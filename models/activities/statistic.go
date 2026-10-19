@@ -6,24 +6,27 @@ package activities
 import (
 	"context"
 
-	asymkey_model "code.gitea.io/gitea/models/asymkey"
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	git_model "code.gitea.io/gitea/models/git"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/organization"
-	access_model "code.gitea.io/gitea/models/perm/access"
-	project_model "code.gitea.io/gitea/models/project"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/models/webhook"
-	"code.gitea.io/gitea/modules/setting"
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/organization"
+	access_model "gitea.dev/models/perm/access"
+	project_model "gitea.dev/models/project"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/models/webhook"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
 )
 
 // Statistic contains the database statistics
 type Statistic struct {
 	Counter struct {
-		User, Org, PublicKey,
+		UsersActive, UsersNotActive,
+		Org, PublicKey,
 		Repo, Watch, Star, Access,
 		Issue, IssueClosed, IssueOpen,
 		Comment, Oauth, Follow,
@@ -53,8 +56,20 @@ type IssueByRepositoryCount struct {
 // GetStatistic returns the database statistics
 func GetStatistic(ctx context.Context) (stats Statistic) {
 	e := db.GetEngine(ctx)
-	stats.Counter.User = user_model.CountUsers(ctx, nil)
-	stats.Counter.Org, _ = db.Count[organization.Organization](ctx, organization.FindOrgOptions{IncludePrivate: true})
+
+	// Number of active users
+	usersActiveOpts := user_model.CountUserFilter{
+		IsActive: optional.Some(true),
+	}
+	stats.Counter.UsersActive = user_model.CountUsers(ctx, &usersActiveOpts)
+
+	// Number of inactive users
+	usersNotActiveOpts := user_model.CountUserFilter{
+		IsActive: optional.Some(false),
+	}
+	stats.Counter.UsersNotActive = user_model.CountUsers(ctx, &usersNotActiveOpts)
+
+	stats.Counter.Org, _ = db.Count[organization.Organization](ctx, organization.FindOrgOptions{IncludeVisibility: structs.VisibleTypePrivate})
 	stats.Counter.PublicKey, _ = e.Count(new(asymkey_model.PublicKey))
 	stats.Counter.Repo, _ = repo_model.CountRepositories(ctx, repo_model.CountRepositoryOptions{})
 	stats.Counter.Watch, _ = e.Count(new(repo_model.Watch))

@@ -6,8 +6,6 @@ package validation
 import (
 	"regexp"
 	"testing"
-
-	"gitea.com/go-chi/binding"
 )
 
 func getRegexPatternErrorString(pattern string) string {
@@ -17,39 +15,35 @@ func getRegexPatternErrorString(pattern string) string {
 	return ""
 }
 
-var regexValidationTestCases = []validationTestCase{
-	{
-		description: "Empty regex pattern",
-		data: TestForm{
-			RegexPattern: "",
-		},
-		expectedErrors: binding.Errors{},
-	},
-	{
-		description: "Valid regex",
-		data: TestForm{
-			RegexPattern: `(\d{1,3})+`,
-		},
-		expectedErrors: binding.Errors{},
-	},
-
-	{
-		description: "Invalid regex",
-		data: TestForm{
-			RegexPattern: "[a-",
-		},
-		expectedErrors: binding.Errors{
-			binding.Error{
-				FieldNames:     []string{"RegexPattern"},
-				Classification: ErrRegexPattern,
-				Message:        getRegexPatternErrorString("[a-"),
+func Test_RegexPatternValidation(t *testing.T) {
+	regexValidationTestCases := []validationTestCase{
+		{
+			description: "Empty regex pattern",
+			data: &TestForm{
+				RegexPattern: "",
 			},
 		},
-	},
-}
+		{
+			description: "Valid regex",
+			data: &TestForm{
+				RegexPattern: `(\d{1,3})+`,
+			},
+		},
 
-func Test_RegexPatternValidation(t *testing.T) {
-	AddBindingRules()
+		{
+			description: "Invalid regex",
+			data: &TestForm{
+				RegexPattern: "[a-",
+			},
+			expectedErrors: BindingErrors{
+				BindingError{
+					FieldNames:     []string{"RegexPattern"},
+					Classification: ErrRegexPattern,
+					Message:        getRegexPatternErrorString("[a-"),
+				},
+			},
+		},
+	}
 
 	for _, testCase := range regexValidationTestCases {
 		t.Run(testCase.description, func(t *testing.T) {

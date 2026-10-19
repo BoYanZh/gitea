@@ -4,7 +4,6 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -13,9 +12,9 @@ import (
 	"net/url"
 	"strconv"
 
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/lfs"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/lfs"
+	"gitea.dev/modules/setting"
 
 	"github.com/charmbracelet/git-lfs-transfer/transfer"
 )
@@ -29,26 +28,25 @@ var Capabilities = []string{
 	"locking",
 }
 
-var _ transfer.Backend = &GiteaBackend{}
+var _ transfer.Backend = (*GiteaBackend)(nil)
 
 // GiteaBackend is an adapter between git-lfs-transfer library and Gitea's internal LFS API
 type GiteaBackend struct {
-	ctx    context.Context
-	server *url.URL
-	op     string
-	token  string
-	itoken string
-	logger transfer.Logger
+	ctx          context.Context
+	server       *url.URL
+	op           string
+	authToken    string
+	internalAuth string
+	logger       transfer.Logger
 }
 
-func New(ctx context.Context, repo, op, token string, logger transfer.Logger) (transfer.Backend, error) {
-	// runServ guarantees repo will be in form [owner]/[name].git
+func New(ctx context.Context, reqPath, op, token string, logger transfer.Logger) (transfer.Backend, error) {
 	server, err := url.Parse(setting.LocalURL)
 	if err != nil {
 		return nil, err
 	}
-	server = server.JoinPath("api/internal/repo", repo, "info/lfs")
-	return &GiteaBackend{ctx: ctx, server: server, op: op, token: token, itoken: fmt.Sprintf("Bearer %s", setting.InternalToken), logger: logger}, nil
+	server = server.JoinPath(reqPath)
+	return &GiteaBackend{ctx: ctx, server: server, op: op, authToken: token, internalAuth: "Bearer " + setting.InternalToken, logger: logger}, nil
 }
 
 // Batch implements transfer.Backend
@@ -71,24 +69,23 @@ func (g *GiteaBackend) Batch(_ string, pointers []transfer.BatchItem, args trans
 		g.logger.Log("json marshal error", err)
 		return nil, err
 	}
-	url := g.server.JoinPath("objects/batch").String()
 	headers := map[string]string{
-		headerAuthorisation: g.itoken,
-		headerAuthX:         g.token,
-		headerAccept:        mimeGitLFS,
-		headerContentType:   mimeGitLFS,
+		headerAuthorization:     g.authToken,
+		headerGiteaInternalAuth: g.internalAuth,
+		headerAccept:            mimeGitLFS,
+		headerContentType:       mimeGitLFS,
 	}
-	req := newInternalRequest(g.ctx, url, http.MethodPost, headers, bodyBytes)
+	req := newInternalRequestLFS(g.ctx, g.server.JoinPath("objects/batch").String(), http.MethodPost, headers, bodyBytes)
 	resp, err := req.Response()
 	if err != nil {
 		g.logger.Log("http request error", err)
 		return nil, err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		g.logger.Log("http statuscode error", resp.StatusCode, statusCodeToErr(resp.StatusCode))
 		return nil, statusCodeToErr(resp.StatusCode)
 	}
-	defer resp.Body.Close()
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		g.logger.Log("http read error", err)
@@ -97,7 +94,7 @@ func (g *GiteaBackend) Batch(_ string, pointers []transfer.BatchItem, args trans
 	var respBody lfs.BatchResponse
 	err = json.Unmarshal(respBytes, &respBody)
 	if err != nil {
-		g.logger.Log("json umarshal error", err)
+		g.logger.Log("json unmarshal error", err)
 		return nil, err
 	}
 
@@ -119,7 +116,7 @@ func (g *GiteaBackend) Batch(_ string, pointers []transfer.BatchItem, args trans
 				}
 				idMapStr := base64.StdEncoding.EncodeToString(idMapBytes)
 				item.Args[argID] = idMapStr
-				if authHeader, ok := action.Header[headerAuthorisation]; ok {
+				if authHeader, ok := action.Header[headerAuthorization]; ok {
 					authHeaderB64 := base64.StdEncoding.EncodeToString([]byte(authHeader))
 					item.Args[argToken] = authHeaderB64
 				}
@@ -142,7 +139,7 @@ func (g *GiteaBackend) Batch(_ string, pointers []transfer.BatchItem, args trans
 				}
 				idMapStr := base64.StdEncoding.EncodeToString(idMapBytes)
 				item.Args[argID] = idMapStr
-				if authHeader, ok := action.Header[headerAuthorisation]; ok {
+				if authHeader, ok := action.Header[headerAuthorization]; ok {
 					authHeaderB64 := base64.StdEncoding.EncodeToString([]byte(authHeader))
 					item.Args[argToken] = authHeaderB64
 				}
@@ -158,9 +155,8 @@ func (g *GiteaBackend) Batch(_ string, pointers []transfer.BatchItem, args trans
 	return pointers, nil
 }
 
-// Download implements transfer.Backend. The returned reader must be closed by the
-// caller.
-func (g *GiteaBackend) Download(oid string, args transfer.Args) (io.ReadCloser, int64, error) {
+// Download implements transfer.Backend. The returned reader must be closed by the caller.
+func (g *GiteaBackend) Download(oid string, args transfer.Args) (_ io.ReadCloser, _ int64, retErr error) {
 	idMapStr, exists := args[argID]
 	if !exists {
 		return nil, 0, ErrMissingID
@@ -181,31 +177,37 @@ func (g *GiteaBackend) Download(oid string, args transfer.Args) (io.ReadCloser, 
 		g.logger.Log("argument id incorrect")
 		return nil, 0, transfer.ErrCorruptData
 	}
-	url := action.Href
 	headers := map[string]string{
-		headerAuthorisation: g.itoken,
-		headerAuthX:         g.token,
-		headerAccept:        mimeOctetStream,
+		headerAuthorization:     g.authToken,
+		headerGiteaInternalAuth: g.internalAuth,
+		headerAccept:            mimeOctetStream,
 	}
-	req := newInternalRequest(g.ctx, url, http.MethodGet, headers, nil)
+	req := newInternalRequestLFS(g.ctx, toInternalLFSURL(action.Href), http.MethodGet, headers, nil)
 	resp, err := req.Response()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to get response: %w", err)
 	}
+	// We must return the ReaderCloser but not "ReadAll", to avoid OOM.
+	// "transfer.Backend" will check io.Closer interface and close the Body reader.
+	// So only close the Body when error occurs
+	defer func() {
+		if retErr != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, statusCodeToErr(resp.StatusCode)
 	}
-	defer resp.Body.Close()
-	respBytes, err := io.ReadAll(resp.Body)
+
+	respSize, err := strconv.ParseInt(resp.Header.Get("X-Gitea-LFS-Content-Length"), 10, 64)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to parse content length: %w", err)
 	}
-	respSize := int64(len(respBytes))
-	respBuf := io.NopCloser(bytes.NewBuffer(respBytes))
-	return respBuf, respSize, nil
+	return resp.Body, respSize, nil
 }
 
-// StartUpload implements transfer.Backend.
+// Upload implements transfer.Backend.
 func (g *GiteaBackend) Upload(oid string, size int64, r io.Reader, args transfer.Args) error {
 	idMapStr, exists := args[argID]
 	if !exists {
@@ -227,22 +229,20 @@ func (g *GiteaBackend) Upload(oid string, size int64, r io.Reader, args transfer
 		g.logger.Log("argument id incorrect")
 		return transfer.ErrCorruptData
 	}
-	url := action.Href
 	headers := map[string]string{
-		headerAuthorisation: g.itoken,
-		headerAuthX:         g.token,
-		headerContentType:   mimeOctetStream,
-		headerContentLength: strconv.FormatInt(size, 10),
+		headerAuthorization:     g.authToken,
+		headerGiteaInternalAuth: g.internalAuth,
+		headerContentType:       mimeOctetStream,
+		headerContentLength:     strconv.FormatInt(size, 10),
 	}
-	reqBytes, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-	req := newInternalRequest(g.ctx, url, http.MethodPut, headers, reqBytes)
+
+	req := newInternalRequestLFS(g.ctx, toInternalLFSURL(action.Href), http.MethodPut, headers, nil)
+	req.Body(r)
 	resp, err := req.Response()
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return statusCodeToErr(resp.StatusCode)
 	}
@@ -277,18 +277,18 @@ func (g *GiteaBackend) Verify(oid string, size int64, args transfer.Args) (trans
 		// the server sent no verify action
 		return transfer.SuccessStatus(), nil
 	}
-	url := action.Href
 	headers := map[string]string{
-		headerAuthorisation: g.itoken,
-		headerAuthX:         g.token,
-		headerAccept:        mimeGitLFS,
-		headerContentType:   mimeGitLFS,
+		headerAuthorization:     g.authToken,
+		headerGiteaInternalAuth: g.internalAuth,
+		headerAccept:            mimeGitLFS,
+		headerContentType:       mimeGitLFS,
 	}
-	req := newInternalRequest(g.ctx, url, http.MethodPost, headers, bodyBytes)
+	req := newInternalRequestLFS(g.ctx, toInternalLFSURL(action.Href), http.MethodPost, headers, bodyBytes)
 	resp, err := req.Response()
 	if err != nil {
 		return transfer.NewStatus(transfer.StatusInternalServerError), err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return transfer.NewStatus(uint32(resp.StatusCode), http.StatusText(resp.StatusCode)), statusCodeToErr(resp.StatusCode)
 	}

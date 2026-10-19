@@ -6,9 +6,9 @@ package repo
 import (
 	"net/http"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/services/context"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/log"
+	"gitea.dev/services/context"
 )
 
 // GetLicenses returns licenses
@@ -38,7 +38,7 @@ func GetLicenses(ctx *context.APIContext) {
 	licenses, err := repo_model.GetRepoLicenses(ctx, ctx.Repo.Repository)
 	if err != nil {
 		log.Error("GetRepoLicenses failed: %v", err)
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 

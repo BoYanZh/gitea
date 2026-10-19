@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
 )
@@ -34,6 +34,14 @@ type PackageVersion struct {
 	IsInternal    bool               `xorm:"INDEX NOT NULL DEFAULT false"`
 	MetadataJSON  string             `xorm:"metadata_json LONGTEXT"`
 	DownloadCount int64              `xorm:"NOT NULL DEFAULT 0"`
+}
+
+// IsPrerelease checks if the version is a prerelease version according to semantic versioning
+func (pv *PackageVersion) IsPrerelease() bool {
+	if pv == nil || pv.Version == "" {
+		return false
+	}
+	return strings.Contains(pv.Version, "-")
 }
 
 // GetOrInsertVersion inserts a version. If the same version exist already ErrDuplicatePackageVersion is returned
@@ -148,11 +156,15 @@ func DeleteVersionByID(ctx context.Context, versionID int64) error {
 	return err
 }
 
+// DeleteVersionsByPackageID deletes all versions of a specific package
+func DeleteVersionsByPackageID(ctx context.Context, packageID int64) error {
+	_, err := db.GetEngine(ctx).Where(builder.Eq{"package_id": packageID}).Delete(&PackageVersion{})
+	return err
+}
+
 // HasVersionFileReferences checks if there are associated files
 func HasVersionFileReferences(ctx context.Context, versionID int64) (bool, error) {
-	return db.GetEngine(ctx).Get(&PackageFile{
-		VersionID: versionID,
-	})
+	return db.Exist[PackageFile](ctx, builder.Eq{"version_id": versionID})
 }
 
 // SearchValue describes a value to search
@@ -187,7 +199,7 @@ type PackageSearchOptions struct {
 	HasFileWithName string                // only results are found which are associated with a file with the specific name
 	HasFiles        optional.Option[bool] // only results are found which have associated files
 	Sort            VersionSort
-	db.Paginator
+	Paginator       db.Paginator
 }
 
 func (opts *PackageSearchOptions) ToConds() builder.Cond {
@@ -279,9 +291,19 @@ func (opts *PackageSearchOptions) configureOrderBy(e db.Engine) {
 	default:
 		e.Desc("package_version.created_unix")
 	}
+	e.Desc("package_version.id") // Sort by id for stable order with duplicates in the other field
+}
 
-	// Sort by id for stable order with duplicates in the other field
-	e.Asc("package_version.id")
+func searchVersionsBySession(sess db.Session, opts *PackageSearchOptions) ([]*PackageVersion, int64, error) {
+	opts.configureOrderBy(sess)
+	pvs := make([]*PackageVersion, 0, 10)
+	if opts.Paginator != nil {
+		db.SetSessionPagination(sess, opts.Paginator)
+		count, err := sess.FindAndCount(&pvs)
+		return pvs, count, err
+	}
+	err := sess.Find(&pvs)
+	return pvs, int64(len(pvs)), err
 }
 
 // SearchVersions gets all versions of packages matching the search options
@@ -291,16 +313,7 @@ func SearchVersions(ctx context.Context, opts *PackageSearchOptions) ([]*Package
 		Table("package_version").
 		Join("INNER", "package", "package.id = package_version.package_id").
 		Where(opts.ToConds())
-
-	opts.configureOrderBy(sess)
-
-	if opts.Paginator != nil {
-		sess = db.SetSessionPagination(sess, opts)
-	}
-
-	pvs := make([]*PackageVersion, 0, 10)
-	count, err := sess.FindAndCount(&pvs)
-	return pvs, count, err
+	return searchVersionsBySession(sess, opts)
 }
 
 // SearchLatestVersions gets the latest version of every package matching the search options
@@ -318,15 +331,7 @@ func SearchLatestVersions(ctx context.Context, opts *PackageSearchOptions) ([]*P
 		Join("INNER", "package", "package.id = package_version.package_id").
 		Where(builder.In("package_version.id", in))
 
-	opts.configureOrderBy(sess)
-
-	if opts.Paginator != nil {
-		sess = db.SetSessionPagination(sess, opts)
-	}
-
-	pvs := make([]*PackageVersion, 0, 10)
-	count, err := sess.FindAndCount(&pvs)
-	return pvs, count, err
+	return searchVersionsBySession(sess, opts)
 }
 
 // ExistVersion checks if a version matching the search options exist

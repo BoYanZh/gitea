@@ -9,17 +9,18 @@ import (
 	"net/url"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func getDeleteFileOptions() *api.DeleteFileOptions {
 	return &api.DeleteFileOptions{
+		SHA: "103ff9234cefeee5ec5361d22b49fbb04d385885",
 		FileOptions: api.FileOptions{
 			BranchName:    "master",
 			NewBranchName: "master",
@@ -33,7 +34,6 @@ func getDeleteFileOptions() *api.DeleteFileOptions {
 				Email: "janedoe@example.com",
 			},
 		},
-		SHA: "103ff9234cefeee5ec5361d22b49fbb04d385885",
 	}
 }
 
@@ -67,8 +67,7 @@ func TestAPIDeleteFile(t *testing.T) {
 			req := NewRequestWithJSON(t, "DELETE", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &deleteFileOptions).
 				AddTokenAuth(token2)
 			resp := MakeRequest(t, req, http.StatusOK)
-			var fileResponse api.FileResponse
-			DecodeJSON(t, resp, &fileResponse)
+			fileResponse := DecodeJSON(t, resp, &api.FileResponse{})
 			assert.NotNil(t, fileResponse)
 			assert.Nil(t, fileResponse.Content)
 		}
@@ -83,11 +82,10 @@ func TestAPIDeleteFile(t *testing.T) {
 		req := NewRequestWithJSON(t, "DELETE", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &deleteFileOptions).
 			AddTokenAuth(token2)
 		resp := MakeRequest(t, req, http.StatusOK)
-		var fileResponse api.FileResponse
-		DecodeJSON(t, resp, &fileResponse)
+		fileResponse := DecodeJSON(t, resp, &api.FileResponse{})
 		assert.NotNil(t, fileResponse)
 		assert.Nil(t, fileResponse.Content)
-		assert.EqualValues(t, deleteFileOptions.Message+"\n", fileResponse.Commit.Message)
+		assert.Equal(t, deleteFileOptions.Message+"\n", fileResponse.Commit.Message)
 
 		// Test deleting file without a message
 		fileID++
@@ -98,9 +96,9 @@ func TestAPIDeleteFile(t *testing.T) {
 		req = NewRequestWithJSON(t, "DELETE", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &deleteFileOptions).
 			AddTokenAuth(token2)
 		resp = MakeRequest(t, req, http.StatusOK)
-		DecodeJSON(t, resp, &fileResponse)
+		fileResponse = DecodeJSON(t, resp, &api.FileResponse{})
 		expectedMessage := "Delete " + treePath + "\n"
-		assert.EqualValues(t, expectedMessage, fileResponse.Commit.Message)
+		assert.Equal(t, expectedMessage, fileResponse.Commit.Message)
 
 		// Test deleting a file with the wrong SHA
 		fileID++
@@ -110,7 +108,7 @@ func TestAPIDeleteFile(t *testing.T) {
 		deleteFileOptions.SHA = "badsha"
 		req = NewRequestWithJSON(t, "DELETE", fmt.Sprintf("/api/v1/repos/%s/%s/contents/%s", user2.Name, repo1.Name, treePath), &deleteFileOptions).
 			AddTokenAuth(token2)
-		MakeRequest(t, req, http.StatusBadRequest)
+		MakeRequest(t, req, http.StatusUnprocessableEntity)
 
 		// Test creating a file in repo16 by user4 who does not have write access
 		fileID++

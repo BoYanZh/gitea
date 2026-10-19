@@ -6,7 +6,7 @@ package migrations
 import (
 	"context"
 
-	base "code.gitea.io/gitea/modules/migration"
+	base "gitea.dev/modules/migration"
 )
 
 var _ base.Downloader = &PlainGitDownloader{}
@@ -28,12 +28,8 @@ func NewPlainGitDownloader(ownerName, repoName, remoteURL string) *PlainGitDownl
 	}
 }
 
-// SetContext set context
-func (g *PlainGitDownloader) SetContext(ctx context.Context) {
-}
-
 // GetRepoInfo returns a repository information
-func (g *PlainGitDownloader) GetRepoInfo() (*base.Repository, error) {
+func (g *PlainGitDownloader) GetRepoInfo(_ context.Context) (*base.Repository, error) {
 	// convert github repo to stand Repo
 	return &base.Repository{
 		Owner:    g.ownerName,
@@ -43,6 +39,6 @@ func (g *PlainGitDownloader) GetRepoInfo() (*base.Repository, error) {
 }
 
 // GetTopics return empty string slice
-func (g PlainGitDownloader) GetTopics() ([]string, error) {
+func (g PlainGitDownloader) GetTopics(_ context.Context) ([]string, error) {
 	return []string{}, nil
 }

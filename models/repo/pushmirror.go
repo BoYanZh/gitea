@@ -7,16 +7,14 @@ import (
 	"context"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
 )
-
-// ErrPushMirrorNotExist mirror does not exist error
-var ErrPushMirrorNotExist = util.NewNotExistErrorf("PushMirror does not exist")
 
 // PushMirror represents mirror information of a repository.
 type PushMirror struct {
@@ -38,6 +36,10 @@ type PushMirrorOptions struct {
 	ID         int64
 	RepoID     int64
 	RemoteName string
+}
+
+func (opts PushMirrorOptions) ToOrders() string {
+	return "id"
 }
 
 func (opts PushMirrorOptions) ToConds() builder.Cond {
@@ -76,13 +78,13 @@ func (m *PushMirror) GetRemoteName() string {
 	return m.RemoteName
 }
 
-// UpdatePushMirror updates the push-mirror
-func UpdatePushMirror(ctx context.Context, m *PushMirror) error {
-	_, err := db.GetEngine(ctx).ID(m.ID).AllCols().Update(m)
+// UpdatePushMirrorSyncStatus updates the sync status (last update time and last error) of the push-mirror
+func UpdatePushMirrorSyncStatus(ctx context.Context, m *PushMirror) error {
+	_, err := db.GetEngine(ctx).ID(m.ID).Cols("last_update", "last_error").Update(m)
 	return err
 }
 
-// UpdatePushMirrorInterval updates the push-mirror
+// UpdatePushMirrorInterval updates the sync interval of the push-mirror
 func UpdatePushMirrorInterval(ctx context.Context, m *PushMirror) error {
 	_, err := db.GetEngine(ctx).ID(m.ID).Cols("interval").Update(m)
 	return err
@@ -96,26 +98,50 @@ func DeletePushMirrors(ctx context.Context, opts PushMirrorOptions) error {
 	return util.NewInvalidArgumentErrorf("repoID required and must be set")
 }
 
+type findPushMirrorOptions struct {
+	db.ListOptions
+	RepoID       int64
+	SyncOnCommit optional.Option[bool]
+}
+
+func (opts findPushMirrorOptions) ToOrders() string {
+	return "id"
+}
+
+func (opts findPushMirrorOptions) ToConds() builder.Cond {
+	cond := builder.NewCond()
+	if opts.RepoID > 0 {
+		cond = cond.And(builder.Eq{"repo_id": opts.RepoID})
+	}
+	if opts.SyncOnCommit.Has() {
+		cond = cond.And(builder.Eq{"sync_on_commit": opts.SyncOnCommit.Value()})
+	}
+	return cond
+}
+
 // GetPushMirrorsByRepoID returns push-mirror information of a repository.
 func GetPushMirrorsByRepoID(ctx context.Context, repoID int64, listOptions db.ListOptions) ([]*PushMirror, int64, error) {
-	sess := db.GetEngine(ctx).Where("repo_id = ?", repoID)
-	if listOptions.Page != 0 {
-		sess = db.SetSessionPagination(sess, &listOptions)
-		mirrors := make([]*PushMirror, 0, listOptions.PageSize)
-		count, err := sess.FindAndCount(&mirrors)
-		return mirrors, count, err
+	return db.FindAndCount[PushMirror](ctx, findPushMirrorOptions{
+		ListOptions: listOptions,
+		RepoID:      repoID,
+	})
+}
+
+func GetPushMirrorByIDAndRepoID(ctx context.Context, id, repoID int64) (*PushMirror, bool, error) {
+	var pushMirror PushMirror
+	has, err := db.GetEngine(ctx).Where("id = ?", id).And("repo_id = ?", repoID).Get(&pushMirror)
+	if !has || err != nil {
+		return nil, has, err
 	}
-	mirrors := make([]*PushMirror, 0, 10)
-	count, err := sess.FindAndCount(&mirrors)
-	return mirrors, count, err
+	return &pushMirror, true, nil
 }
 
 // GetPushMirrorsSyncedOnCommit returns push-mirrors for this repo that should be updated by new commits
 func GetPushMirrorsSyncedOnCommit(ctx context.Context, repoID int64) ([]*PushMirror, error) {
-	mirrors := make([]*PushMirror, 0, 10)
-	return mirrors, db.GetEngine(ctx).
-		Where("repo_id = ? AND sync_on_commit = ?", repoID, true).
-		Find(&mirrors)
+	return db.Find[PushMirror](ctx, findPushMirrorOptions{
+		RepoID:       repoID,
+		SyncOnCommit: optional.Some(true),
+	})
 }
 
 // PushMirrorsIterate iterates all push-mirror repositories.

@@ -1,11 +1,10 @@
-{{template "base/head" .}}
-<link rel="stylesheet" href="{{AssetUrlPrefix}}/css/devtest.css?v={{AssetVersion}}">
+{{template "devtest/devtest-header"}}
 <div class="page-content devtest ui container">
 	<div>
 		<h2>Dropdown</h2>
 		<div>
 			<div class="ui dropdown tw-border tw-border-red tw-border-dashed" data-tooltip-content="border for demo purpose only">
-				<span class="text">search-input &amp; flex-item in menu</span>
+				<span class="text">search-input &amp; flexed items in menu</span>
 				{{svg "octicon-triangle-down" 14 "dropdown icon"}}
 				<div class="menu flex-items-menu">
 					<div class="ui icon search input"><i class="icon">{{svg "octicon-search"}}</i><input type="text" value="search input in menu"></div>
@@ -42,7 +41,7 @@
 				</div>
 			</div>
 			<div class="ui buttons">
-				<button class="ui button">Button with Dropdown</button>
+				<button type="button" class="ui button">Button with Dropdown</button>
 				<div class="ui dropdown button icon">
 					{{svg "octicon-triangle-down"}}
 					<div class="menu">
@@ -76,12 +75,12 @@
 		<h2>Selection</h2>
 		<div>
 			{{/* the "selection" class is optional, it will be added by JS automatically */}}
-			<select class="ui dropdown selection ellipsis-items-nowrap">
+			<select class="ui dropdown selection ellipsis-text-items">
 				<option>a</option>
 				<option>abcdefuvwxyz</option>
 				<option>loooooooooooooooooooooooooooooooooooooooooooooooooooooooooong</option>
 			</select>
-			<select class="ui dropdown ellipsis-items-nowrap tw-max-w-[8em]">
+			<select class="ui dropdown ellipsis-text-items tw-max-w-[8em]">
 				<option>loooooooooooooooooooooooooooooooooooooooooooooooooooooooooong</option>
 				<option>abcdefuvwxyz</option>
 				<option>a</option>
@@ -128,4 +127,4 @@
 		</div>
 	</div>
 </div>
-{{template "base/footer" .}}
+{{template "devtest/devtest-footer"}}

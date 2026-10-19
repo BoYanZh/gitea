@@ -7,25 +7,31 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
+	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/gitrepo"
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/options"
-	"code.gitea.io/gitea/modules/queue"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/options"
+	"gitea.dev/modules/queue"
+	"gitea.dev/modules/util"
 
 	licenseclassifier "github.com/google/licenseclassifier/v2"
 )
 
+const (
+	LicenseLegacyFile = "LICENSE"
+	// LicenseReuseDir is for REUSE license spec - see https://reuse.software/spec-3.3/
+	// TODO: Surface this version in repo creation
+	LicenseReuseDir = "LICENSES"
+)
+
 var (
-	classifier      *licenseclassifier.Classifier
-	LicenseFileName = "LICENSE"
-	licenseAliases  map[string]string
+	classifier *licenseclassifier.Classifier
 
 	// licenseUpdaterQueue represents a queue to handle update repo licenses
 	licenseUpdaterQueue *queue.WorkerPoolQueue[*LicenseUpdaterOptions]
@@ -38,34 +44,6 @@ func AddRepoToLicenseUpdaterQueue(opts *LicenseUpdaterOptions) error {
 	return licenseUpdaterQueue.Push(opts)
 }
 
-func loadLicenseAliases() error {
-	if licenseAliases != nil {
-		return nil
-	}
-
-	data, err := options.AssetFS().ReadFile("license", "etc", "license-aliases.json")
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(data, &licenseAliases)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func ConvertLicenseName(name string) string {
-	if err := loadLicenseAliases(); err != nil {
-		return name
-	}
-
-	v, ok := licenseAliases[name]
-	if ok {
-		return v
-	}
-	return name
-}
-
 func InitLicenseClassifier() error {
 	// threshold should be 0.84~0.86 or the test will be failed
 	classifier = licenseclassifier.NewClassifier(.85)
@@ -74,20 +52,13 @@ func InitLicenseClassifier() error {
 		return err
 	}
 
-	existLicense := make(container.Set[string])
-	if len(licenseFiles) > 0 {
-		for _, licenseFile := range licenseFiles {
-			licenseName := ConvertLicenseName(licenseFile)
-			if existLicense.Contains(licenseName) {
-				continue
-			}
-			existLicense.Add(licenseName)
-			data, err := options.License(licenseFile)
-			if err != nil {
-				return err
-			}
-			classifier.AddContent("License", licenseFile, licenseName, data)
+	for _, licenseFile := range licenseFiles {
+		licenseName := licenseFile
+		data, err := options.License(licenseFile)
+		if err != nil {
+			return err
 		}
+		classifier.AddContent("License", licenseName, licenseName, data)
 	}
 	return nil
 }
@@ -109,21 +80,23 @@ func repoLicenseUpdater(items ...*LicenseUpdaterOptions) []*LicenseUpdaterOption
 			continue
 		}
 
-		gitRepo, err := gitrepo.OpenRepository(ctx, repo)
-		if err != nil {
-			log.Error("repoLicenseUpdater [%d] failed: OpenRepository: %v", opts.RepoID, err)
-			continue
-		}
-		defer gitRepo.Close()
+		func() {
+			gitRepo, err := git.OpenRepository(ctx, repo)
+			if err != nil {
+				log.Error("repoLicenseUpdater [%d] failed: OpenRepository: %v", opts.RepoID, err)
+				return
+			}
+			defer gitRepo.Close()
 
-		commit, err := gitRepo.GetBranchCommit(repo.DefaultBranch)
-		if err != nil {
-			log.Error("repoLicenseUpdater [%d] failed: GetBranchCommit: %v", opts.RepoID, err)
-			continue
-		}
-		if err = UpdateRepoLicenses(ctx, repo, commit); err != nil {
-			log.Error("repoLicenseUpdater [%d] failed: updateRepoLicenses: %v", opts.RepoID, err)
-		}
+			commit, err := gitRepo.GetBranchCommit(ctx, repo.DefaultBranch)
+			if err != nil {
+				log.Error("repoLicenseUpdater [%d] failed: GetBranchCommit: %v", opts.RepoID, err)
+				return
+			}
+			if err = UpdateRepoLicenses(ctx, repo, gitRepo, commit); err != nil {
+				log.Error("repoLicenseUpdater [%d] failed: updateRepoLicenses: %v", opts.RepoID, err)
+			}
+		}()
 	}
 	return nil
 }
@@ -151,43 +124,94 @@ func SyncRepoLicenses(ctx context.Context) error {
 	return nil
 }
 
-// UpdateRepoLicenses will update repository licenses col if license file exists
-func UpdateRepoLicenses(ctx context.Context, repo *repo_model.Repository, commit *git.Commit) error {
-	if commit == nil {
-		return nil
+// resolveReuseLicenses gathers all licenses in a subtree (assumed to be LicenseReuseDir as per REUSE specification)
+func resolveReuseLicenses(ctx context.Context, gitrepo *git.Repository, parentPath string, tree *git.Tree) ([]repo_model.DetectedLicense, error) {
+	entries, err := tree.ListEntries(ctx, gitrepo)
+	if err != nil {
+		return nil, fmt.Errorf("ListEntries: %w", err)
+	}
+	licenses := make([]repo_model.DetectedLicense, 0)
+	for _, entry := range entries {
+		if entry.IsRegular() {
+			spdxID := util.PathBaseStem(entry.Name())
+			licenses = append(licenses, repo_model.DetectedLicense{SPDXID: spdxID, LicensePath: path.Join(parentPath, entry.Name())})
+		}
 	}
 
-	b, err := commit.GetBlobByPath(LicenseFileName)
+	return licenses, nil
+}
+
+// isLicenseFile checks the prefix of the file and determines if it could plausibly be a license one
+// it's checking well-known ones: license, licence and copying
+// allowed extensions are: md, lesser and txt
+func isLicenseFile(name string) bool {
+	lower := strings.ToLower(name)
+	stem := util.PathBaseStem(lower)
+	ext := path.Ext(lower)
+	// exact match (e.g. "LICENSE") or at most one allowed extension (e.g. "LICENSE.md")
+	return (stem == "license" || stem == "licence" || stem == "copying") &&
+		(ext == "" || ext == ".md" || ext == ".lesser" || ext == ".txt")
+}
+
+func resolveLicenses(ctx context.Context, gitRepo *git.Repository, commit *git.Commit) ([]repo_model.DetectedLicense, error) {
+	tree, err := commit.SubTree(ctx, gitRepo, LicenseReuseDir)
 	if err != nil && !git.IsErrNotExist(err) {
-		return fmt.Errorf("GetBlobByPath: %w", err)
+		return nil, fmt.Errorf("SubTree: %w", err)
 	}
 
-	if git.IsErrNotExist(err) {
+	// handle REUSE license spec first
+	if !git.IsErrNotExist(err) {
+		return resolveReuseLicenses(ctx, gitRepo, LicenseReuseDir, tree)
+	}
+
+	tree, err = commit.SubTree(ctx, gitRepo, "")
+	if err != nil && !git.IsErrNotExist(err) {
+		return nil, fmt.Errorf("SubTree: %w", err)
+	}
+
+	entries, err := tree.ListEntries(ctx, gitRepo)
+	if err != nil {
+		return nil, fmt.Errorf("ListEntries: %w", err)
+	}
+	licenses := make([]repo_model.DetectedLicense, 0)
+	for _, entry := range entries {
+		if !entry.IsRegular() {
+			continue
+		}
+		if !isLicenseFile(entry.Name()) {
+			continue
+		}
+		r, err := entry.Blob(gitRepo).DataAsync(ctx)
+		if err != nil {
+			continue
+		}
+		found, err := detectLicense(r)
+		_ = r.Close()
+		if err != nil {
+			continue
+		}
+		for _, license := range found {
+			licenses = append(licenses, repo_model.DetectedLicense{SPDXID: license, LicensePath: entry.Name()})
+		}
+	}
+	return licenses, nil
+}
+
+// UpdateRepoLicenses will update repository licenses col if license file exists
+func UpdateRepoLicenses(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, commit *git.Commit) error {
+	licenses, err := resolveLicenses(ctx, gitRepo, commit)
+	if err != nil {
+		return err
+	}
+	if len(licenses) == 0 {
 		return repo_model.CleanRepoLicenses(ctx, repo)
 	}
 
-	licenses := make([]string, 0)
-	if b != nil {
-		r, err := b.DataAsync()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-
-		licenses, err = detectLicense(r)
-		if err != nil {
-			return fmt.Errorf("detectLicense: %w", err)
-		}
-	}
 	return repo_model.UpdateRepoLicenses(ctx, repo, commit.ID.String(), licenses)
 }
 
 // detectLicense returns the licenses detected by the given content buff
 func detectLicense(r io.Reader) ([]string, error) {
-	if r == nil {
-		return nil, nil
-	}
-
 	matches, err := classifier.MatchFrom(r)
 	if err != nil {
 		return nil, err

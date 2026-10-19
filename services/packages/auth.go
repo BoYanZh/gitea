@@ -4,15 +4,16 @@
 package packages
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	auth_model "gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -22,21 +23,24 @@ type packageClaims struct {
 	PackageMeta
 }
 type PackageMeta struct {
-	UserID int64
-	Scope  auth_model.AccessTokenScope
+	UserID            int64
+	Scope             auth_model.AccessTokenScope
+	ActionsUserTaskID int64
 }
 
 func CreateAuthorizationToken(u *user_model.User, packageScope auth_model.AccessTokenScope) (string, error) {
 	now := time.Now()
 
+	actionsUserTaskID, _ := user_model.GetActionsUserTaskID(u)
 	claims := packageClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(now.Add(24 * time.Hour)),
 			NotBefore: jwt.NewNumericDate(now),
 		},
 		PackageMeta: PackageMeta{
-			UserID: u.ID,
-			Scope:  packageScope,
+			UserID:            u.ID,
+			Scope:             packageScope,
+			ActionsUserTaskID: actionsUserTaskID,
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -52,13 +56,13 @@ func CreateAuthorizationToken(u *user_model.User, packageScope auth_model.Access
 func ParseAuthorizationRequest(req *http.Request) (*PackageMeta, error) {
 	h := req.Header.Get("Authorization")
 	if h == "" {
-		return nil, nil
+		return nil, nil //nolint:nilnil // the auth method is not applicable
 	}
 
 	parts := strings.SplitN(h, " ", 2)
 	if len(parts) != 2 {
 		log.Error("split token failed: %s", h)
-		return nil, fmt.Errorf("split token failed")
+		return nil, errors.New("split token failed")
 	}
 
 	return ParseAuthorizationToken(parts[1])
@@ -77,7 +81,7 @@ func ParseAuthorizationToken(tokenStr string) (*PackageMeta, error) {
 
 	c, ok := token.Claims.(*packageClaims)
 	if !token.Valid || !ok {
-		return nil, fmt.Errorf("invalid token claim")
+		return nil, errors.New("invalid token claim")
 	}
 
 	return &c.PackageMeta, nil

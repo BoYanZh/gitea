@@ -7,14 +7,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"uuid"
 
-	"code.gitea.io/gitea/models/auth"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/auth/pam"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/setting"
-
-	"github.com/google/uuid"
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/auth/pam"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/services/audit"
 )
 
 // Authenticate queries if login/password is valid against the PAM,
@@ -35,9 +36,9 @@ func (source *Source) Authenticate(ctx context.Context, user *user_model.User, u
 	// Allow PAM sources with `@` in their name, like from Active Directory
 	username := pamLogin
 	email := pamLogin
-	idx := strings.Index(pamLogin, "@")
-	if idx > -1 {
-		username = pamLogin[:idx]
+	before, _, ok := strings.Cut(pamLogin, "@")
+	if ok {
+		username = before
 	}
 	if user_model.ValidateEmail(email) != nil {
 		if source.EmailDomain != "" {
@@ -56,7 +57,7 @@ func (source *Source) Authenticate(ctx context.Context, user *user_model.User, u
 		Email:       email,
 		Passwd:      password,
 		LoginType:   auth.PAM,
-		LoginSource: source.authSource.ID,
+		LoginSource: source.AuthSource.ID,
 		LoginName:   userName, // This is what the user typed in
 	}
 	overwriteDefault := &user_model.CreateUserOverwriteOptions{
@@ -67,10 +68,7 @@ func (source *Source) Authenticate(ctx context.Context, user *user_model.User, u
 		return user, err
 	}
 
-	return user, nil
-}
+	audit.RecordAs(ctx, user_model.NewAuthSourceUser(), audit_model.UserCreate, user)
 
-// IsSkipLocalTwoFA returns if this source should skip local 2fa for password authentication
-func (source *Source) IsSkipLocalTwoFA() bool {
-	return source.SkipLocalTwoFA
+	return user, nil
 }

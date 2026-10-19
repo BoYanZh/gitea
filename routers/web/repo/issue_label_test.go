@@ -6,39 +6,43 @@ package repo
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/repository"
-	"code.gitea.io/gitea/modules/test"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/contexttest"
-	"code.gitea.io/gitea/services/forms"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/repository"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/contexttest"
+	"gitea.dev/services/forms"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func int64SliceToCommaSeparated(a []int64) string {
-	s := ""
-	for i, n := range a {
-		if i > 0 {
-			s += ","
-		}
-		s += strconv.Itoa(int(n))
-	}
-	return s
+func TestIssueLabel(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+	t.Run("RetrieveLabels", testRetrieveLabels)
+	t.Run("NewLabel", testNewLabel)
+	t.Run("NewLabelInvalidColor", testNewLabelInvalidColor)
+	t.Run("UpdateLabel", testUpdateLabel)
+	t.Run("UpdateLabelInvalidColor", testUpdateLabelInvalidColor)
+	t.Run("UpdateIssueLabelClear", testUpdateIssueLabelClear)
+	t.Run("UpdateIssueLabelToggle", testUpdateIssueLabelToggle)
+	t.Run("InitializeLabels", testInitializeLabels)
+	t.Run("DeleteLabel", testDeleteLabel)
 }
 
-func TestInitializeLabels(t *testing.T) {
-	unittest.PrepareTestEnv(t)
+func testInitializeLabels(t *testing.T) {
 	assert.NoError(t, repository.LoadRepoConfig())
 	ctx, _ := contexttest.MockContext(t, "user2/repo1/labels/initialize")
 	contexttest.LoadUser(t, ctx, 2)
 	contexttest.LoadRepo(t, ctx, 2)
 	web.SetForm(ctx, &forms.InitializeLabelsForm{TemplateName: "Default"})
 	InitializeLabels(ctx)
-	assert.EqualValues(t, http.StatusSeeOther, ctx.Resp.Status())
+	assert.Equal(t, http.StatusSeeOther, ctx.Resp.WrittenStatus())
 	unittest.AssertExistsAndLoadBean(t, &issues_model.Label{
 		RepoID: 2,
 		Name:   "enhancement",
@@ -47,36 +51,45 @@ func TestInitializeLabels(t *testing.T) {
 	assert.Equal(t, "/user2/repo2/labels", test.RedirectURL(ctx.Resp))
 }
 
-func TestRetrieveLabels(t *testing.T) {
-	unittest.PrepareTestEnv(t)
+func testRetrieveLabels(t *testing.T) {
+	issueLabel := &issues_model.IssueLabel{IssueID: 6, LabelID: 3}
+	assert.NoError(t, db.Insert(t.Context(), issueLabel))
+	defer func() {
+		_, err := db.DeleteByBean(t.Context(), issueLabel)
+		assert.NoError(t, err)
+	}()
+
 	for _, testCase := range []struct {
-		RepoID           int64
-		Sort             string
-		ExpectedLabelIDs []int64
+		RepoID              int64
+		Sort                string
+		ExpectedLabelIDs    []int64
+		ExpectedOrgLabelIDs []int64
 	}{
-		{1, "", []int64{1, 2}},
-		{1, "leastissues", []int64{2, 1}},
-		{2, "", []int64{}},
+		{1, "", []int64{1, 2}, nil},
+		{1, "leastissues", []int64{2, 1}, nil},
+		{2, "", nil, nil},
+		{3, "mostissues", []int64{10}, []int64{3, 4}},
 	} {
 		ctx, _ := contexttest.MockContext(t, "user/repo/issues")
 		contexttest.LoadUser(t, ctx, 2)
 		contexttest.LoadRepo(t, ctx, testCase.RepoID)
 		ctx.Req.Form.Set("sort", testCase.Sort)
-		RetrieveLabels(ctx)
+		RetrieveLabelsForList(ctx)
 		assert.False(t, ctx.Written())
-		labels, ok := ctx.Data["Labels"].([]*issues_model.Label)
-		assert.True(t, ok)
-		if assert.Len(t, labels, len(testCase.ExpectedLabelIDs)) {
-			for i, label := range labels {
-				assert.EqualValues(t, testCase.ExpectedLabelIDs[i], label.ID)
+		labelIDs := func(key string) (ids []int64) {
+			labels, _ := ctx.Data[key].([]*issues_model.Label)
+			for _, label := range labels {
+				ids = append(ids, label.ID)
 			}
+			return ids
 		}
+		assert.Equal(t, testCase.ExpectedLabelIDs, labelIDs("Labels"))
+		assert.Equal(t, testCase.ExpectedOrgLabelIDs, labelIDs("OrgLabels"))
 	}
 }
 
-func TestNewLabel(t *testing.T) {
-	unittest.PrepareTestEnv(t)
-	ctx, _ := contexttest.MockContext(t, "user2/repo1/labels/edit")
+func testNewLabel(t *testing.T) {
+	ctx, respWriter := contexttest.MockContext(t, "user2/repo1/labels/edit")
 	contexttest.LoadUser(t, ctx, 2)
 	contexttest.LoadRepo(t, ctx, 1)
 	web.SetForm(ctx, &forms.CreateLabelForm{
@@ -84,17 +97,32 @@ func TestNewLabel(t *testing.T) {
 		Color: "#abcdef",
 	})
 	NewLabel(ctx)
-	assert.EqualValues(t, http.StatusSeeOther, ctx.Resp.Status())
+	assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 	unittest.AssertExistsAndLoadBean(t, &issues_model.Label{
 		Name:  "newlabel",
 		Color: "#abcdef",
 	})
-	assert.Equal(t, "/user2/repo1/labels", test.RedirectURL(ctx.Resp))
+	assert.Equal(t, "/user2/repo1/labels", test.RedirectURL(respWriter))
 }
 
-func TestUpdateLabel(t *testing.T) {
-	unittest.PrepareTestEnv(t)
-	ctx, _ := contexttest.MockContext(t, "user2/repo1/labels/edit")
+func testNewLabelInvalidColor(t *testing.T) {
+	ctx, respWriter := contexttest.MockContext(t, "user2/repo1/labels/edit")
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadRepo(t, ctx, 1)
+	web.SetForm(ctx, &forms.CreateLabelForm{
+		Title: "newlabel-x",
+		Color: "bad-label-code",
+	})
+	NewLabel(ctx)
+	assert.Equal(t, http.StatusBadRequest, ctx.Resp.WrittenStatus())
+	assert.Equal(t, "repo.issues.label_color_invalid", test.ParseJSONError(respWriter.Body.Bytes()).ErrorMessage)
+	unittest.AssertNotExistsBean(t, &issues_model.Label{
+		Name: "newlabel-x",
+	})
+}
+
+func testUpdateLabel(t *testing.T) {
+	ctx, respWriter := contexttest.MockContext(t, "user2/repo1/labels/edit")
 	contexttest.LoadUser(t, ctx, 2)
 	contexttest.LoadRepo(t, ctx, 1)
 	web.SetForm(ctx, &forms.CreateLabelForm{
@@ -104,43 +132,62 @@ func TestUpdateLabel(t *testing.T) {
 		IsArchived: true,
 	})
 	UpdateLabel(ctx)
-	assert.EqualValues(t, http.StatusSeeOther, ctx.Resp.Status())
+	assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 	unittest.AssertExistsAndLoadBean(t, &issues_model.Label{
 		ID:    2,
 		Name:  "newnameforlabel",
 		Color: "#abcdef",
 	})
-	assert.Equal(t, "/user2/repo1/labels", test.RedirectURL(ctx.Resp))
+	assert.Equal(t, "/user2/repo1/labels", test.RedirectURL(respWriter))
 }
 
-func TestDeleteLabel(t *testing.T) {
-	unittest.PrepareTestEnv(t)
+func testUpdateLabelInvalidColor(t *testing.T) {
+	ctx, respWriter := contexttest.MockContext(t, "user2/repo1/labels/edit")
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadRepo(t, ctx, 1)
+	web.SetForm(ctx, &forms.CreateLabelForm{
+		ID:    1,
+		Title: "label1",
+		Color: "bad-label-code",
+	})
+
+	UpdateLabel(ctx)
+
+	assert.Equal(t, http.StatusBadRequest, ctx.Resp.WrittenStatus())
+	assert.Equal(t, "repo.issues.label_color_invalid", test.ParseJSONError(respWriter.Body.Bytes()).ErrorMessage)
+	unittest.AssertExistsAndLoadBean(t, &issues_model.Label{
+		ID:    1,
+		Name:  "label1",
+		Color: "#abcdef",
+	})
+}
+
+func testDeleteLabel(t *testing.T) {
 	ctx, _ := contexttest.MockContext(t, "user2/repo1/labels/delete")
 	contexttest.LoadUser(t, ctx, 2)
 	contexttest.LoadRepo(t, ctx, 1)
 	ctx.Req.Form.Set("id", "2")
 	DeleteLabel(ctx)
-	assert.EqualValues(t, http.StatusOK, ctx.Resp.Status())
+	assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 	unittest.AssertNotExistsBean(t, &issues_model.Label{ID: 2})
 	unittest.AssertNotExistsBean(t, &issues_model.IssueLabel{LabelID: 2})
 	assert.EqualValues(t, ctx.Tr("repo.issues.label_deletion_success"), ctx.Flash.SuccessMsg)
 }
 
-func TestUpdateIssueLabel_Clear(t *testing.T) {
-	unittest.PrepareTestEnv(t)
+func testUpdateIssueLabelClear(t *testing.T) {
 	ctx, _ := contexttest.MockContext(t, "user2/repo1/issues/labels")
 	contexttest.LoadUser(t, ctx, 2)
 	contexttest.LoadRepo(t, ctx, 1)
 	ctx.Req.Form.Set("issue_ids", "1,3")
 	ctx.Req.Form.Set("action", "clear")
 	UpdateIssueLabel(ctx)
-	assert.EqualValues(t, http.StatusOK, ctx.Resp.Status())
+	assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 	unittest.AssertNotExistsBean(t, &issues_model.IssueLabel{IssueID: 1})
 	unittest.AssertNotExistsBean(t, &issues_model.IssueLabel{IssueID: 3})
 	unittest.CheckConsistencyFor(t, &issues_model.Label{})
 }
 
-func TestUpdateIssueLabel_Toggle(t *testing.T) {
+func testUpdateIssueLabelToggle(t *testing.T) {
 	for _, testCase := range []struct {
 		Action      string
 		IssueIDs    []int64
@@ -152,20 +199,22 @@ func TestUpdateIssueLabel_Toggle(t *testing.T) {
 		{"toggle", []int64{1, 3}, 1, false},
 		{"toggle", []int64{1, 2}, 2, true},
 	} {
-		unittest.PrepareTestEnv(t)
+		assert.NoError(t, unittest.PrepareTestDatabase())
 		ctx, _ := contexttest.MockContext(t, "user2/repo1/issues/labels")
 		contexttest.LoadUser(t, ctx, 2)
 		contexttest.LoadRepo(t, ctx, 1)
-		ctx.Req.Form.Set("issue_ids", int64SliceToCommaSeparated(testCase.IssueIDs))
+
+		ctx.Req.Form.Set("issue_ids", strings.Join(base.Int64sToStrings(testCase.IssueIDs), ","))
 		ctx.Req.Form.Set("action", testCase.Action)
 		ctx.Req.Form.Set("id", strconv.Itoa(int(testCase.LabelID)))
 		UpdateIssueLabel(ctx)
-		assert.EqualValues(t, http.StatusOK, ctx.Resp.Status())
+		assert.Equal(t, http.StatusOK, ctx.Resp.WrittenStatus())
 		for _, issueID := range testCase.IssueIDs {
-			unittest.AssertExistsIf(t, testCase.ExpectedAdd, &issues_model.IssueLabel{
-				IssueID: issueID,
-				LabelID: testCase.LabelID,
-			})
+			if testCase.ExpectedAdd {
+				unittest.AssertExistsAndLoadBean(t, &issues_model.IssueLabel{IssueID: issueID, LabelID: testCase.LabelID})
+			} else {
+				unittest.AssertNotExistsBean(t, &issues_model.IssueLabel{IssueID: issueID, LabelID: testCase.LabelID})
+			}
 		}
 		unittest.CheckConsistencyFor(t, &issues_model.Label{})
 	}

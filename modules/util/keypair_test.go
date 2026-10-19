@@ -10,10 +10,10 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
-	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestKeygen(t *testing.T) {
@@ -23,8 +23,8 @@ func TestKeygen(t *testing.T) {
 	assert.NotEmpty(t, priv)
 	assert.NotEmpty(t, pub)
 
-	assert.Regexp(t, regexp.MustCompile("^-----BEGIN RSA PRIVATE KEY-----.*"), priv)
-	assert.Regexp(t, regexp.MustCompile("^-----BEGIN PUBLIC KEY-----.*"), pub)
+	assert.Regexp(t, "^-----BEGIN RSA PRIVATE KEY-----.*", priv)
+	assert.Regexp(t, "^-----BEGIN PUBLIC KEY-----.*", pub)
 }
 
 func TestSignUsingKeys(t *testing.T) {
@@ -56,6 +56,8 @@ func TestSignUsingKeys(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify
-	err = rsa.VerifyPKCS1v15(pubParsed.(*rsa.PublicKey), crypto.SHA256, d, sig)
+	pubKey, ok := pubParsed.(*rsa.PublicKey)
+	require.True(t, ok)
+	err = rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, d, sig)
 	assert.NoError(t, err)
 }

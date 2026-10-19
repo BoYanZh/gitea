@@ -5,14 +5,16 @@ package log
 
 import (
 	"context"
+	"net/url"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/util"
 )
 
 type LoggerImpl struct {
@@ -175,34 +177,42 @@ func (l *LoggerImpl) IsEnabled() bool {
 	return l.level.Load() < int32(FATAL) && len(l.eventWriters) > 0
 }
 
+func asLogStringer(v any) LogStringer {
+	if s, ok := v.(LogStringer); ok {
+		return s
+	} else if a := reflect.ValueOf(v); a.Kind() == reflect.Struct {
+		// in case the receiver is a pointer, but the value is a struct
+		vp := reflect.New(a.Type())
+		vp.Elem().Set(a)
+		if s, ok := reflect.TypeAssert[LogStringer](vp); ok {
+			return s
+		}
+	}
+	return nil
+}
+
 // Log prepares the log event, if the level matches, the event will be sent to the writers
-func (l *LoggerImpl) Log(skip int, level Level, format string, logArgs ...any) {
-	if Level(l.level.Load()) > level {
+func (l *LoggerImpl) Log(skip int, event *Event, format string, logArgs ...any) {
+	if Level(l.level.Load()) > event.Level {
 		return
 	}
 
-	event := &Event{
-		Time:   time.Now(),
-		Level:  level,
-		Caller: "?()",
+	if event.Time.IsZero() {
+		event.Time = time.Now()
 	}
-
-	pc, filename, line, ok := runtime.Caller(skip + 1)
-	if ok {
-		fn := runtime.FuncForPC(pc)
-		if fn != nil {
-			event.Caller = fn.Name() + "()"
+	if event.Caller == "" {
+		pc, filename, line, ok := runtime.Caller(skip + 1)
+		if ok {
+			fn := runtime.FuncForPC(pc)
+			if fn != nil {
+				fnName := fn.Name()
+				event.Caller = strings.ReplaceAll(fnName, "[...]", "") + "()" // generic function names are "foo[...]"
+			}
 		}
-	}
-	event.Filename, event.Line = strings.TrimPrefix(filename, projectPackagePrefix), line
-
-	if l.stacktraceLevel.Load() <= int32(level) {
-		event.Stacktrace = Stack(skip + 1)
-	}
-
-	labels := getGoroutineLabels()
-	if labels != nil {
-		event.GoroutinePid = labels["pid"]
+		event.Filename, event.Line = strings.TrimPrefix(filename, projectPackagePrefix), line
+		if l.stacktraceLevel.Load() <= int32(event.Level) {
+			event.Stacktrace = Stack(skip + 1)
+		}
 	}
 
 	// get a simple text message without color
@@ -212,11 +222,13 @@ func (l *LoggerImpl) Log(skip int, level Level, format string, logArgs ...any) {
 	// handle LogStringer values
 	for i, v := range msgArgs {
 		if cv, ok := v.(*ColoredValue); ok {
-			if s, ok := cv.v.(LogStringer); ok {
-				cv.v = logStringFormatter{v: s}
+			if ls := asLogStringer(cv.v); ls != nil {
+				cv.v = logStringFormatter{v: ls}
 			}
-		} else if s, ok := v.(LogStringer); ok {
-			msgArgs[i] = logStringFormatter{v: s}
+		} else if ls := asLogStringer(v); ls != nil {
+			msgArgs[i] = logStringFormatter{v: ls}
+		} else if str, ok := v.(string); ok {
+			msgArgs[i] = protectSensitiveInfo(str)
 		}
 	}
 
@@ -224,6 +236,24 @@ func (l *LoggerImpl) Log(skip int, level Level, format string, logArgs ...any) {
 	event.msgFormat = format
 	event.msgArgs = msgArgs
 	l.SendLogEvent(event)
+}
+
+func protectSensitiveInfo(s string) string {
+	u, err := url.Parse(s)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return s
+	}
+	q := u.Query()
+	for _, vals := range q {
+		for i := range vals {
+			vals[i] = "_"
+		}
+	}
+	masked := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawQuery: q.Encode()}
+	if u.User != nil {
+		masked.User = url.User("_masked_")
+	}
+	return masked.String()
 }
 
 func (l *LoggerImpl) GetLevel() Level {

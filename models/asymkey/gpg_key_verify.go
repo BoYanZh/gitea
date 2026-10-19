@@ -8,103 +8,70 @@ import (
 	"strconv"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/log"
 )
-
-//   __________________  ________   ____  __.
-//  /  _____/\______   \/  _____/  |    |/ _|____ ___.__.
-// /   \  ___ |     ___/   \  ___  |      <_/ __ <   |  |
-// \    \_\  \|    |   \    \_\  \ |    |  \  ___/\___  |
-//  \______  /|____|    \______  / |____|__ \___  > ____|
-//         \/                  \/          \/   \/\/
-// ____   ____           .__  _____
-// \   \ /   /___________|__|/ ____\__.__.
-//  \   Y   // __ \_  __ \  \   __<   |  |
-//   \     /\  ___/|  | \/  ||  |  \___  |
-//    \___/  \___  >__|  |__||__|  / ____|
-//               \/                \/
 
 // This file provides functions relating verifying gpg keys
 
 // VerifyGPGKey marks a GPG key as verified
 func VerifyGPGKey(ctx context.Context, ownerID int64, keyID, token, signature string) (string, error) {
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer committer.Close()
+	return db.WithTx2(ctx, func(ctx context.Context) (string, error) {
+		key := new(GPGKey)
 
-	key := new(GPGKey)
-
-	has, err := db.GetEngine(ctx).Where("owner_id = ? AND key_id = ?", ownerID, keyID).Get(key)
-	if err != nil {
-		return "", err
-	} else if !has {
-		return "", ErrGPGKeyNotExist{}
-	}
-
-	if err := key.LoadSubKeys(ctx); err != nil {
-		return "", err
-	}
-
-	sig, err := extractSignature(signature)
-	if err != nil {
-		return "", ErrGPGInvalidTokenSignature{
-			ID:      key.KeyID,
-			Wrapped: err,
+		has, err := db.GetEngine(ctx).Where("owner_id = ? AND key_id = ?", ownerID, keyID).Get(key)
+		if err != nil {
+			return "", err
+		} else if !has {
+			return "", ErrGPGKeyNotExist{}
 		}
-	}
 
-	signer, err := hashAndVerifyWithSubKeys(sig, token, key)
-	if err != nil {
-		return "", ErrGPGInvalidTokenSignature{
-			ID:      key.KeyID,
-			Wrapped: err,
+		if err := key.LoadSubKeys(ctx); err != nil {
+			return "", err
 		}
-	}
-	if signer == nil {
-		signer, err = hashAndVerifyWithSubKeys(sig, token+"\n", key)
+
+		sig, err := ExtractSignature(signature)
 		if err != nil {
 			return "", ErrGPGInvalidTokenSignature{
 				ID:      key.KeyID,
 				Wrapped: err,
 			}
 		}
-	}
-	if signer == nil {
-		signer, err = hashAndVerifyWithSubKeys(sig, token+"\n\n", key)
-		if err != nil {
-			return "", ErrGPGInvalidTokenSignature{
-				ID:      key.KeyID,
-				Wrapped: err,
+
+		var signer *GPGKey
+		for _, tokenCandidate := range []string{token, token + "\n", token + "\n\n", token + "\r\n", token + "\r\n\r\n"} {
+			signer, err = hashAndVerifyWithSubKeys(sig, tokenCandidate, key)
+			if err != nil {
+				return "", ErrGPGInvalidTokenSignature{
+					ID:      key.KeyID,
+					Wrapped: err,
+				}
+			}
+			if signer != nil {
+				break
 			}
 		}
-	}
 
-	if signer == nil {
-		log.Error("Unable to validate token signature. Error: %v", err)
-		return "", ErrGPGInvalidTokenSignature{
-			ID: key.KeyID,
+		if signer == nil {
+			log.Debug("VerifyGPGKey failed: no signer")
+			return "", ErrGPGInvalidTokenSignature{
+				ID: key.KeyID,
+			}
 		}
-	}
 
-	if signer.PrimaryKeyID != key.KeyID && signer.KeyID != key.KeyID {
-		return "", ErrGPGKeyNotExist{}
-	}
+		if signer.PrimaryKeyID != key.KeyID && signer.KeyID != key.KeyID {
+			return "", ErrGPGKeyNotExist{}
+		}
 
-	key.Verified = true
-	if _, err := db.GetEngine(ctx).ID(key.ID).SetExpr("verified", true).Update(new(GPGKey)); err != nil {
-		return "", err
-	}
+		key.Verified = true
+		if _, err := db.GetEngine(ctx).ID(key.ID).Cols("verified").Update(key); err != nil {
+			return "", err
+		}
 
-	if err := committer.Commit(); err != nil {
-		return "", err
-	}
-
-	return key.KeyID, nil
+		return key.KeyID, nil
+	})
 }
 
 // VerificationToken returns token for the user that will be valid in minutes (time)

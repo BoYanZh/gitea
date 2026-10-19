@@ -4,25 +4,24 @@
 package integration
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"testing"
+	"time"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/gitrepo"
-	"code.gitea.io/gitea/modules/setting"
-	gitea_context "code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/migrations"
-	mirror_service "code.gitea.io/gitea/services/mirror"
-	repo_service "code.gitea.io/gitea/services/repository"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	mirror_service "gitea.dev/services/mirror"
+	repo_service "gitea.dev/services/repository"
+	wiki_service "gitea.dev/services/wiki"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,91 +30,155 @@ func TestMirrorPush(t *testing.T) {
 	onGiteaRun(t, testMirrorPush)
 }
 
+func TestMirrorPushWikiDefaultBranchMismatch(t *testing.T) {
+	onGiteaRun(t, testMirrorPushWikiDefaultBranchMismatch)
+}
+
 func testMirrorPush(t *testing.T, u *url.URL) {
-	defer tests.PrepareTestEnv(t)()
-
-	setting.Migrations.AllowLocalNetworks = true
-	assert.NoError(t, migrations.Init())
-
+	_ = db.TruncateBeans(t.Context(), &repo_model.PushMirror{})
 	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
 	srcRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
 
-	mirrorRepo, err := repo_service.CreateRepositoryDirectly(db.DefaultContext, user, user, repo_service.CreateRepoOptions{
+	mirrorRepo, err := repo_service.CreateRepositoryDirectly(t.Context(), user, user, repo_service.CreateRepoOptions{
 		Name: "test-push-mirror",
-	})
+	}, true)
 	assert.NoError(t, err)
 
-	ctx := NewAPITestContext(t, user.LowerName, srcRepo.Name)
+	session := loginUser(t, user.Name)
 
-	doCreatePushMirror(ctx, fmt.Sprintf("%s%s/%s", u.String(), url.PathEscape(ctx.Username), url.PathEscape(mirrorRepo.Name)), user.LowerName, userPassword)(t)
+	pushMirrorURL := fmt.Sprintf("%s%s/%s", u.String(), url.PathEscape(user.Name), url.PathEscape(mirrorRepo.Name))
+	testCreatePushMirror(t, session, user.Name, srcRepo.Name, pushMirrorURL, user.LowerName, userPassword, "0")
 
-	mirrors, _, err := repo_model.GetPushMirrorsByRepoID(db.DefaultContext, srcRepo.ID, db.ListOptions{})
+	mirrors, _, err := repo_model.GetPushMirrorsByRepoID(t.Context(), srcRepo.ID, db.ListOptions{})
 	assert.NoError(t, err)
 	assert.Len(t, mirrors, 1)
 
-	ok := mirror_service.SyncPushMirror(context.Background(), mirrors[0].ID)
+	ok := mirror_service.SyncPushMirror(t.Context(), mirrors[0].ID)
 	assert.True(t, ok)
+	assert.NotZero(t, unittest.AssertExistsAndLoadBean(t, &repo_model.PushMirror{ID: mirrors[0].ID}).LastUpdateUnix)
 
-	srcGitRepo, err := gitrepo.OpenRepository(git.DefaultContext, srcRepo)
+	srcGitRepo, err := git.OpenRepository(t.Context(), srcRepo)
 	assert.NoError(t, err)
 	defer srcGitRepo.Close()
 
-	srcCommit, err := srcGitRepo.GetBranchCommit("master")
+	srcCommit, err := srcGitRepo.GetBranchCommit(t.Context(), "master")
 	assert.NoError(t, err)
 
-	mirrorGitRepo, err := gitrepo.OpenRepository(git.DefaultContext, mirrorRepo)
+	mirrorGitRepo, err := git.OpenRepository(t.Context(), mirrorRepo)
 	assert.NoError(t, err)
 	defer mirrorGitRepo.Close()
 
-	mirrorCommit, err := mirrorGitRepo.GetBranchCommit("master")
+	mirrorCommit, err := mirrorGitRepo.GetBranchCommit(t.Context(), "master")
 	assert.NoError(t, err)
 
 	assert.Equal(t, srcCommit.ID, mirrorCommit.ID)
 
+	defer test.MockVariableValue(&setting.Migrations.AllowedHostList, "")()
+	assert.False(t, mirror_service.SyncPushMirror(t.Context(), mirrors[0].ID))
+	assert.NotEmpty(t, unittest.AssertExistsAndLoadBean(t, &repo_model.PushMirror{ID: mirrors[0].ID}).LastError)
+
 	// Cleanup
-	doRemovePushMirror(ctx, fmt.Sprintf("%s%s/%s", u.String(), url.PathEscape(ctx.Username), url.PathEscape(mirrorRepo.Name)), user.LowerName, userPassword, int(mirrors[0].ID))(t)
-	mirrors, _, err = repo_model.GetPushMirrorsByRepoID(db.DefaultContext, srcRepo.ID, db.ListOptions{})
+	assert.True(t, doRemovePushMirror(t, session, user.Name, srcRepo.Name, mirrors[0].ID))
+	mirrors, _, err = repo_model.GetPushMirrorsByRepoID(t.Context(), srcRepo.ID, db.ListOptions{})
 	assert.NoError(t, err)
-	assert.Len(t, mirrors, 0)
+	assert.Empty(t, mirrors)
 }
 
-func doCreatePushMirror(ctx APITestContext, address, username, password string) func(t *testing.T) {
-	return func(t *testing.T) {
-		csrf := GetUserCSRFToken(t, ctx.Session)
+func testMirrorPushWikiDefaultBranchMismatch(t *testing.T, u *url.URL) {
+	_ = db.TruncateBeans(t.Context(), &repo_model.PushMirror{})
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	srcRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
 
-		req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/settings", url.PathEscape(ctx.Username), url.PathEscape(ctx.Reponame)), map[string]string{
-			"_csrf":                csrf,
-			"action":               "push-mirror-add",
-			"push_mirror_address":  address,
-			"push_mirror_username": username,
-			"push_mirror_password": password,
-			"push_mirror_interval": "0",
-		})
-		ctx.Session.MakeRequest(t, req, http.StatusSeeOther)
+	mirrorRepo, err := repo_service.CreateRepositoryDirectly(t.Context(), user, user, repo_service.CreateRepoOptions{
+		Name: "test-push-mirror-wiki",
+	}, true)
+	assert.NoError(t, err)
 
-		flashCookie := ctx.Session.GetCookie(gitea_context.CookieNameFlash)
-		assert.NotNil(t, flashCookie)
-		assert.Contains(t, flashCookie.Value, "success")
-	}
+	assert.NoError(t, wiki_service.AddWikiPage(t.Context(), user, mirrorRepo, wiki_service.WebPath("Home"), "Mirror wiki content", "init wiki"))
+
+	mirrorRepo.DefaultBranch = "mirror-head"
+	assert.NoError(t, repo_model.UpdateRepositoryColsNoAutoTime(t.Context(), mirrorRepo, "default_branch"))
+
+	wikiCommitID, err := git.GetBranchCommitID(t.Context(), mirrorRepo.WikiStorageRepo(), mirrorRepo.DefaultWikiBranch)
+	assert.NoError(t, err)
+	assert.NoError(t, git.CreateBranch(t.Context(), mirrorRepo.WikiStorageRepo(), "mirror-head", wikiCommitID))
+
+	session := loginUser(t, user.Name)
+
+	pushMirrorURL := fmt.Sprintf("%s%s/%s", u.String(), url.PathEscape(user.Name), url.PathEscape(mirrorRepo.Name))
+	testCreatePushMirror(t, session, user.Name, srcRepo.Name, pushMirrorURL, user.LowerName, userPassword, "0")
+
+	mirrors, _, err := repo_model.GetPushMirrorsByRepoID(t.Context(), srcRepo.ID, db.ListOptions{})
+	assert.NoError(t, err)
+	assert.Len(t, mirrors, 1)
+
+	ok := mirror_service.SyncPushMirror(t.Context(), mirrors[0].ID)
+	assert.True(t, ok)
 }
 
-func doRemovePushMirror(ctx APITestContext, address, username, password string, pushMirrorID int) func(t *testing.T) {
-	return func(t *testing.T) {
-		csrf := GetUserCSRFToken(t, ctx.Session)
+func testCreatePushMirror(t *testing.T, session *TestSession, owner, repo, address, username, password, interval string) {
+	req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/settings", url.PathEscape(owner), url.PathEscape(repo)), map[string]string{
+		"action":               "push-mirror-add",
+		"push_mirror_address":  address,
+		"push_mirror_username": username,
+		"push_mirror_password": password,
+		"push_mirror_interval": interval,
+	})
+	session.MakeRequest(t, req, http.StatusSeeOther)
 
-		req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/settings", url.PathEscape(ctx.Username), url.PathEscape(ctx.Reponame)), map[string]string{
-			"_csrf":                csrf,
-			"action":               "push-mirror-remove",
-			"push_mirror_id":       strconv.Itoa(pushMirrorID),
-			"push_mirror_address":  address,
-			"push_mirror_username": username,
-			"push_mirror_password": password,
-			"push_mirror_interval": "0",
-		})
-		ctx.Session.MakeRequest(t, req, http.StatusSeeOther)
+	flashMsg := session.GetCookieFlashMessage()
+	assert.NotEmpty(t, flashMsg.SuccessMsg)
+}
 
-		flashCookie := ctx.Session.GetCookie(gitea_context.CookieNameFlash)
-		assert.NotNil(t, flashCookie)
-		assert.Contains(t, flashCookie.Value, "success")
-	}
+func doRemovePushMirror(t *testing.T, session *TestSession, owner, repo string, pushMirrorID int64) bool {
+	req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/settings", url.PathEscape(owner), url.PathEscape(repo)), map[string]string{
+		"action":         "push-mirror-remove",
+		"push_mirror_id": strconv.FormatInt(pushMirrorID, 10),
+	})
+	resp := session.MakeRequest(t, req, NoExpectedStatus)
+	flashMsg := session.GetCookieFlashMessage()
+	return resp.Code == http.StatusSeeOther && assert.NotEmpty(t, flashMsg.SuccessMsg)
+}
+
+func doUpdatePushMirror(t *testing.T, session *TestSession, owner, repo string, pushMirrorID int64, interval string) bool {
+	req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/settings", owner, repo), map[string]string{
+		"action":                 "push-mirror-update",
+		"push_mirror_id":         strconv.FormatInt(pushMirrorID, 10),
+		"push_mirror_interval":   interval,
+		"push_mirror_defer_sync": "true",
+	})
+	resp := session.MakeRequest(t, req, NoExpectedStatus)
+	return resp.Code == http.StatusSeeOther
+}
+
+func TestRepoSettingPushMirrorUpdate(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	session := loginUser(t, "user2")
+	repo2 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 2})
+	testCreatePushMirror(t, session, "user2", "repo2", "https://127.0.0.1/user1/repo1.git", "", "", "24h")
+
+	pushMirrors, cnt, err := repo_model.GetPushMirrorsByRepoID(t.Context(), repo2.ID, db.ListOptions{})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, cnt)
+	assert.Equal(t, 24*time.Hour, pushMirrors[0].Interval)
+	repo2PushMirrorID := pushMirrors[0].ID
+
+	// update repo2 push mirror
+	assert.True(t, doUpdatePushMirror(t, session, "user2", "repo2", repo2PushMirrorID, "10m0s"))
+	pushMirror := unittest.AssertExistsAndLoadBean(t, &repo_model.PushMirror{ID: repo2PushMirrorID})
+	assert.Equal(t, 10*time.Minute, pushMirror.Interval)
+
+	// avoid updating repo2 push mirror from repo1
+	assert.False(t, doUpdatePushMirror(t, session, "user2", "repo1", repo2PushMirrorID, "20m0s"))
+	pushMirror = unittest.AssertExistsAndLoadBean(t, &repo_model.PushMirror{ID: repo2PushMirrorID})
+	assert.Equal(t, 10*time.Minute, pushMirror.Interval) // not changed
+
+	// avoid deleting repo2 push mirror from repo1
+	assert.False(t, doRemovePushMirror(t, session, "user2", "repo1", repo2PushMirrorID))
+	unittest.AssertExistsAndLoadBean(t, &repo_model.PushMirror{ID: repo2PushMirrorID})
+
+	// delete repo2 push mirror
+	assert.True(t, doRemovePushMirror(t, session, "user2", "repo2", repo2PushMirrorID))
+	unittest.AssertNotExistsBean(t, &repo_model.PushMirror{ID: repo2PushMirrorID})
 }

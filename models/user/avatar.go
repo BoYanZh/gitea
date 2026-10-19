@@ -5,18 +5,18 @@ package user
 
 import (
 	"context"
-	"crypto/md5"
 	"fmt"
 	"image/png"
 	"io"
 
-	"code.gitea.io/gitea/models/avatars"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/avatar"
-	"code.gitea.io/gitea/modules/httplib"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/storage"
+	"gitea.dev/models/avatars"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/avatar"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	"gitea.dev/modules/util"
 )
 
 // CustomAvatarRelativePath returns user custom avatar relative path.
@@ -26,39 +26,28 @@ func (u *User) CustomAvatarRelativePath() string {
 
 // GenerateRandomAvatar generates a random avatar for user.
 func GenerateRandomAvatar(ctx context.Context, u *User) error {
-	seed := u.Email
-	if len(seed) == 0 {
-		seed = u.Name
-	}
+	seed := []byte(util.IfZero(u.Email, u.Name))
+	u.Avatar = avatar.HashAvatar(u.ID, seed)
 
-	img, err := avatar.RandomImage([]byte(seed))
-	if err != nil {
-		return fmt.Errorf("RandomImage: %w", err)
-	}
-
-	u.Avatar = avatars.HashEmail(seed)
-
-	// Don't share the images so that we can delete them easily
-	if err := storage.SaveFrom(storage.Avatars, u.CustomAvatarRelativePath(), func(w io.Writer) error {
-		if err := png.Encode(w, img); err != nil {
-			log.Error("Encode: %v", err)
+	// a failed Stat usually means the file is not there yet
+	if _, err := storage.Avatars.Stat(u.CustomAvatarRelativePath()); err != nil {
+		if err := storage.SaveFrom(storage.Avatars, u.CustomAvatarRelativePath(), func(w io.Writer) error {
+			return png.Encode(w, avatar.RandomImageDefaultSize(seed))
+		}); err != nil {
+			return fmt.Errorf("failed to save avatar %s: %w", u.CustomAvatarRelativePath(), err)
 		}
-		return err
-	}); err != nil {
-		return fmt.Errorf("Failed to create dir %s: %w", u.CustomAvatarRelativePath(), err)
 	}
 
 	if _, err := db.GetEngine(ctx).ID(u.ID).Cols("avatar").Update(u); err != nil {
 		return err
 	}
 
-	log.Info("New random avatar created: %d", u.ID)
 	return nil
 }
 
 // AvatarLinkWithSize returns a link to the user's avatar with size. size <= 0 means default size
 func (u *User) AvatarLinkWithSize(ctx context.Context, size int) string {
-	if u.IsGhost() {
+	if u.ID <= 0 {
 		return avatars.DefaultAvatarLink()
 	}
 
@@ -70,7 +59,7 @@ func (u *User) AvatarLinkWithSize(ctx context.Context, size int) string {
 	switch {
 	case u.UseCustomAvatar:
 		useLocalAvatar = true
-	case disableGravatar, setting.OfflineMode:
+	case disableGravatar:
 		useLocalAvatar = true
 		autoGenerateAvatar = true
 	}
@@ -101,7 +90,7 @@ func (u *User) IsUploadAvatarChanged(data []byte) bool {
 	if !u.UseCustomAvatar || len(u.Avatar) == 0 {
 		return true
 	}
-	avatarID := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%d-%x", u.ID, md5.Sum(data)))))
+	avatarID := avatar.HashAvatar(u.ID, data)
 	return u.Avatar != avatarID
 }
 

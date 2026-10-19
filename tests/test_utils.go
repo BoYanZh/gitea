@@ -1,181 +1,55 @@
 // Copyright 2017 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//nolint:forbidigo
 package tests
 
 import (
-	"context"
-	"database/sql"
-	"fmt"
-	"os"
-	"path"
 	"path/filepath"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	packages_model "code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
-	repo_module "code.gitea.io/gitea/modules/repository"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/storage"
-	"code.gitea.io/gitea/modules/testlogger"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/routers"
+	"gitea.dev/models/db"
+	packages_model "gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
+	"gitea.dev/modules/testlogger"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func exitf(format string, args ...any) {
-	fmt.Printf(format+"\n", args...)
-	os.Exit(1)
-}
+func InitIntegrationTest() (workPath string, err error) {
+	testlogger.Init()
 
-func InitTest(requireGitea bool) {
-	log.RegisterEventWriter("test", testlogger.NewTestLoggerWriter)
-
-	giteaRoot := base.SetupGiteaRoot()
-	if giteaRoot == "" {
-		exitf("Environment variable $GITEA_ROOT not set")
+	workPath, err = setting.PrepareIntegrationTestConfig()
+	if err != nil {
+		return "", err
 	}
 
-	// TODO: Speedup tests that rely on the event source ticker, confirm whether there is any bug or failure.
-	// setting.UI.Notification.EventSourceUpdateTime = time.Second
-
-	setting.AppWorkPath = giteaRoot
-	setting.CustomPath = filepath.Join(setting.AppWorkPath, "custom")
-	if requireGitea {
-		giteaBinary := "gitea"
-		if setting.IsWindows {
-			giteaBinary += ".exe"
-		}
-		setting.AppPath = path.Join(giteaRoot, giteaBinary)
-		if _, err := os.Stat(setting.AppPath); err != nil {
-			exitf("Could not find gitea binary at %s", setting.AppPath)
-		}
-	}
-	giteaConf := os.Getenv("GITEA_CONF")
-	if giteaConf == "" {
-		// By default, use sqlite.ini for testing, then IDE like GoLand can start the test process with debugger.
-		// It's easier for developers to debug bugs step by step with a debugger.
-		// Notice: when doing "ssh push", Gitea executes sub processes, debugger won't work for the sub processes.
-		giteaConf = "tests/sqlite.ini"
-		_ = os.Setenv("GITEA_CONF", giteaConf)
-		fmt.Printf("Environment variable $GITEA_CONF not set, use default: %s\n", giteaConf)
-		if !setting.EnableSQLite3 {
-			exitf(`sqlite3 requires: import _ "github.com/mattn/go-sqlite3" or -tags sqlite,sqlite_unlock_notify`)
-		}
-	}
-	if !path.IsAbs(giteaConf) {
-		setting.CustomConf = filepath.Join(giteaRoot, giteaConf)
-	} else {
-		setting.CustomConf = giteaConf
-	}
-
-	unittest.InitSettings()
+	setting.SetupGiteaTestEnv()
 	setting.Repository.DefaultBranch = "master" // many test code still assume that default branch is called "master"
-	_ = util.RemoveAll(repo_module.LocalCopyPath())
 
-	if err := git.InitFull(context.Background()); err != nil {
-		log.Fatal("git.InitOnceWithSync: %v", err)
+	if err := git.InitFull(); err != nil {
+		return "", err
 	}
 
+	setting.Database.SlowQueryThreshold = 0
 	setting.LoadDBSetting()
-	if err := storage.Init(); err != nil {
-		exitf("Init storage failed: %v", err)
+	cleanupDb, err := unittest.ResetTestDatabase()
+	if err != nil {
+		return "", err
 	}
+	_ = cleanupDb // no clean up yet (not really needed at the moment)
 
-	switch {
-	case setting.Database.Type.IsMySQL():
-		connType := "tcp"
-		if len(setting.Database.Host) > 0 && setting.Database.Host[0] == '/' { // looks like a unix socket
-			connType = "unix"
-		}
-
-		db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@%s(%s)/",
-			setting.Database.User, setting.Database.Passwd, connType, setting.Database.Host))
-		defer db.Close()
-		if err != nil {
-			log.Fatal("sql.Open: %v", err)
-		}
-		if _, err = db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", setting.Database.Name)); err != nil {
-			log.Fatal("db.Exec: %v", err)
-		}
-	case setting.Database.Type.IsPostgreSQL():
-		var db *sql.DB
-		var err error
-		if setting.Database.Host[0] == '/' {
-			db, err = sql.Open("postgres", fmt.Sprintf("postgres://%s:%s@/%s?sslmode=%s&host=%s",
-				setting.Database.User, setting.Database.Passwd, setting.Database.Name, setting.Database.SSLMode, setting.Database.Host))
-		} else {
-			db, err = sql.Open("postgres", fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
-				setting.Database.User, setting.Database.Passwd, setting.Database.Host, setting.Database.Name, setting.Database.SSLMode))
-		}
-
-		defer db.Close()
-		if err != nil {
-			log.Fatal("sql.Open: %v", err)
-		}
-		dbrows, err := db.Query(fmt.Sprintf("SELECT 1 FROM pg_database WHERE datname = '%s'", setting.Database.Name))
-		if err != nil {
-			log.Fatal("db.Query: %v", err)
-		}
-		defer dbrows.Close()
-
-		if !dbrows.Next() {
-			if _, err = db.Exec(fmt.Sprintf("CREATE DATABASE %s", setting.Database.Name)); err != nil {
-				log.Fatal("db.Exec: CREATE DATABASE: %v", err)
-			}
-		}
-		// Check if we need to setup a specific schema
-		if len(setting.Database.Schema) == 0 {
-			break
-		}
-		db.Close()
-
-		if setting.Database.Host[0] == '/' {
-			db, err = sql.Open("postgres", fmt.Sprintf("postgres://%s:%s@/%s?sslmode=%s&host=%s",
-				setting.Database.User, setting.Database.Passwd, setting.Database.Name, setting.Database.SSLMode, setting.Database.Host))
-		} else {
-			db, err = sql.Open("postgres", fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
-				setting.Database.User, setting.Database.Passwd, setting.Database.Host, setting.Database.Name, setting.Database.SSLMode))
-		}
-		// This is a different db object; requires a different Close()
-		defer db.Close()
-		if err != nil {
-			log.Fatal("sql.Open: %v", err)
-		}
-		schrows, err := db.Query(fmt.Sprintf("SELECT 1 FROM information_schema.schemata WHERE schema_name = '%s'", setting.Database.Schema))
-		if err != nil {
-			log.Fatal("db.Query: %v", err)
-		}
-		defer schrows.Close()
-
-		if !schrows.Next() {
-			// Create and setup a DB schema
-			if _, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s", setting.Database.Schema)); err != nil {
-				log.Fatal("db.Exec: CREATE SCHEMA: %v", err)
-			}
-		}
-
-	case setting.Database.Type.IsMSSQL():
-		host, port := setting.ParseMSSQLHostPort(setting.Database.Host)
-		db, err := sql.Open("mssql", fmt.Sprintf("server=%s; port=%s; database=%s; user id=%s; password=%s;",
-			host, port, "master", setting.Database.User, setting.Database.Passwd))
-		if err != nil {
-			log.Fatal("sql.Open: %v", err)
-		}
-		if _, err := db.Exec(fmt.Sprintf("If(db_id(N'%s') IS NULL) BEGIN CREATE DATABASE %s; END;", setting.Database.Name, setting.Database.Name)); err != nil {
-			log.Fatal("db.Exec: %v", err)
-		}
-		defer db.Close()
+	if err := storage.Init(); err != nil {
+		return "", err
 	}
 
 	routers.InitWebInstalled(graceful.GetManager().HammerContext())
+	return workPath, nil
 }
 
 func PrepareAttachmentsStorage(t testing.TB) {
@@ -192,43 +66,30 @@ func PrepareAttachmentsStorage(t testing.TB) {
 	}))
 }
 
-func PrepareTestEnv(t testing.TB, skip ...int) func() {
-	t.Helper()
-	ourSkip := 1
-	if len(skip) > 0 {
-		ourSkip += skip[0]
+func PrepareGitRepoDirectory(t testing.TB) {
+	if !assert.NotEmpty(t, setting.RepoRootPath) {
+		return
 	}
-	deferFn := PrintCurrentTest(t, ourSkip)
+	assert.NoError(t, unittest.SyncDirs(filepath.Join(setting.GetGiteaTestSourceRoot(), "tests/gitea-repositories-meta"), setting.RepoRootPath))
+}
 
-	// load database fixtures
-	assert.NoError(t, unittest.LoadFixtures())
+func PrepareArtifactsStorage(t testing.TB) {
+	// prepare actions artifacts directory and files
+	assert.NoError(t, storage.Clean(storage.ActionsArtifacts))
 
-	// load git repo fixtures
-	assert.NoError(t, util.RemoveAll(setting.RepoRootPath))
-	assert.NoError(t, unittest.CopyDir(path.Join(filepath.Dir(setting.AppPath), "tests/gitea-repositories-meta"), setting.RepoRootPath))
-	ownerDirs, err := os.ReadDir(setting.RepoRootPath)
-	if err != nil {
-		assert.NoError(t, err, "unable to read the new repo root: %v\n", err)
-	}
-	for _, ownerDir := range ownerDirs {
-		if !ownerDir.Type().IsDir() {
-			continue
-		}
-		repoDirs, err := os.ReadDir(filepath.Join(setting.RepoRootPath, ownerDir.Name()))
-		if err != nil {
-			assert.NoError(t, err, "unable to read the new repo root: %v\n", err)
-		}
-		for _, repoDir := range repoDirs {
-			_ = os.MkdirAll(filepath.Join(setting.RepoRootPath, ownerDir.Name(), repoDir.Name(), "objects", "pack"), 0o755)
-			_ = os.MkdirAll(filepath.Join(setting.RepoRootPath, ownerDir.Name(), repoDir.Name(), "objects", "info"), 0o755)
-			_ = os.MkdirAll(filepath.Join(setting.RepoRootPath, ownerDir.Name(), repoDir.Name(), "refs", "heads"), 0o755)
-			_ = os.MkdirAll(filepath.Join(setting.RepoRootPath, ownerDir.Name(), repoDir.Name(), "refs", "tag"), 0o755)
-			_ = os.MkdirAll(filepath.Join(setting.RepoRootPath, ownerDir.Name(), repoDir.Name(), "refs", "pull"), 0o755)
-		}
-	}
+	s, err := storage.NewStorage(setting.LocalStorageType, &setting.Storage{
+		Path: filepath.Join(filepath.Dir(setting.AppPath), "tests", "testdata", "data", "artifacts"),
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, s.IterateObjects("", func(p string, obj storage.Object) error {
+		_, err = storage.Copy(storage.ActionsArtifacts, p, s, p)
+		return err
+	}))
+}
 
+func PrepareLFSStorage(t testing.TB) {
 	// load LFS object fixtures
-	// (LFS storage can be on any of several backends, including remote servers, so we init it with the storage API)
+	// (LFS storage can be on any of several backends, including remote servers, so init it with the storage API)
 	lfsFixtures, err := storage.NewStorage(setting.LocalStorageType, &setting.Storage{
 		Path: filepath.Join(filepath.Dir(setting.AppPath), "tests/gitea-lfs-meta"),
 	})
@@ -238,9 +99,11 @@ func PrepareTestEnv(t testing.TB, skip ...int) func() {
 		_, err := storage.Copy(storage.LFS, path, lfsFixtures, path)
 		return err
 	}))
+}
 
+func PrepareCleanPackageData(t testing.TB) {
 	// clear all package data
-	assert.NoError(t, db.TruncateBeans(db.DefaultContext,
+	assert.NoError(t, db.TruncateBeans(t.Context(),
 		&packages_model.Package{},
 		&packages_model.PackageVersion{},
 		&packages_model.PackageFile{},
@@ -250,20 +113,23 @@ func PrepareTestEnv(t testing.TB, skip ...int) func() {
 		&packages_model.PackageCleanupRule{},
 	))
 	assert.NoError(t, storage.Clean(storage.Packages))
+}
 
+func PrepareTestEnv(t testing.TB, skip ...int) func() {
+	t.Helper()
+	deferFn := PrintCurrentTest(t, util.OptionalArg(skip)+1)
+
+	// load database fixtures
+	assert.NoError(t, unittest.LoadFixtures())
+
+	// do not add more Prepare* functions here, only call necessary ones in the related test functions
+	PrepareGitRepoDirectory(t)
+	PrepareLFSStorage(t)
+	PrepareCleanPackageData(t)
 	return deferFn
 }
 
 func PrintCurrentTest(t testing.TB, skip ...int) func() {
 	t.Helper()
-	actualSkip := 1
-	if len(skip) > 0 {
-		actualSkip = skip[0] + 1
-	}
-	return testlogger.PrintCurrentTest(t, actualSkip)
-}
-
-// Printf takes a format and args and prints the string to os.Stdout
-func Printf(format string, args ...any) {
-	testlogger.Printf(format, args...)
+	return testlogger.PrintCurrentTest(t, util.OptionalArg(skip)+1)
 }

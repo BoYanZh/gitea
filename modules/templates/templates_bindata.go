@@ -3,6 +3,21 @@
 
 //go:build bindata
 
+//go:generate go run ../../build/generate-bindata.go ../../templates bindata.dat
+
 package templates
 
-//go:generate go run ../../build/generate-bindata.go ../../templates templates bindata.go true
+import (
+	"sync"
+
+	"gitea.dev/modules/assetfs"
+
+	_ "embed"
+)
+
+//go:embed bindata.dat
+var bindata []byte
+
+var BuiltinAssets = sync.OnceValue(func() *assetfs.Layer {
+	return assetfs.Bindata("builtin(bindata)", assetfs.NewEmbeddedFS(bindata))
+})

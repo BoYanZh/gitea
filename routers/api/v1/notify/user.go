@@ -7,11 +7,12 @@ import (
 	"net/http"
 	"time"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
+	activities_model "gitea.dev/models/activities"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/structs"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	"gitea.dev/services/notifications"
 )
 
 // ListNotifications list users's notification threads
@@ -71,21 +72,22 @@ func ListNotifications(ctx *context.APIContext) {
 
 	totalCount, err := db.Count[activities_model.Notification](ctx, opts)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	nl, err := db.Find[activities_model.Notification](ctx, opts)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	err = activities_model.NotificationList(nl).LoadAttributes(ctx)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
+	ctx.SetLinkHeader(totalCount, opts.PageSize)
 	ctx.SetTotalCountHeader(totalCount)
 	ctx.JSON(http.StatusOK, convert.ToNotifications(ctx, nl))
 }
@@ -133,7 +135,7 @@ func ReadNotifications(ctx *context.APIContext) {
 	if len(qLastRead) > 0 {
 		tmpLastRead, err := time.Parse(time.RFC3339, qLastRead)
 		if err != nil {
-			ctx.Error(http.StatusBadRequest, "Parse", err)
+			ctx.APIError(http.StatusBadRequest, err.Error())
 			return
 		}
 		if !tmpLastRead.IsZero() {
@@ -150,7 +152,7 @@ func ReadNotifications(ctx *context.APIContext) {
 	}
 	nl, err := db.Find[activities_model.Notification](ctx, opts)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -159,14 +161,13 @@ func ReadNotifications(ctx *context.APIContext) {
 		targetStatus = activities_model.NotificationStatusRead
 	}
 
-	changed := make([]*structs.NotificationThread, 0, len(nl))
-
-	for _, n := range nl {
-		notif, err := activities_model.SetNotificationStatus(ctx, n.ID, ctx.Doer, targetStatus)
-		if err != nil {
-			ctx.InternalServerError(err)
-			return
-		}
+	updated, err := notifications.SetManyNotificationStatuses(ctx, nl, ctx.Doer, targetStatus)
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return
+	}
+	changed := make([]*structs.NotificationThread, 0, len(updated))
+	for _, notif := range updated {
 		_ = notif.LoadAttributes(ctx)
 		changed = append(changed, convert.ToNotificationThread(ctx, notif))
 	}

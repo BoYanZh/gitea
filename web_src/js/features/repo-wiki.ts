@@ -1,18 +1,17 @@
-import {initMarkupContent} from '../markup/content.ts';
 import {validateTextareaNonEmpty, initComboMarkdownEditor} from './comp/ComboMarkdownEditor.ts';
 import {fomanticMobileScreen} from '../modules/fomantic.ts';
 import {POST} from '../modules/fetch.ts';
+import type {ComboMarkdownEditor} from './comp/ComboMarkdownEditor.ts';
+import {html, htmlRaw} from '../utils/html.ts';
+import {registerGlobalInitFunc} from '../modules/observer.ts';
 
-async function initRepoWikiFormEditor() {
-  const editArea = document.querySelector<HTMLTextAreaElement>('.repository.wiki .combo-markdown-editor textarea');
-  if (!editArea) return;
-
-  const form = document.querySelector('.repository.wiki.new .ui.form');
-  const editorContainer = form.querySelector<HTMLElement>('.combo-markdown-editor');
-  let editor;
+async function initRepoWikiForm(form: HTMLFormElement) {
+  const editorContainer = form.querySelector<HTMLElement>('.combo-markdown-editor')!;
+  const editArea = editorContainer.querySelector<HTMLTextAreaElement>('textarea')!;
+  let editor: ComboMarkdownEditor;
 
   let renderRequesting = false;
-  let lastContent;
+  let lastContent: string = '';
   const renderEasyMDEPreview = async function () {
     if (renderRequesting) return;
 
@@ -26,13 +25,11 @@ async function initRepoWikiFormEditor() {
       formData.append('mode', editor.previewMode);
       formData.append('context', editor.previewContext);
       formData.append('text', newContent);
-      formData.append('wiki', editor.previewWiki);
       try {
         const response = await POST(editor.previewUrl, {data: formData});
         const data = await response.text();
         lastContent = newContent;
-        previewTarget.innerHTML = `<div class="markup ui segment">${data}</div>`;
-        initMarkupContent();
+        previewTarget.innerHTML = html`<div class="render-content markup ui segment">${htmlRaw(data)}</div>`;
       } catch (error) {
         console.error('Error rendering preview:', error);
       } finally {
@@ -46,13 +43,10 @@ async function initRepoWikiFormEditor() {
   renderEasyMDEPreview();
 
   editor = await initComboMarkdownEditor(editorContainer, {
-    useScene: 'wiki',
     // EasyMDE has some problems of height definition, it has inline style height 300px by default, so we also use inline styles to override it.
     // And another benefit is that we only need to write the style once for both editors.
     // TODO: Move height style to CSS after EasyMDE removal.
     editorHeights: {minHeight: '300px', height: 'calc(100vh - 600px)'},
-    previewMode: 'gfm',
-    previewWiki: true,
     easyMDEOptions: {
       previewRender: (_content, previewTarget) => previewTarget.innerHTML, // disable builtin preview render
       toolbar: ['bold', 'italic', 'strikethrough', '|',
@@ -73,17 +67,13 @@ async function initRepoWikiFormEditor() {
   });
 }
 
-function collapseWikiTocForMobile(collapse) {
-  if (collapse) {
-    document.querySelector('.wiki-content-toc details')?.removeAttribute('open');
-  }
-}
-
-export function initRepoWikiForm() {
-  if (!document.querySelector('.page-content.repository.wiki')) return;
-
-  fomanticMobileScreen.addEventListener('change', (e) => collapseWikiTocForMobile(e.matches));
-  collapseWikiTocForMobile(fomanticMobileScreen.matches);
-
-  initRepoWikiFormEditor();
+export function initRepoWiki() {
+  registerGlobalInitFunc('initRepoWikiSidebarToc', (el) => {
+    const collapseWikiTocForMobile = (collapse: boolean) => {
+      if (collapse) el.querySelector('details')?.removeAttribute('open');
+    };
+    fomanticMobileScreen.addEventListener('change', (e) => collapseWikiTocForMobile(e.matches));
+    collapseWikiTocForMobile(fomanticMobileScreen.matches);
+  });
+  registerGlobalInitFunc('initRepoWikiForm', initRepoWikiForm);
 }

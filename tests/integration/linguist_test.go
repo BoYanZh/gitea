@@ -4,21 +4,20 @@
 package integration
 
 import (
-	"context"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/indexer/stats"
-	"code.gitea.io/gitea/modules/queue"
-	repo_service "code.gitea.io/gitea/services/repository"
-	files_service "code.gitea.io/gitea/services/repository/files"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/indexer/stats"
+	"gitea.dev/modules/queue"
+	repo_service "gitea.dev/services/repository"
+	files_service "gitea.dev/services/repository/files"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -215,45 +214,68 @@ func TestLinguist(t *testing.T) {
 				},
 				ExpectedLanguageOrder: []string{"Markdown"},
 			},
+			// case 14: linguist-detectable on a configuration/data file (YAML) without linguist-language
+			{
+				GitAttributesContent: "*.yaml linguist-detectable",
+				FilesToAdd: []*files_service.ChangeRepoFile{
+					{
+						TreePath:      "config.yaml",
+						ContentReader: strings.NewReader("name: test\ndescription: A test yaml file\n"),
+					},
+				},
+				ExpectedLanguageOrder: []string{"YAML"},
+			},
+			// case 15: linguist-language alias should resolve to its canonical language
+			{
+				GitAttributesContent: "*.cpp linguist-language=golang",
+				FilesToAdd: []*files_service.ChangeRepoFile{
+					{
+						TreePath:      "cplusplus.cpp",
+						ContentReader: strings.NewReader(cppContent),
+					},
+				},
+				ExpectedLanguageOrder: []string{"Go"},
+			},
 		}
 
 		for i, c := range cases {
-			repo, err := repo_service.CreateRepository(db.DefaultContext, user, user, repo_service.CreateRepoOptions{
-				Name: "linguist-test",
+			t.Run("Case-"+strconv.Itoa(i), func(t *testing.T) {
+				defer tests.PrintCurrentTest(t)()
+				repo, err := repo_service.CreateRepository(t.Context(), user, user, repo_service.CreateRepoOptions{
+					Name: "linguist-test-" + strconv.Itoa(i),
+				})
+				assert.NoError(t, err)
+
+				files := []*files_service.ChangeRepoFile{
+					{
+						TreePath:      ".gitattributes",
+						ContentReader: strings.NewReader(c.GitAttributesContent),
+					},
+				}
+				files = append(files, c.FilesToAdd...)
+				for _, f := range files {
+					f.Operation = "create"
+				}
+
+				_, err = files_service.ChangeRepoFiles(t.Context(), repo, user, &files_service.ChangeRepoFilesOptions{
+					Files:     files,
+					OldBranch: repo.DefaultBranch,
+					NewBranch: repo.DefaultBranch,
+				})
+				assert.NoError(t, err)
+
+				assert.NoError(t, stats.UpdateRepoIndexer(repo))
+				assert.NoError(t, queue.GetManager().FlushAll(t.Context(), 10*time.Second))
+
+				stats, err := repo_model.GetTopLanguageStats(t.Context(), repo, len(c.FilesToAdd))
+				assert.NoError(t, err)
+
+				languages := make([]string, 0, len(stats))
+				for _, s := range stats {
+					languages = append(languages, s.Language)
+				}
+				assert.Equal(t, c.ExpectedLanguageOrder, languages, "case %d: unexpected language stats", i)
 			})
-			assert.NoError(t, err)
-
-			files := []*files_service.ChangeRepoFile{
-				{
-					TreePath:      ".gitattributes",
-					ContentReader: strings.NewReader(c.GitAttributesContent),
-				},
-			}
-			files = append(files, c.FilesToAdd...)
-			for _, f := range files {
-				f.Operation = "create"
-			}
-
-			_, err = files_service.ChangeRepoFiles(git.DefaultContext, repo, user, &files_service.ChangeRepoFilesOptions{
-				Files:     files,
-				OldBranch: repo.DefaultBranch,
-				NewBranch: repo.DefaultBranch,
-			})
-			assert.NoError(t, err)
-
-			assert.NoError(t, stats.UpdateRepoIndexer(repo))
-			assert.NoError(t, queue.GetManager().FlushAll(context.Background(), 10*time.Second))
-
-			stats, err := repo_model.GetTopLanguageStats(db.DefaultContext, repo, len(c.FilesToAdd))
-			assert.NoError(t, err)
-
-			languages := make([]string, 0, len(stats))
-			for _, s := range stats {
-				languages = append(languages, s.Language)
-			}
-			assert.Equal(t, c.ExpectedLanguageOrder, languages, "case %d: unexpected language stats", i)
-
-			assert.NoError(t, repo_service.DeleteRepository(db.DefaultContext, user, repo, false))
 		}
 	})
 }

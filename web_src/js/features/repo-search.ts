@@ -1,22 +1,12 @@
+import {registerGlobalInitFunc} from '../modules/observer.ts';
+import {addDelegatedEventListener, queryElems} from '../utils/dom.ts';
+
 export function initRepositorySearch() {
-  const repositorySearchForm = document.querySelector('#repo-search-form');
-  if (!repositorySearchForm) return;
-
-  repositorySearchForm.addEventListener('change', (e) => {
-    e.preventDefault();
-
-    const formData = new FormData(repositorySearchForm);
-    const params = new URLSearchParams(formData);
-
-    if (e.target.name === 'clear-filter') {
-      params.delete('archived');
-      params.delete('fork');
-      params.delete('mirror');
-      params.delete('template');
-      params.delete('private');
-    }
-
-    params.delete('clear-filter');
-    window.location.search = params.toString();
+  registerGlobalInitFunc('initRepositorySearch', (form: HTMLFormElement) => {
+    addDelegatedEventListener(form, 'change', 'input[type="radio"]', () => form.submit());
+    form.querySelector('.repo-search-filter-reset')!.addEventListener('click', () => {
+      queryElems(form, 'input[type="radio"]', (el: HTMLInputElement) => el.checked = false);
+      form.submit();
+    });
   });
 }

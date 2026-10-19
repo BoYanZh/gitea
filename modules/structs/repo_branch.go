@@ -9,22 +9,34 @@ import (
 
 // Branch represents a repository branch
 type Branch struct {
-	Name                          string         `json:"name"`
-	Commit                        *PayloadCommit `json:"commit"`
-	Protected                     bool           `json:"protected"`
-	RequiredApprovals             int64          `json:"required_approvals"`
-	EnableStatusCheck             bool           `json:"enable_status_check"`
-	StatusCheckContexts           []string       `json:"status_check_contexts"`
-	UserCanPush                   bool           `json:"user_can_push"`
-	UserCanMerge                  bool           `json:"user_can_merge"`
-	EffectiveBranchProtectionName string         `json:"effective_branch_protection_name"`
+	// Name is the branch name
+	Name string `json:"name"`
+	// Commit contains the latest commit information for this branch
+	Commit *PayloadCommit `json:"commit"`
+	// Protected indicates if the branch is protected
+	Protected bool `json:"protected"`
+	// RequiredApprovals is the number of required approvals for pull requests
+	RequiredApprovals int64 `json:"required_approvals"`
+	// EnableStatusCheck indicates if status checks are enabled
+	EnableStatusCheck bool `json:"enable_status_check"`
+	// StatusCheckContexts contains the list of required status check contexts
+	StatusCheckContexts []string `json:"status_check_contexts"`
+	// UserCanPush indicates if the current user can push to this branch
+	UserCanPush bool `json:"user_can_push"`
+	// UserCanMerge indicates if the current user can merge to this branch
+	UserCanMerge bool `json:"user_can_merge"`
+	// EffectiveBranchProtectionName is the name of the effective branch protection rule
+	EffectiveBranchProtectionName string `json:"effective_branch_protection_name"`
 }
 
 // BranchProtection represents a branch protection for a repository
 type BranchProtection struct {
 	// Deprecated: true
-	BranchName                    string   `json:"branch_name"`
-	RuleName                      string   `json:"rule_name"`
+	BranchName string `json:"branch_name"`
+	// RuleName is the name of the branch protection rule
+	RuleName string `json:"rule_name"`
+	// Priority is the priority of this branch protection rule
+	Priority                      int64    `json:"priority"`
 	EnablePush                    bool     `json:"enable_push"`
 	EnablePushWhitelist           bool     `json:"enable_push_whitelist"`
 	PushWhitelistUsernames        []string `json:"push_whitelist_usernames"`
@@ -35,9 +47,16 @@ type BranchProtection struct {
 	ForcePushAllowlistUsernames   []string `json:"force_push_allowlist_usernames"`
 	ForcePushAllowlistTeams       []string `json:"force_push_allowlist_teams"`
 	ForcePushAllowlistDeployKeys  bool     `json:"force_push_allowlist_deploy_keys"`
+	EnableDeletion                bool     `json:"enable_deletion"`
+	EnableDeletionAllowlist       bool     `json:"enable_deletion_allowlist"`
+	DeletionAllowlistUsernames    []string `json:"deletion_allowlist_usernames"`
+	DeletionAllowlistTeams        []string `json:"deletion_allowlist_teams"`
 	EnableMergeWhitelist          bool     `json:"enable_merge_whitelist"`
 	MergeWhitelistUsernames       []string `json:"merge_whitelist_usernames"`
 	MergeWhitelistTeams           []string `json:"merge_whitelist_teams"`
+	EnableBypassAllowlist         bool     `json:"enable_bypass_allowlist"`
+	BypassAllowlistUsernames      []string `json:"bypass_allowlist_usernames"`
+	BypassAllowlistTeams          []string `json:"bypass_allowlist_teams"`
 	EnableStatusCheck             bool     `json:"enable_status_check"`
 	StatusCheckContexts           []string `json:"status_check_contexts"`
 	RequiredApprovals             int64    `json:"required_approvals"`
@@ -46,6 +65,7 @@ type BranchProtection struct {
 	ApprovalsWhitelistTeams       []string `json:"approvals_whitelist_teams"`
 	BlockOnRejectedReviews        bool     `json:"block_on_rejected_reviews"`
 	BlockOnOfficialReviewRequests bool     `json:"block_on_official_review_requests"`
+	BlockOnCodeownerReviews       bool     `json:"block_on_codeowner_reviews"`
 	BlockOnOutdatedBranch         bool     `json:"block_on_outdated_branch"`
 	DismissStaleApprovals         bool     `json:"dismiss_stale_approvals"`
 	IgnoreStaleApprovals          bool     `json:"ignore_stale_approvals"`
@@ -64,6 +84,7 @@ type CreateBranchProtectionOption struct {
 	// Deprecated: true
 	BranchName                    string   `json:"branch_name"`
 	RuleName                      string   `json:"rule_name"`
+	Priority                      int64    `json:"priority"`
 	EnablePush                    bool     `json:"enable_push"`
 	EnablePushWhitelist           bool     `json:"enable_push_whitelist"`
 	PushWhitelistUsernames        []string `json:"push_whitelist_usernames"`
@@ -74,9 +95,16 @@ type CreateBranchProtectionOption struct {
 	ForcePushAllowlistUsernames   []string `json:"force_push_allowlist_usernames"`
 	ForcePushAllowlistTeams       []string `json:"force_push_allowlist_teams"`
 	ForcePushAllowlistDeployKeys  bool     `json:"force_push_allowlist_deploy_keys"`
+	EnableDeletion                bool     `json:"enable_deletion"`
+	EnableDeletionAllowlist       bool     `json:"enable_deletion_allowlist"`
+	DeletionAllowlistUsernames    []string `json:"deletion_allowlist_usernames"`
+	DeletionAllowlistTeams        []string `json:"deletion_allowlist_teams"`
 	EnableMergeWhitelist          bool     `json:"enable_merge_whitelist"`
 	MergeWhitelistUsernames       []string `json:"merge_whitelist_usernames"`
 	MergeWhitelistTeams           []string `json:"merge_whitelist_teams"`
+	EnableBypassAllowlist         bool     `json:"enable_bypass_allowlist"`
+	BypassAllowlistUsernames      []string `json:"bypass_allowlist_usernames"`
+	BypassAllowlistTeams          []string `json:"bypass_allowlist_teams"`
 	EnableStatusCheck             bool     `json:"enable_status_check"`
 	StatusCheckContexts           []string `json:"status_check_contexts"`
 	RequiredApprovals             int64    `json:"required_approvals"`
@@ -85,6 +113,7 @@ type CreateBranchProtectionOption struct {
 	ApprovalsWhitelistTeams       []string `json:"approvals_whitelist_teams"`
 	BlockOnRejectedReviews        bool     `json:"block_on_rejected_reviews"`
 	BlockOnOfficialReviewRequests bool     `json:"block_on_official_review_requests"`
+	BlockOnCodeownerReviews       bool     `json:"block_on_codeowner_reviews"`
 	BlockOnOutdatedBranch         bool     `json:"block_on_outdated_branch"`
 	DismissStaleApprovals         bool     `json:"dismiss_stale_approvals"`
 	IgnoreStaleApprovals          bool     `json:"ignore_stale_approvals"`
@@ -96,6 +125,7 @@ type CreateBranchProtectionOption struct {
 
 // EditBranchProtectionOption options for editing a branch protection
 type EditBranchProtectionOption struct {
+	Priority                      *int64   `json:"priority"`
 	EnablePush                    *bool    `json:"enable_push"`
 	EnablePushWhitelist           *bool    `json:"enable_push_whitelist"`
 	PushWhitelistUsernames        []string `json:"push_whitelist_usernames"`
@@ -106,9 +136,16 @@ type EditBranchProtectionOption struct {
 	ForcePushAllowlistUsernames   []string `json:"force_push_allowlist_usernames"`
 	ForcePushAllowlistTeams       []string `json:"force_push_allowlist_teams"`
 	ForcePushAllowlistDeployKeys  *bool    `json:"force_push_allowlist_deploy_keys"`
+	EnableDeletion                *bool    `json:"enable_deletion"`
+	EnableDeletionAllowlist       *bool    `json:"enable_deletion_allowlist"`
+	DeletionAllowlistUsernames    []string `json:"deletion_allowlist_usernames"`
+	DeletionAllowlistTeams        []string `json:"deletion_allowlist_teams"`
 	EnableMergeWhitelist          *bool    `json:"enable_merge_whitelist"`
 	MergeWhitelistUsernames       []string `json:"merge_whitelist_usernames"`
 	MergeWhitelistTeams           []string `json:"merge_whitelist_teams"`
+	EnableBypassAllowlist         *bool    `json:"enable_bypass_allowlist"`
+	BypassAllowlistUsernames      []string `json:"bypass_allowlist_usernames"`
+	BypassAllowlistTeams          []string `json:"bypass_allowlist_teams"`
 	EnableStatusCheck             *bool    `json:"enable_status_check"`
 	StatusCheckContexts           []string `json:"status_check_contexts"`
 	RequiredApprovals             *int64   `json:"required_approvals"`
@@ -117,6 +154,7 @@ type EditBranchProtectionOption struct {
 	ApprovalsWhitelistTeams       []string `json:"approvals_whitelist_teams"`
 	BlockOnRejectedReviews        *bool    `json:"block_on_rejected_reviews"`
 	BlockOnOfficialReviewRequests *bool    `json:"block_on_official_review_requests"`
+	BlockOnCodeownerReviews       *bool    `json:"block_on_codeowner_reviews"`
 	BlockOnOutdatedBranch         *bool    `json:"block_on_outdated_branch"`
 	DismissStaleApprovals         *bool    `json:"dismiss_stale_approvals"`
 	IgnoreStaleApprovals          *bool    `json:"ignore_stale_approvals"`
@@ -124,4 +162,18 @@ type EditBranchProtectionOption struct {
 	ProtectedFilePatterns         *string  `json:"protected_file_patterns"`
 	UnprotectedFilePatterns       *string  `json:"unprotected_file_patterns"`
 	BlockAdminMergeOverride       *bool    `json:"block_admin_merge_override"`
+}
+
+// UpdateBranchProtectionPriories a list to update the branch protection rule priorities
+type UpdateBranchProtectionPriories struct {
+	IDs []int64 `json:"ids"`
+}
+
+type MergeUpstreamRequest struct {
+	Branch string `json:"branch"`
+	FfOnly bool   `json:"ff_only"`
+}
+
+type MergeUpstreamResponse struct {
+	MergeStyle string `json:"merge_type"`
 }

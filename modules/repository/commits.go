@@ -9,16 +9,14 @@ import (
 	"net/url"
 	"time"
 
-	"code.gitea.io/gitea/models/avatars"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/cache"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	api "gitea.dev/modules/structs"
 )
 
 // PushCommit represents a commit in a push operation.
+// This struct is marshaled as JSON (see ActionContent2Commits)
 type PushCommit struct {
 	Sha1           string
 	Message        string
@@ -30,6 +28,7 @@ type PushCommit struct {
 }
 
 // PushCommits represents list of commits in a push operation.
+// This struct is marshaled as JSON (see ActionContent2Commits)
 type PushCommits struct {
 	Commits    []*PushCommit
 	HeadCommit *PushCommit
@@ -42,8 +41,8 @@ func NewPushCommits() *PushCommits {
 	return &PushCommits{}
 }
 
-// toAPIPayloadCommit converts a single PushCommit to an api.PayloadCommit object.
-func (pc *PushCommits) toAPIPayloadCommit(ctx context.Context, emailUsers map[string]*user_model.User, repoPath, repoLink string, commit *PushCommit) (*api.PayloadCommit, error) {
+// ToAPIPayloadCommit converts a single PushCommit to an api.PayloadCommit object.
+func ToAPIPayloadCommit(ctx context.Context, emailUsers map[string]*user_model.User, repo *repo_model.Repository, commit *PushCommit) (*api.PayloadCommit, error) {
 	var err error
 	authorUsername := ""
 	author, ok := emailUsers[commit.AuthorEmail]
@@ -70,7 +69,7 @@ func (pc *PushCommits) toAPIPayloadCommit(ctx context.Context, emailUsers map[st
 		committerUsername = committer.Name
 	}
 
-	fileStatus, err := git.GetCommitFileStatus(ctx, repoPath, commit.Sha1)
+	fileStatus, err := git.GetCommitFileStatus(ctx, repo, commit.Sha1)
 	if err != nil {
 		return nil, fmt.Errorf("FileStatus [commit_sha1: %s]: %w", commit.Sha1, err)
 	}
@@ -78,7 +77,7 @@ func (pc *PushCommits) toAPIPayloadCommit(ctx context.Context, emailUsers map[st
 	return &api.PayloadCommit{
 		ID:      commit.Sha1,
 		Message: commit.Message,
-		URL:     fmt.Sprintf("%s/commit/%s", repoLink, url.PathEscape(commit.Sha1)),
+		URL:     fmt.Sprintf("%s/commit/%s", repo.HTMLURL(), url.PathEscape(commit.Sha1)),
 		Author: &api.PayloadUser{
 			Name:     commit.AuthorName,
 			Email:    commit.AuthorEmail,
@@ -98,14 +97,14 @@ func (pc *PushCommits) toAPIPayloadCommit(ctx context.Context, emailUsers map[st
 
 // ToAPIPayloadCommits converts a PushCommits object to api.PayloadCommit format.
 // It returns all converted commits and, if provided, the head commit or an error otherwise.
-func (pc *PushCommits) ToAPIPayloadCommits(ctx context.Context, repoPath, repoLink string) ([]*api.PayloadCommit, *api.PayloadCommit, error) {
+func (pc *PushCommits) ToAPIPayloadCommits(ctx context.Context, repo *repo_model.Repository) ([]*api.PayloadCommit, *api.PayloadCommit, error) {
 	commits := make([]*api.PayloadCommit, len(pc.Commits))
 	var headCommit *api.PayloadCommit
 
 	emailUsers := make(map[string]*user_model.User)
 
 	for i, commit := range pc.Commits {
-		apiCommit, err := pc.toAPIPayloadCommit(ctx, emailUsers, repoPath, repoLink, commit)
+		apiCommit, err := ToAPIPayloadCommit(ctx, emailUsers, repo, commit)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -117,7 +116,7 @@ func (pc *PushCommits) ToAPIPayloadCommits(ctx context.Context, repoPath, repoLi
 	}
 	if pc.HeadCommit != nil && headCommit == nil {
 		var err error
-		headCommit, err = pc.toAPIPayloadCommit(ctx, emailUsers, repoPath, repoLink, pc.HeadCommit)
+		headCommit, err = ToAPIPayloadCommit(ctx, emailUsers, repo, pc.HeadCommit)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -125,31 +124,11 @@ func (pc *PushCommits) ToAPIPayloadCommits(ctx context.Context, repoPath, repoLi
 	return commits, headCommit, nil
 }
 
-// AvatarLink tries to match user in database with e-mail
-// in order to show custom avatar, and falls back to general avatar link.
-func (pc *PushCommits) AvatarLink(ctx context.Context, email string) string {
-	size := avatars.DefaultAvatarPixelSize * setting.Avatar.RenderedSizeFactor
-
-	v, _ := cache.GetWithContextCache(ctx, "push_commits", email, func() (string, error) {
-		u, err := user_model.GetUserByEmail(ctx, email)
-		if err != nil {
-			if !user_model.IsErrUserNotExist(err) {
-				log.Error("GetUserByEmail: %v", err)
-				return "", err
-			}
-			return avatars.GenerateEmailAvatarFastLink(ctx, email, size), nil
-		}
-		return u.AvatarLinkWithSize(ctx, size), nil
-	})
-
-	return v
-}
-
 // CommitToPushCommit transforms a git.Commit to PushCommit type.
 func CommitToPushCommit(commit *git.Commit) *PushCommit {
 	return &PushCommit{
 		Sha1:           commit.ID.String(),
-		Message:        commit.Message(),
+		Message:        commit.MessageUTF8(),
 		AuthorEmail:    commit.Author.Email,
 		AuthorName:     commit.Author.Name,
 		CommitterEmail: commit.Committer.Email,

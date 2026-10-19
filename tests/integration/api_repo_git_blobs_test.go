@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -37,11 +37,10 @@ func TestAPIReposGitBlobs(t *testing.T) {
 	// Test a public repo that anyone can GET the blob of
 	req := NewRequestf(t, "GET", "/api/v1/repos/%s/%s/git/blobs/%s", user2.Name, repo1.Name, repo1ReadmeSHA)
 	resp := MakeRequest(t, req, http.StatusOK)
-	var gitBlobResponse api.GitBlobResponse
-	DecodeJSON(t, resp, &gitBlobResponse)
+	gitBlobResponse := DecodeJSON(t, resp, &api.GitBlobResponse{})
 	assert.NotNil(t, gitBlobResponse)
 	expectedContent := "dHJlZSAyYTJmMWQ0NjcwNzI4YTJlMTAwNDllMzQ1YmQ3YTI3NjQ2OGJlYWI2CmF1dGhvciB1c2VyMSA8YWRkcmVzczFAZXhhbXBsZS5jb20+IDE0ODk5NTY0NzkgLTA0MDAKY29tbWl0dGVyIEV0aGFuIEtvZW5pZyA8ZXRoYW50a29lbmlnQGdtYWlsLmNvbT4gMTQ4OTk1NjQ3OSAtMDQwMAoKSW5pdGlhbCBjb21taXQK"
-	assert.Equal(t, expectedContent, gitBlobResponse.Content)
+	assert.Equal(t, expectedContent, *gitBlobResponse.Content)
 
 	// Tests a private repo with no token so will fail
 	req = NewRequestf(t, "GET", "/api/v1/repos/%s/%s/git/blobs/%s", user2.Name, repo16.Name, repo16ReadmeSHA)
@@ -72,7 +71,7 @@ func TestAPIReposGitBlobs(t *testing.T) {
 
 	// Login as User4.
 	session = loginUser(t, user4.Name)
-	token4 := getTokenForLoggedInUser(t, session)
+	token4 := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeAll)
 
 	// Test using org repo "org3/repo3" where user4 is a NOT collaborator
 	req = NewRequestf(t, "GET", "/api/v1/repos/%s/%s/git/blobs/d56a3073c1dbb7b15963110a049d50cdb5db99fc?access=%s", org3.Name, repo3.Name, token4)

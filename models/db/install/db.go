@@ -4,27 +4,21 @@
 package install
 
 import (
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/setting"
+	"context"
 
-	"xorm.io/xorm"
+	"gitea.dev/models/db"
 )
 
-func getXORMEngine() *xorm.Engine {
-	return db.GetEngine(db.DefaultContext).(*xorm.Engine)
-}
-
 // CheckDatabaseConnection checks the database connection
-func CheckDatabaseConnection() error {
-	e := db.GetEngine(db.DefaultContext)
-	_, err := e.Exec("SELECT 1")
+func CheckDatabaseConnection(ctx context.Context) error {
+	_, err := db.GetEngine(ctx).Exec("SELECT 1")
 	return err
 }
 
 // GetMigrationVersion gets the database migration version
-func GetMigrationVersion() (int64, error) {
+func GetMigrationVersion(ctx context.Context) (int64, error) {
 	var installedDbVersion int64
-	x := getXORMEngine()
+	x := db.GetEngine(ctx)
 	exist, err := x.IsTableExist("version")
 	if err != nil {
 		return 0, err
@@ -40,8 +34,8 @@ func GetMigrationVersion() (int64, error) {
 }
 
 // HasPostInstallationUsers checks whether there are users after installation
-func HasPostInstallationUsers() (bool, error) {
-	x := getXORMEngine()
+func HasPostInstallationUsers(ctx context.Context) (bool, error) {
+	x := db.GetEngine(ctx)
 	exist, err := x.IsTableExist("user")
 	if err != nil {
 		return false, err
@@ -50,15 +44,5 @@ func HasPostInstallationUsers() (bool, error) {
 		return false, nil
 	}
 
-	// if there are 2 or more users in database, we consider there are users created after installation
-	threshold := 2
-	if !setting.IsProd {
-		// to debug easily, with non-prod RUN_MODE, we only check the count to 1
-		threshold = 1
-	}
-	res, err := x.Table("user").Cols("id").Limit(threshold).Query()
-	if err != nil {
-		return false, err
-	}
-	return len(res) >= threshold, nil
+	return x.Table("user").Exist()
 }

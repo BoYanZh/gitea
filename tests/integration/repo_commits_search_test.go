@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -23,7 +23,7 @@ func testRepoCommitsSearch(t *testing.T, query, commit string) {
 
 	doc := NewHTMLParser(t, resp.Body)
 	sel := doc.doc.Find("#commits-table tbody tr td.sha a")
-	assert.EqualValues(t, commit, strings.TrimSpace(sel.Text()))
+	assert.Equal(t, commit, strings.TrimSpace(sel.Text()))
 }
 
 func TestRepoCommitsSearch(t *testing.T) {

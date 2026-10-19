@@ -7,15 +7,15 @@ import (
 	"errors"
 	"net/http"
 
-	"code.gitea.io/gitea/models/webhook"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/context"
-	webhook_service "code.gitea.io/gitea/services/webhook"
+	"gitea.dev/models/webhook"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	webhook_service "gitea.dev/services/webhook"
 )
 
 // ListHooks list system's webhooks
@@ -34,24 +34,51 @@ func ListHooks(ctx *context.APIContext) {
 	//   in: query
 	//   description: page size of results
 	//   type: integer
+	// - type: string
+	//   enum:
+	//     - system
+	//     - default
+	//     - all
+	//   description: system, default or both kinds of webhooks
+	//   name: type
+	//   default: system
+	//   in: query
+	//
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/HookList"
 
-	sysHooks, err := webhook.GetSystemWebhooks(ctx, optional.None[bool]())
+	// for compatibility the default value is true
+	isSystemWebhook := optional.Some(true)
+	typeValue := ctx.FormString("type")
+	switch typeValue {
+	case "default":
+		isSystemWebhook = optional.Some(false)
+	case "all":
+		isSystemWebhook = optional.None[bool]()
+	}
+	listOptions := utils.GetListOptions(ctx)
+	opts := &webhook.ListSystemWebhookOptions{
+		ListOptions: listOptions,
+		IsSystem:    isSystemWebhook,
+	}
+
+	sysHooks, total, err := webhook.GetGlobalWebhooks(ctx, opts)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetSystemWebhooks", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	hooks := make([]*api.Hook, len(sysHooks))
 	for i, hook := range sysHooks {
 		h, err := webhook_service.ToHook(setting.AppURL+"/-/admin", hook)
 		if err != nil {
-			ctx.Error(http.StatusInternalServerError, "convert.ToHook", err)
+			ctx.APIErrorInternal(err)
 			return
 		}
 		hooks[i] = h
 	}
+	ctx.SetLinkHeader(total, listOptions.PageSize)
+	ctx.SetTotalCountHeader(total)
 	ctx.JSON(http.StatusOK, hooks)
 }
 
@@ -73,19 +100,19 @@ func GetHook(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/Hook"
 
-	hookID := ctx.PathParamInt64(":id")
+	hookID := ctx.PathParamInt64("id")
 	hook, err := webhook.GetSystemOrDefaultWebhook(ctx, hookID)
 	if err != nil {
 		if errors.Is(err, util.ErrNotExist) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 		} else {
-			ctx.Error(http.StatusInternalServerError, "GetSystemOrDefaultWebhook", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
 	h, err := webhook_service.ToHook("/-/admin/", hook)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "convert.ToHook", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.JSON(http.StatusOK, h)
@@ -110,7 +137,7 @@ func CreateHook(ctx *context.APIContext) {
 	//   "201":
 	//     "$ref": "#/responses/Hook"
 
-	form := web.GetForm(ctx).(*api.CreateHookOption)
+	form := web.GetForm[*api.CreateHookOption](ctx)
 
 	utils.AddSystemHook(ctx, form)
 }
@@ -139,10 +166,10 @@ func EditHook(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/Hook"
 
-	form := web.GetForm(ctx).(*api.EditHookOption)
+	form := web.GetForm[*api.EditHookOption](ctx)
 
 	// TODO in body params
-	hookID := ctx.PathParamInt64(":id")
+	hookID := ctx.PathParamInt64("id")
 	utils.EditSystemHook(ctx, form, hookID)
 }
 
@@ -164,12 +191,12 @@ func DeleteHook(ctx *context.APIContext) {
 	//   "204":
 	//     "$ref": "#/responses/empty"
 
-	hookID := ctx.PathParamInt64(":id")
+	hookID := ctx.PathParamInt64("id")
 	if err := webhook.DeleteDefaultSystemWebhook(ctx, hookID); err != nil {
 		if errors.Is(err, util.ErrNotExist) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 		} else {
-			ctx.Error(http.StatusInternalServerError, "DeleteDefaultSystemWebhook", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}

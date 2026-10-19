@@ -15,13 +15,14 @@ import (
 	"strings"
 	"time"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/log"
-	base "code.gitea.io/gitea/modules/migration"
-	"code.gitea.io/gitea/modules/structs"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/user"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/log"
+	base "gitea.dev/modules/migration"
+	"gitea.dev/modules/structs"
 
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 )
 
 var (
@@ -49,7 +50,7 @@ func (f *GitlabDownloaderFactory) New(ctx context.Context, opts base.MigrateOpti
 
 	log.Trace("Create gitlab downloader. BaseURL: %s RepoName: %s", baseURL, repoNameSpace)
 
-	return NewGitlabDownloader(ctx, baseURL, repoNameSpace, opts.AuthUsername, opts.AuthPassword, opts.AuthToken)
+	return NewGitlabDownloader(ctx, baseURL, repoNameSpace, opts.AuthToken)
 }
 
 // GitServiceType returns the type of git service
@@ -62,16 +63,16 @@ type gitlabIIDResolver struct {
 	frozen      bool
 }
 
-func (r *gitlabIIDResolver) recordIssueIID(issueIID int) {
+func (r *gitlabIIDResolver) recordIssueIID(issueIID int64) {
 	if r.frozen {
 		panic("cannot record issue IID after pull request IID generation has started")
 	}
-	r.maxIssueIID = max(r.maxIssueIID, int64(issueIID))
+	r.maxIssueIID = max(r.maxIssueIID, issueIID)
 }
 
-func (r *gitlabIIDResolver) generatePullRequestNumber(mrIID int) int64 {
+func (r *gitlabIIDResolver) generatePullRequestNumber(mrIID int64) int64 {
 	r.frozen = true
-	return r.maxIssueIID + int64(mrIID)
+	return r.maxIssueIID + mrIID
 }
 
 // GitlabDownloader implements a Downloader interface to get repository information
@@ -80,10 +81,9 @@ func (r *gitlabIIDResolver) generatePullRequestNumber(mrIID int) int64 {
 // because Gitlab has individual Issue and Pull Request numbers.
 type GitlabDownloader struct {
 	base.NullDownloader
-	ctx         context.Context
 	client      *gitlab.Client
 	baseURL     string
-	repoID      int
+	repoID      int64
 	repoName    string
 	iidResolver gitlabIIDResolver
 	maxPerPage  int
@@ -93,14 +93,8 @@ type GitlabDownloader struct {
 //
 //	Use either a username/password, personal token entered into the username field, or anonymous/public access
 //	Note: Public access only allows very basic access
-func NewGitlabDownloader(ctx context.Context, baseURL, repoPath, username, password, token string) (*GitlabDownloader, error) {
-	gitlabClient, err := gitlab.NewClient(token, gitlab.WithBaseURL(baseURL), gitlab.WithHTTPClient(NewMigrationHTTPClient()))
-	// Only use basic auth if token is blank and password is NOT
-	// Basic auth will fail with empty strings, but empty token will allow anonymous public API usage
-	if token == "" && password != "" {
-		gitlabClient, err = gitlab.NewBasicAuthClient(username, password, gitlab.WithBaseURL(baseURL), gitlab.WithHTTPClient(NewMigrationHTTPClient()))
-	}
-
+func NewGitlabDownloader(ctx context.Context, baseURL, repoPath, token string) (*GitlabDownloader, error) {
+	gitlabClient, err := gitlab.NewClient(token, gitlab.WithBaseURL(baseURL), gitlab.WithHTTPClient(newMigrationHTTPClient()))
 	if err != nil {
 		log.Trace("Error logging into gitlab: %v", err)
 		return nil, err
@@ -111,7 +105,7 @@ func NewGitlabDownloader(ctx context.Context, baseURL, repoPath, username, passw
 	var resp *gitlab.Response
 	u, _ := url.Parse(baseURL)
 	for len(pathParts) >= 2 {
-		_, resp, err = gitlabClient.Version.GetVersion()
+		_, resp, err = gitlabClient.Version.GetVersion(gitlab.WithContext(ctx))
 		if err == nil || resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			err = nil // if no authentication given, this still should work
 			break
@@ -143,7 +137,6 @@ func NewGitlabDownloader(ctx context.Context, baseURL, repoPath, username, passw
 	}
 
 	return &GitlabDownloader{
-		ctx:        ctx,
 		client:     gitlabClient,
 		baseURL:    baseURL,
 		repoID:     gr.ID,
@@ -164,14 +157,9 @@ func (g *GitlabDownloader) LogString() string {
 	return fmt.Sprintf("<GitlabDownloader %s [%d]/%s>", g.baseURL, g.repoID, g.repoName)
 }
 
-// SetContext set context
-func (g *GitlabDownloader) SetContext(ctx context.Context) {
-	g.ctx = ctx
-}
-
 // GetRepoInfo returns a repository information
-func (g *GitlabDownloader) GetRepoInfo() (*base.Repository, error) {
-	gr, _, err := g.client.Projects.GetProject(g.repoID, nil, nil, gitlab.WithContext(g.ctx))
+func (g *GitlabDownloader) GetRepoInfo(ctx context.Context) (*base.Repository, error) {
+	gr, _, err := g.client.Projects.GetProject(g.repoID, nil, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -207,16 +195,16 @@ func (g *GitlabDownloader) GetRepoInfo() (*base.Repository, error) {
 }
 
 // GetTopics return gitlab topics
-func (g *GitlabDownloader) GetTopics() ([]string, error) {
-	gr, _, err := g.client.Projects.GetProject(g.repoID, nil, nil, gitlab.WithContext(g.ctx))
+func (g *GitlabDownloader) GetTopics(ctx context.Context) ([]string, error) {
+	gr, _, err := g.client.Projects.GetProject(g.repoID, nil, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
-	return gr.TagList, err
+	return gr.Topics, err
 }
 
 // GetMilestones returns milestones
-func (g *GitlabDownloader) GetMilestones() ([]*base.Milestone, error) {
+func (g *GitlabDownloader) GetMilestones(ctx context.Context) ([]*base.Milestone, error) {
 	perPage := g.maxPerPage
 	state := "all"
 	milestones := make([]*base.Milestone, 0, perPage)
@@ -224,10 +212,10 @@ func (g *GitlabDownloader) GetMilestones() ([]*base.Milestone, error) {
 		ms, _, err := g.client.Milestones.ListMilestones(g.repoID, &gitlab.ListMilestonesOptions{
 			State: &state,
 			ListOptions: gitlab.ListOptions{
-				Page:    i,
-				PerPage: perPage,
+				Page:    int64(i),
+				PerPage: int64(perPage),
 			},
-		}, nil, gitlab.WithContext(g.ctx))
+		}, nil, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -288,14 +276,14 @@ func (g *GitlabDownloader) normalizeColor(val string) string {
 }
 
 // GetLabels returns labels
-func (g *GitlabDownloader) GetLabels() ([]*base.Label, error) {
+func (g *GitlabDownloader) GetLabels(ctx context.Context) ([]*base.Label, error) {
 	perPage := g.maxPerPage
 	labels := make([]*base.Label, 0, perPage)
 	for i := 1; ; i++ {
 		ls, _, err := g.client.Labels.ListLabels(g.repoID, &gitlab.ListLabelsOptions{ListOptions: gitlab.ListOptions{
-			Page:    i,
-			PerPage: perPage,
-		}}, nil, gitlab.WithContext(g.ctx))
+			Page:    int64(i),
+			PerPage: int64(perPage),
+		}}, nil, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -314,7 +302,7 @@ func (g *GitlabDownloader) GetLabels() ([]*base.Label, error) {
 	return labels, nil
 }
 
-func (g *GitlabDownloader) convertGitlabRelease(rel *gitlab.Release) *base.Release {
+func (g *GitlabDownloader) convertGitlabRelease(ctx context.Context, rel *gitlab.Release) *base.Release {
 	var zero int
 	r := &base.Release{
 		TagName:         rel.TagName,
@@ -322,22 +310,21 @@ func (g *GitlabDownloader) convertGitlabRelease(rel *gitlab.Release) *base.Relea
 		Name:            rel.Name,
 		Body:            rel.Description,
 		Created:         *rel.CreatedAt,
-		PublisherID:     int64(rel.Author.ID),
+		PublisherID:     rel.Author.ID,
 		PublisherName:   rel.Author.Username,
 	}
 
-	httpClient := NewMigrationHTTPClient()
+	httpClient := newMigrationHTTPClient()
 
-	for k, asset := range rel.Assets.Links {
+	for _, asset := range rel.Assets.Links {
 		assetID := asset.ID // Don't optimize this, for closure we need a local variable
 		r.Assets = append(r.Assets, &base.ReleaseAsset{
-			ID:            int64(asset.ID),
+			ID:            asset.ID,
 			Name:          asset.Name,
-			ContentType:   &rel.Assets.Sources[k].Format,
 			Size:          &zero,
 			DownloadCount: &zero,
 			DownloadFunc: func() (io.ReadCloser, error) {
-				link, _, err := g.client.ReleaseLinks.GetReleaseLink(g.repoID, rel.TagName, assetID, gitlab.WithContext(g.ctx))
+				link, _, err := g.client.ReleaseLinks.GetReleaseLink(g.repoID, rel.TagName, assetID, gitlab.WithContext(ctx))
 				if err != nil {
 					return nil, err
 				}
@@ -347,11 +334,11 @@ func (g *GitlabDownloader) convertGitlabRelease(rel *gitlab.Release) *base.Relea
 					return io.NopCloser(strings.NewReader(link.URL)), nil
 				}
 
-				req, err := http.NewRequest("GET", link.URL, nil)
+				req, err := http.NewRequest(http.MethodGet, link.URL, nil)
 				if err != nil {
 					return nil, err
 				}
-				req = req.WithContext(g.ctx)
+				req = req.WithContext(ctx)
 				resp, err := httpClient.Do(req)
 				if err != nil {
 					return nil, err
@@ -366,22 +353,22 @@ func (g *GitlabDownloader) convertGitlabRelease(rel *gitlab.Release) *base.Relea
 }
 
 // GetReleases returns releases
-func (g *GitlabDownloader) GetReleases() ([]*base.Release, error) {
+func (g *GitlabDownloader) GetReleases(ctx context.Context) ([]*base.Release, error) {
 	perPage := g.maxPerPage
 	releases := make([]*base.Release, 0, perPage)
 	for i := 1; ; i++ {
 		ls, _, err := g.client.Releases.ListReleases(g.repoID, &gitlab.ListReleasesOptions{
 			ListOptions: gitlab.ListOptions{
-				Page:    i,
-				PerPage: perPage,
+				Page:    int64(i),
+				PerPage: int64(perPage),
 			},
-		}, nil, gitlab.WithContext(g.ctx))
+		}, nil, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, err
 		}
 
 		for _, release := range ls {
-			releases = append(releases, g.convertGitlabRelease(release))
+			releases = append(releases, g.convertGitlabRelease(ctx, release))
 		}
 		if len(ls) < perPage {
 			break
@@ -397,7 +384,7 @@ type gitlabIssueContext struct {
 // GetIssues returns issues according start and limit
 //
 //	Note: issue label description and colors are not supported by the go-gitlab library at this time
-func (g *GitlabDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, error) {
+func (g *GitlabDownloader) GetIssues(ctx context.Context, page, perPage int) ([]*base.Issue, bool, error) {
 	state := "all"
 	sort := "asc"
 
@@ -409,14 +396,14 @@ func (g *GitlabDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, er
 		State: &state,
 		Sort:  &sort,
 		ListOptions: gitlab.ListOptions{
-			PerPage: perPage,
-			Page:    page,
+			PerPage: int64(perPage),
+			Page:    int64(page),
 		},
 	}
 
 	allIssues := make([]*base.Issue, 0, perPage)
 
-	issues, _, err := g.client.Issues.ListProjectIssues(g.repoID, opt, nil, gitlab.WithContext(g.ctx))
+	issues, _, err := g.client.Issues.ListProjectIssues(g.repoID, opt, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, false, fmt.Errorf("error while listing issues: %w", err)
 	}
@@ -436,7 +423,7 @@ func (g *GitlabDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, er
 		var reactions []*gitlab.AwardEmoji
 		awardPage := 1
 		for {
-			awards, _, err := g.client.AwardEmoji.ListIssueAwardEmoji(g.repoID, issue.IID, &gitlab.ListAwardEmojiOptions{Page: awardPage, PerPage: perPage}, gitlab.WithContext(g.ctx))
+			awards, _, err := g.client.AwardEmoji.ListIssueAwardEmoji(g.repoID, issue.IID, &gitlab.ListAwardEmojiOptions{ListOptions: gitlab.ListOptions{Page: int64(awardPage), PerPage: int64(perPage)}}, gitlab.WithContext(ctx))
 			if err != nil {
 				return nil, false, fmt.Errorf("error while listing issue awards: %w", err)
 			}
@@ -452,8 +439,8 @@ func (g *GitlabDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, er
 
 		allIssues = append(allIssues, &base.Issue{
 			Title:        issue.Title,
-			Number:       int64(issue.IID),
-			PosterID:     int64(issue.Author.ID),
+			Number:       issue.IID,
+			PosterID:     issue.Author.ID,
 			PosterName:   issue.Author.Username,
 			Content:      issue.Description,
 			Milestone:    milestone,
@@ -464,7 +451,7 @@ func (g *GitlabDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, er
 			Closed:       issue.ClosedAt,
 			IsLocked:     issue.DiscussionLocked,
 			Updated:      *issue.UpdatedAt,
-			ForeignIndex: int64(issue.IID),
+			ForeignIndex: issue.IID,
 			Context:      gitlabIssueContext{IsMergeRequest: false},
 		})
 
@@ -477,7 +464,7 @@ func (g *GitlabDownloader) GetIssues(page, perPage int) ([]*base.Issue, bool, er
 
 // GetComments returns comments according issueNumber
 // TODO: figure out how to transfer comment reactions
-func (g *GitlabDownloader) GetComments(commentable base.Commentable) ([]*base.Comment, bool, error) {
+func (g *GitlabDownloader) GetComments(ctx context.Context, commentable base.Commentable) ([]*base.Comment, bool, error) {
 	context, ok := commentable.GetContext().(gitlabIssueContext)
 	if !ok {
 		return nil, false, fmt.Errorf("unexpected context: %+v", commentable.GetContext())
@@ -485,22 +472,26 @@ func (g *GitlabDownloader) GetComments(commentable base.Commentable) ([]*base.Co
 
 	allComments := make([]*base.Comment, 0, g.maxPerPage)
 
-	page := 1
+	var page int64 = 1
 
 	for {
 		var comments []*gitlab.Discussion
 		var resp *gitlab.Response
 		var err error
 		if !context.IsMergeRequest {
-			comments, resp, err = g.client.Discussions.ListIssueDiscussions(g.repoID, int(commentable.GetForeignIndex()), &gitlab.ListIssueDiscussionsOptions{
-				Page:    page,
-				PerPage: g.maxPerPage,
-			}, nil, gitlab.WithContext(g.ctx))
+			comments, resp, err = g.client.Discussions.ListIssueDiscussions(g.repoID, commentable.GetForeignIndex(), &gitlab.ListIssueDiscussionsOptions{
+				ListOptions: gitlab.ListOptions{
+					Page:    page,
+					PerPage: int64(g.maxPerPage),
+				},
+			}, nil, gitlab.WithContext(ctx))
 		} else {
-			comments, resp, err = g.client.Discussions.ListMergeRequestDiscussions(g.repoID, int(commentable.GetForeignIndex()), &gitlab.ListMergeRequestDiscussionsOptions{
-				Page:    page,
-				PerPage: g.maxPerPage,
-			}, nil, gitlab.WithContext(g.ctx))
+			comments, resp, err = g.client.Discussions.ListMergeRequestDiscussions(g.repoID, commentable.GetForeignIndex(), &gitlab.ListMergeRequestDiscussionsOptions{
+				ListOptions: gitlab.ListOptions{
+					Page:    page,
+					PerPage: int64(g.maxPerPage),
+				},
+			}, nil, gitlab.WithContext(ctx))
 		}
 
 		if err != nil {
@@ -523,30 +514,34 @@ func (g *GitlabDownloader) GetComments(commentable base.Commentable) ([]*base.Co
 		var resp *gitlab.Response
 		var err error
 		if context.IsMergeRequest {
-			stateEvents, resp, err = g.client.ResourceStateEvents.ListMergeStateEvents(g.repoID, int(commentable.GetForeignIndex()), &gitlab.ListStateEventsOptions{
+			stateEvents, resp, err = g.client.ResourceStateEvents.ListMergeStateEvents(g.repoID, commentable.GetForeignIndex(), &gitlab.ListStateEventsOptions{
 				ListOptions: gitlab.ListOptions{
 					Page:    page,
-					PerPage: g.maxPerPage,
+					PerPage: int64(g.maxPerPage),
 				},
-			}, nil, gitlab.WithContext(g.ctx))
+			}, nil, gitlab.WithContext(ctx))
 		} else {
-			stateEvents, resp, err = g.client.ResourceStateEvents.ListIssueStateEvents(g.repoID, int(commentable.GetForeignIndex()), &gitlab.ListStateEventsOptions{
+			stateEvents, resp, err = g.client.ResourceStateEvents.ListIssueStateEvents(g.repoID, commentable.GetForeignIndex(), &gitlab.ListStateEventsOptions{
 				ListOptions: gitlab.ListOptions{
 					Page:    page,
-					PerPage: g.maxPerPage,
+					PerPage: int64(g.maxPerPage),
 				},
-			}, nil, gitlab.WithContext(g.ctx))
+			}, nil, gitlab.WithContext(ctx))
 		}
 		if err != nil {
 			return nil, false, fmt.Errorf("error while listing state events: %v %w", g.repoID, err)
 		}
 
 		for _, stateEvent := range stateEvents {
+			posterUserID, posterUsername := user.GhostUserID, user.GhostUserName
+			if stateEvent.User != nil {
+				posterUserID, posterUsername = stateEvent.User.ID, stateEvent.User.Username
+			}
 			comment := &base.Comment{
 				IssueIndex: commentable.GetLocalIndex(),
-				Index:      int64(stateEvent.ID),
-				PosterID:   int64(stateEvent.User.ID),
-				PosterName: stateEvent.User.Username,
+				Index:      stateEvent.ID,
+				PosterID:   posterUserID,
+				PosterName: posterUsername,
 				Content:    "",
 				Created:    *stateEvent.CreatedAt,
 			}
@@ -578,8 +573,8 @@ var targetBranchChangeRegexp = regexp.MustCompile("^changed target branch from `
 func (g *GitlabDownloader) convertNoteToComment(localIndex int64, note *gitlab.Note) *base.Comment {
 	comment := &base.Comment{
 		IssueIndex:  localIndex,
-		Index:       int64(note.ID),
-		PosterID:    int64(note.Author.ID),
+		Index:       note.ID,
+		PosterID:    note.Author.ID,
 		PosterName:  note.Author.Username,
 		PosterEmail: note.Author.Email,
 		Content:     note.Body,
@@ -604,7 +599,7 @@ func (g *GitlabDownloader) convertNoteToComment(localIndex int64, note *gitlab.N
 }
 
 // GetPullRequests returns pull requests according page and perPage
-func (g *GitlabDownloader) GetPullRequests(page, perPage int) ([]*base.PullRequest, bool, error) {
+func (g *GitlabDownloader) GetPullRequests(ctx context.Context, page, perPage int) ([]*base.PullRequest, bool, error) {
 	if perPage > g.maxPerPage {
 		perPage = g.maxPerPage
 	}
@@ -612,15 +607,15 @@ func (g *GitlabDownloader) GetPullRequests(page, perPage int) ([]*base.PullReque
 	view := "simple"
 	opt := &gitlab.ListProjectMergeRequestsOptions{
 		ListOptions: gitlab.ListOptions{
-			PerPage: perPage,
-			Page:    page,
+			PerPage: int64(perPage),
+			Page:    int64(page),
 		},
 		View: &view,
 	}
 
 	allPRs := make([]*base.PullRequest, 0, perPage)
 
-	prs, _, err := g.client.MergeRequests.ListProjectMergeRequests(g.repoID, opt, nil, gitlab.WithContext(g.ctx))
+	prs, _, err := g.client.MergeRequests.ListProjectMergeRequests(g.repoID, opt, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, false, fmt.Errorf("error while listing merge requests: %w", err)
 	}
@@ -673,7 +668,7 @@ func (g *GitlabDownloader) GetPullRequests(page, perPage int) ([]*base.PullReque
 		var reactions []*gitlab.AwardEmoji
 		awardPage := 1
 		for {
-			awards, _, err := g.client.AwardEmoji.ListMergeRequestAwardEmoji(g.repoID, pr.IID, &gitlab.ListAwardEmojiOptions{Page: awardPage, PerPage: perPage}, gitlab.WithContext(g.ctx))
+			awards, _, err := g.client.AwardEmoji.ListMergeRequestAwardEmoji(g.repoID, pr.IID, &gitlab.ListAwardEmojiOptions{ListOptions: gitlab.ListOptions{Page: int64(awardPage), PerPage: int64(perPage)}}, gitlab.WithContext(ctx))
 			if err != nil {
 				return nil, false, fmt.Errorf("error while listing merge requests awards: %w", err)
 			}
@@ -694,7 +689,7 @@ func (g *GitlabDownloader) GetPullRequests(page, perPage int) ([]*base.PullReque
 			Title:          pr.Title,
 			Number:         newPRNumber,
 			PosterName:     pr.Author.Username,
-			PosterID:       int64(pr.Author.ID),
+			PosterID:       pr.Author.ID,
 			Content:        pr.Description,
 			Milestone:      milestone,
 			State:          pr.State,
@@ -720,7 +715,7 @@ func (g *GitlabDownloader) GetPullRequests(page, perPage int) ([]*base.PullReque
 				OwnerName: pr.Author.Username,
 			},
 			PatchURL:     pr.WebURL + ".patch",
-			ForeignIndex: int64(pr.IID),
+			ForeignIndex: pr.IID,
 			Context:      gitlabIssueContext{IsMergeRequest: true},
 			IsDraft:      pr.Draft,
 		})
@@ -733,8 +728,8 @@ func (g *GitlabDownloader) GetPullRequests(page, perPage int) ([]*base.PullReque
 }
 
 // GetReviews returns pull requests review
-func (g *GitlabDownloader) GetReviews(reviewable base.Reviewable) ([]*base.Review, error) {
-	approvals, resp, err := g.client.MergeRequestApprovals.GetConfiguration(g.repoID, int(reviewable.GetForeignIndex()), gitlab.WithContext(g.ctx))
+func (g *GitlabDownloader) GetReviews(ctx context.Context, reviewable base.Reviewable) ([]*base.Review, error) {
+	approvals, resp, err := g.client.MergeRequestApprovals.GetConfiguration(g.repoID, reviewable.GetForeignIndex(), gitlab.WithContext(ctx))
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			log.Error(fmt.Sprintf("GitlabDownloader: while migrating a error occurred: '%s'", err.Error()))
@@ -756,7 +751,7 @@ func (g *GitlabDownloader) GetReviews(reviewable base.Reviewable) ([]*base.Revie
 	for _, user := range approvals.ApprovedBy {
 		reviews = append(reviews, &base.Review{
 			IssueIndex:   reviewable.GetLocalIndex(),
-			ReviewerID:   int64(user.User.ID),
+			ReviewerID:   user.User.ID,
 			ReviewerName: user.User.Username,
 			CreatedAt:    createdAt,
 			// All we get are approvals
@@ -774,7 +769,7 @@ func (g *GitlabDownloader) awardsToReactions(awards []*gitlab.AwardEmoji) []*bas
 		uid := fmt.Sprintf("%s%d", award.Name, award.User.ID)
 		if uniqCheck.Add(uid) {
 			result = append(result, &base.Reaction{
-				UserID:   int64(award.User.ID),
+				UserID:   award.User.ID,
 				UserName: award.User.Username,
 				Content:  award.Name,
 			})

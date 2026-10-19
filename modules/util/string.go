@@ -3,7 +3,11 @@
 
 package util
 
-import "unsafe"
+import (
+	"iter"
+	"strings"
+	"unsafe"
+)
 
 func isSnakeCaseUpper(c byte) bool {
 	return 'A' <= c && c <= 'Z'
@@ -94,4 +98,44 @@ func UnsafeBytesToString(b []byte) string {
 // UnsafeStringToBytes uses Go's unsafe package to convert a string to a byte slice.
 func UnsafeStringToBytes(s string) []byte {
 	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+// SplitTrimSpace splits the string at given separator and trims leading and trailing space
+func SplitTrimSpace(input, sep string) []string {
+	input = strings.TrimSpace(input)
+	var stringList []string
+	for s := range strings.SplitSeq(input, sep) {
+		if s = strings.TrimSpace(s); s != "" {
+			stringList = append(stringList, s)
+		}
+	}
+	return stringList
+}
+
+func asciiLower(b byte) byte {
+	if 'A' <= b && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+// AsciiEqualFold is from Golang https://cs.opensource.google/go/go/+/refs/tags/go1.24.4:src/net/http/internal/ascii/print.go
+// ASCII only. In most cases for protocols, we should only use this but not [strings.EqualFold]
+func AsciiEqualFold[T string | []byte](s, t T) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if asciiLower(s[i]) != asciiLower(t[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func StringSplitSeq[T, S ~string](s T, sep S) iter.Seq[T] {
+	f := strings.SplitSeq(string(s), string(sep))
+	return func(yield func(T) bool) {
+		f(func(v string) bool { return yield(T(v)) })
+	}
 }

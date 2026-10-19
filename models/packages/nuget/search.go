@@ -7,8 +7,8 @@ import (
 	"context"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	packages_model "code.gitea.io/gitea/models/packages"
+	"gitea.dev/models/db"
+	packages_model "gitea.dev/models/packages"
 
 	"xorm.io/builder"
 )
@@ -33,7 +33,7 @@ func SearchVersions(ctx context.Context, opts *packages_model.PackageSearchOptio
 		Where(cond).
 		OrderBy("package.name ASC")
 	if opts.Paginator != nil {
-		skip, take := opts.GetSkipTake()
+		skip, take := opts.Paginator.GetSkipTake()
 		inner = inner.Limit(take, skip)
 	}
 

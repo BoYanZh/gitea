@@ -6,42 +6,41 @@ package setting
 import (
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 
-	"github.com/dustin/go-humanize"
+	"gitea.dev/modules/util"
 )
 
 // Package registry settings
 var (
 	Packages = struct {
-		Storage           *Storage
-		Enabled           bool
-		ChunkedUploadPath string
+		Storage *Storage
+		Enabled bool
 
-		LimitTotalOwnerCount int64
-		LimitTotalOwnerSize  int64
-		LimitSizeAlpine      int64
-		LimitSizeCargo       int64
-		LimitSizeChef        int64
-		LimitSizeComposer    int64
-		LimitSizeConan       int64
-		LimitSizeConda       int64
-		LimitSizeContainer   int64
-		LimitSizeCran        int64
-		LimitSizeDebian      int64
-		LimitSizeGeneric     int64
-		LimitSizeGo          int64
-		LimitSizeHelm        int64
-		LimitSizeMaven       int64
-		LimitSizeNpm         int64
-		LimitSizeNuGet       int64
-		LimitSizePub         int64
-		LimitSizePyPI        int64
-		LimitSizeRpm         int64
-		LimitSizeRubyGems    int64
-		LimitSizeSwift       int64
-		LimitSizeVagrant     int64
+		LimitTotalOwnerCount    int64
+		LimitTotalOwnerSize     int64
+		LimitSizeAlpine         int64
+		LimitSizeArch           int64
+		LimitSizeCargo          int64
+		LimitSizeChef           int64
+		LimitSizeComposer       int64
+		LimitSizeConan          int64
+		LimitSizeConda          int64
+		LimitSizeContainer      int64
+		LimitSizeCran           int64
+		LimitSizeDebian         int64
+		LimitSizeGeneric        int64
+		LimitSizeGo             int64
+		LimitSizeHelm           int64
+		LimitSizeMaven          int64
+		LimitSizeNpm            int64
+		LimitSizeNuGet          int64
+		LimitSizePub            int64
+		LimitSizePyPI           int64
+		LimitSizeRpm            int64
+		LimitSizeRubyGems       int64
+		LimitSizeSwift          int64
+		LimitSizeTerraformState int64
+		LimitSizeVagrant        int64
 
 		DefaultRPMSignEnabled bool
 	}{
@@ -66,19 +65,9 @@ func loadPackagesFrom(rootCfg ConfigProvider) (err error) {
 		return err
 	}
 
-	Packages.ChunkedUploadPath = filepath.ToSlash(sec.Key("CHUNKED_UPLOAD_PATH").MustString("tmp/package-upload"))
-	if !filepath.IsAbs(Packages.ChunkedUploadPath) {
-		Packages.ChunkedUploadPath = filepath.ToSlash(filepath.Join(AppDataPath, Packages.ChunkedUploadPath))
-	}
-
-	if HasInstallLock(rootCfg) {
-		if err := os.MkdirAll(Packages.ChunkedUploadPath, os.ModePerm); err != nil {
-			return fmt.Errorf("unable to create chunked upload directory: %s (%v)", Packages.ChunkedUploadPath, err)
-		}
-	}
-
 	Packages.LimitTotalOwnerSize = mustBytes(sec, "LIMIT_TOTAL_OWNER_SIZE")
 	Packages.LimitSizeAlpine = mustBytes(sec, "LIMIT_SIZE_ALPINE")
+	Packages.LimitSizeArch = mustBytes(sec, "LIMIT_SIZE_ARCH")
 	Packages.LimitSizeCargo = mustBytes(sec, "LIMIT_SIZE_CARGO")
 	Packages.LimitSizeChef = mustBytes(sec, "LIMIT_SIZE_CHEF")
 	Packages.LimitSizeComposer = mustBytes(sec, "LIMIT_SIZE_COMPOSER")
@@ -98,6 +87,7 @@ func loadPackagesFrom(rootCfg ConfigProvider) (err error) {
 	Packages.LimitSizeRpm = mustBytes(sec, "LIMIT_SIZE_RPM")
 	Packages.LimitSizeRubyGems = mustBytes(sec, "LIMIT_SIZE_RUBYGEMS")
 	Packages.LimitSizeSwift = mustBytes(sec, "LIMIT_SIZE_SWIFT")
+	Packages.LimitSizeTerraformState = mustBytes(sec, "LIMIT_SIZE_TERRAFORM_STATE")
 	Packages.LimitSizeVagrant = mustBytes(sec, "LIMIT_SIZE_VAGRANT")
 	Packages.DefaultRPMSignEnabled = sec.Key("DEFAULT_RPM_SIGN_ENABLED").MustBool(false)
 	return nil
@@ -110,7 +100,7 @@ func mustBytes(section ConfigSection, key string) int64 {
 	if value == noLimit {
 		return -1
 	}
-	bytes, err := humanize.ParseBytes(value)
+	bytes, err := util.ParseByteSize(value)
 	if err != nil || bytes > math.MaxInt64 {
 		return -1
 	}

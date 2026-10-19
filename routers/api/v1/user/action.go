@@ -7,15 +7,17 @@ import (
 	"errors"
 	"net/http"
 
-	actions_model "code.gitea.io/gitea/models/actions"
-	"code.gitea.io/gitea/models/db"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	actions_service "code.gitea.io/gitea/services/actions"
-	"code.gitea.io/gitea/services/context"
-	secret_service "code.gitea.io/gitea/services/secrets"
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/shared"
+	"gitea.dev/routers/api/v1/utils"
+	actions_service "gitea.dev/services/actions"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	secret_service "gitea.dev/services/secrets"
 )
 
 // create or update one secret of the user scope
@@ -47,19 +49,19 @@ func CreateOrUpdateSecret(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	opt := web.GetForm(ctx).(*api.CreateOrUpdateSecretOption)
+	opt := web.GetForm[*api.CreateOrUpdateSecretOption](ctx)
 
-	_, created, err := secret_service.CreateOrUpdateSecret(ctx, ctx.Doer.ID, 0, ctx.PathParam("secretname"), opt.Data)
+	s, created, err := secret_service.CreateOrUpdateSecret(ctx, actions_model.BelongingScopeOwner(ctx.Doer.ID), ctx.PathParam("secretname"), opt.Data, opt.Description)
 	if err != nil {
-		if errors.Is(err, util.ErrInvalidArgument) {
-			ctx.Error(http.StatusBadRequest, "CreateOrUpdateSecret", err)
-		} else if errors.Is(err, util.ErrNotExist) {
-			ctx.Error(http.StatusNotFound, "CreateOrUpdateSecret", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "CreateOrUpdateSecret", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
+
+	actions := audit.SecretUpdate
+	if created {
+		actions = audit.SecretAdd
+	}
+	audit.RecordScoped(ctx, ctx.Doer, nil, actions, "secret", s.Name)
 
 	if created {
 		ctx.Status(http.StatusCreated)
@@ -91,17 +93,13 @@ func DeleteSecret(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	err := secret_service.DeleteSecretByName(ctx, ctx.Doer.ID, 0, ctx.PathParam("secretname"))
+	s, err := secret_service.DeleteSecretByName(ctx, actions_model.BelongingScopeOwner(ctx.Doer.ID), ctx.PathParam("secretname"))
 	if err != nil {
-		if errors.Is(err, util.ErrInvalidArgument) {
-			ctx.Error(http.StatusBadRequest, "DeleteSecret", err)
-		} else if errors.Is(err, util.ErrNotExist) {
-			ctx.Error(http.StatusNotFound, "DeleteSecret", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "DeleteSecret", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
+
+	audit.RecordScoped(ctx, ctx.Doer, nil, audit.SecretRemove, "secret", s.Name)
 
 	ctx.Status(http.StatusNoContent)
 }
@@ -127,42 +125,36 @@ func CreateVariable(ctx *context.APIContext) {
 	//     "$ref": "#/definitions/CreateVariableOption"
 	// responses:
 	//   "201":
-	//     description: response when creating a variable
-	//   "204":
-	//     description: response when creating a variable
+	//     description: successfully created the user-level variable
 	//   "400":
 	//     "$ref": "#/responses/error"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
+	//   "409":
+	//     description: variable name already exists.
 
-	opt := web.GetForm(ctx).(*api.CreateVariableOption)
+	opt := web.GetForm[*api.CreateVariableOption](ctx)
 
 	ownerID := ctx.Doer.ID
 	variableName := ctx.PathParam("variablename")
 
 	v, err := actions_service.GetVariable(ctx, actions_model.FindVariablesOpts{
-		OwnerID: ownerID,
-		Name:    variableName,
+		BelongingScope: actions_model.BelongingScopeOwner(ownerID),
+		Name:           variableName,
 	})
 	if err != nil && !errors.Is(err, util.ErrNotExist) {
-		ctx.Error(http.StatusInternalServerError, "GetVariable", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	if v != nil && v.ID > 0 {
-		ctx.Error(http.StatusConflict, "VariableNameAlreadyExists", util.NewAlreadyExistErrorf("variable name %s already exists", variableName))
+		ctx.APIError(http.StatusConflict, "variable name already exists")
 		return
 	}
 
-	if _, err := actions_service.CreateVariable(ctx, ownerID, 0, variableName, opt.Value); err != nil {
-		if errors.Is(err, util.ErrInvalidArgument) {
-			ctx.Error(http.StatusBadRequest, "CreateVariable", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "CreateVariable", err)
-		}
+	if _, err := actions_service.CreateVariable(ctx, actions_model.BelongingScopeOwner(ownerID), variableName, opt.Value, opt.Description); err != nil {
+		ctx.APIErrorAuto(err)
 		return
 	}
 
-	ctx.Status(http.StatusNoContent)
+	ctx.Status(http.StatusCreated)
 }
 
 // UpdateVariable update a user-level variable which is created by current doer
@@ -194,30 +186,27 @@ func UpdateVariable(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	opt := web.GetForm(ctx).(*api.UpdateVariableOption)
+	opt := web.GetForm[*api.UpdateVariableOption](ctx)
 
 	v, err := actions_service.GetVariable(ctx, actions_model.FindVariablesOpts{
-		OwnerID: ctx.Doer.ID,
-		Name:    ctx.PathParam("variablename"),
+		BelongingScope: actions_model.BelongingScopeOwner(ctx.Doer.ID),
+		Name:           ctx.PathParam("variablename"),
 	})
 	if err != nil {
-		if errors.Is(err, util.ErrNotExist) {
-			ctx.Error(http.StatusNotFound, "GetVariable", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "GetVariable", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
 
 	if opt.Name == "" {
 		opt.Name = ctx.PathParam("variablename")
 	}
-	if _, err := actions_service.UpdateVariable(ctx, v.ID, opt.Name, opt.Value); err != nil {
-		if errors.Is(err, util.ErrInvalidArgument) {
-			ctx.Error(http.StatusBadRequest, "UpdateVariable", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "UpdateVariable", err)
-		}
+
+	v.Name = opt.Name
+	v.Data = opt.Value
+	v.Description = opt.Description
+
+	if _, err := actions_service.UpdateVariableNameData(ctx, v); err != nil {
+		ctx.APIErrorAuto(err)
 		return
 	}
 
@@ -247,14 +236,8 @@ func DeleteVariable(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	if err := actions_service.DeleteVariableByName(ctx, ctx.Doer.ID, 0, ctx.PathParam("variablename")); err != nil {
-		if errors.Is(err, util.ErrInvalidArgument) {
-			ctx.Error(http.StatusBadRequest, "DeleteVariableByName", err)
-		} else if errors.Is(err, util.ErrNotExist) {
-			ctx.Error(http.StatusNotFound, "DeleteVariableByName", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "DeleteVariableByName", err)
-		}
+	if err := actions_service.DeleteVariableByName(ctx, actions_model.BelongingScopeOwner(ctx.Doer.ID), ctx.PathParam("variablename")); err != nil {
+		ctx.APIErrorAuto(err)
 		return
 	}
 
@@ -283,23 +266,20 @@ func GetVariable(ctx *context.APIContext) {
 	//     "$ref": "#/responses/notFound"
 
 	v, err := actions_service.GetVariable(ctx, actions_model.FindVariablesOpts{
-		OwnerID: ctx.Doer.ID,
-		Name:    ctx.PathParam("variablename"),
+		BelongingScope: actions_model.BelongingScopeOwner(ctx.Doer.ID),
+		Name:           ctx.PathParam("variablename"),
 	})
 	if err != nil {
-		if errors.Is(err, util.ErrNotExist) {
-			ctx.Error(http.StatusNotFound, "GetVariable", err)
-		} else {
-			ctx.Error(http.StatusInternalServerError, "GetVariable", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
 
 	variable := &api.ActionVariable{
-		OwnerID: v.OwnerID,
-		RepoID:  v.RepoID,
-		Name:    v.Name,
-		Data:    v.Data,
+		OwnerID:     v.OwnerID,
+		RepoID:      v.RepoID,
+		Name:        v.Name,
+		Data:        v.Data,
+		Description: v.Description,
 	}
 
 	ctx.JSON(http.StatusOK, variable)
@@ -328,26 +308,121 @@ func ListVariables(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
-
+	listOptions := utils.GetListOptions(ctx)
 	vars, count, err := db.FindAndCount[actions_model.ActionVariable](ctx, &actions_model.FindVariablesOpts{
-		OwnerID:     ctx.Doer.ID,
-		ListOptions: utils.GetListOptions(ctx),
+		BelongingScope: actions_model.BelongingScopeOwner(ctx.Doer.ID),
+		ListOptions:    listOptions,
 	})
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "FindVariables", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	variables := make([]*api.ActionVariable, len(vars))
 	for i, v := range vars {
 		variables[i] = &api.ActionVariable{
-			OwnerID: v.OwnerID,
-			RepoID:  v.RepoID,
-			Name:    v.Name,
-			Data:    v.Data,
+			OwnerID:     v.OwnerID,
+			RepoID:      v.RepoID,
+			Name:        v.Name,
+			Data:        v.Data,
+			Description: v.Description,
 		}
 	}
 
+	ctx.SetLinkHeader(count, listOptions.PageSize)
 	ctx.SetTotalCountHeader(count)
 	ctx.JSON(http.StatusOK, variables)
+}
+
+// ListWorkflowRuns lists workflow runs
+func ListWorkflowRuns(ctx *context.APIContext) {
+	// swagger:operation GET /user/actions/runs user getUserWorkflowRuns
+	// ---
+	// summary: Get workflow runs
+	// parameters:
+	// - name: event
+	//   in: query
+	//   description: workflow event name
+	//   type: string
+	//   required: false
+	// - name: branch
+	//   in: query
+	//   description: workflow branch
+	//   type: string
+	//   required: false
+	// - name: status
+	//   in: query
+	//   description: workflow status (requested, pending, queued, in_progress, failure, success, skipped)
+	//   type: string
+	//   required: false
+	// - name: actor
+	//   in: query
+	//   description: triggered by user
+	//   type: string
+	//   required: false
+	// - name: head_sha
+	//   in: query
+	//   description: triggering sha of the workflow run
+	//   type: string
+	//   required: false
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WorkflowRunsList"
+	//   "400":
+	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+	shared.ListRuns(ctx, ctx.Doer.ID, 0, "")
+}
+
+// ListWorkflowJobs lists workflow jobs
+func ListWorkflowJobs(ctx *context.APIContext) {
+	// swagger:operation GET /user/actions/jobs user getUserWorkflowJobs
+	// ---
+	// summary: Get workflow jobs
+	// parameters:
+	// - name: status
+	//   in: query
+	//   description: workflow status (requested, pending, queued, in_progress, failure, success, skipped)
+	//   type: string
+	//   required: false
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// - name: sort
+	//   in: query
+	//   description: sort jobs by attribute. Supported values are "id". Default is "id"
+	//   type: string
+	// - name: order
+	//   in: query
+	//   description: sort order, either "asc" (ascending) or "desc" (descending). Default is "asc"
+	//   type: string
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/WorkflowJobsList"
+	//   "400":
+	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
+
+	shared.ListJobs(ctx, ctx.Doer.ID, 0, 0, nil)
 }

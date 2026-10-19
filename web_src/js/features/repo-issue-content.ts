@@ -1,41 +1,45 @@
-import $ from 'jquery';
-import {svg} from '../svg.ts';
+import {svgRaw} from '../svg.ts';
 import {showErrorToast} from '../modules/toast.ts';
 import {GET, POST} from '../modules/fetch.ts';
-import {showElem} from '../utils/dom.ts';
+import {createElementFromHTML, showElem} from '../utils/dom.ts';
+import {parseIssuePageInfo} from '../utils.ts';
+import {fomanticQuery} from '../modules/fomantic/base.ts';
+import {hideFomanticModal, showFomanticModal} from '../modules/fomantic/modal.ts';
+import {html, htmlRaw} from '../utils/html.ts';
+import type {JQueryElem} from '../types.ts';
 
-const {appSubUrl} = window.config;
-let i18nTextEdited;
-let i18nTextOptions;
-let i18nTextDeleteFromHistory;
-let i18nTextDeleteFromHistoryConfirm;
+let i18nTextEdited: string;
+let i18nTextOptions: string;
+let i18nTextDeleteFromHistory: string;
+let i18nTextDeleteFromHistoryConfirm: string;
 
-function showContentHistoryDetail(issueBaseUrl, commentId, historyId, itemTitleHtml) {
-  let $dialog = $('.content-history-detail-dialog');
-  if ($dialog.length) return;
-
-  $dialog = $(`
-<div class="ui modal content-history-detail-dialog">
-  ${svg('octicon-x', 16, 'close icon inside')}
-  <div class="header tw-flex tw-items-center tw-justify-between">
-    <div>${itemTitleHtml}</div>
-    <div class="ui dropdown dialog-header-options tw-mr-8 tw-hidden">
-      ${i18nTextOptions}
-      ${svg('octicon-triangle-down', 14, 'dropdown icon')}
-      <div class="menu">
-        <div class="item red text" data-option-item="delete">${i18nTextDeleteFromHistory}</div>
+function showContentHistoryDetail(issueBaseUrl: string, commentId: string, historyId: string, itemTitleHtml: string) {
+  const elDetailDialog = createElementFromHTML(html`
+    <div class="ui modal content-history-detail-dialog">
+      <div class="header flex-left-right">
+        <div>${htmlRaw(itemTitleHtml)}</div>
+        <div class="ui dropdown dialog-header-options tw-mx-4 tw-hidden">
+          ${i18nTextOptions}
+          ${svgRaw('octicon-triangle-down', 14, 'dropdown icon')}
+          <div class="menu">
+            <div class="item tw-text-red" data-option-item="delete">${i18nTextDeleteFromHistory}</div>
+          </div>
+        </div>
+        <button type="button" class="close-modal"></button>
       </div>
+      <div class="comment-diff-data is-loading"></div>
     </div>
-  </div>
-  <div class="comment-diff-data is-loading"></div>
-</div>`);
-  $dialog.appendTo($('body'));
-  $dialog.find('.dialog-header-options').dropdown({
+  `);
+  document.body.append(elDetailDialog);
+  const elOptionsDropdown = elDetailDialog.querySelector('.ui.dropdown.dialog-header-options')!;
+  const $fomanticDropdownOptions = fomanticQuery(elOptionsDropdown);
+  $fomanticDropdownOptions.dropdown({
     showOnFocus: false,
     allowReselection: true,
-    async onChange(_value, _text, $item) {
+    async onChange(_value: string, _text: string, $item: JQueryElem) {
       const optionItem = $item.data('option-item');
       if (optionItem === 'delete') {
+        // TODO: to use confirmModal instead of window.confirm, need to support multiple modals on the same page first.
         if (window.confirm(i18nTextDeleteFromHistoryConfirm)) {
           try {
             const params = new URLSearchParams();
@@ -46,7 +50,7 @@ function showContentHistoryDetail(issueBaseUrl, commentId, historyId, itemTitleH
             const resp = await response.json();
 
             if (resp.ok) {
-              $dialog.modal('hide');
+              hideFomanticModal(elDetailDialog);
             } else {
               showErrorToast(resp.message);
             }
@@ -60,10 +64,10 @@ function showContentHistoryDetail(issueBaseUrl, commentId, historyId, itemTitleH
       }
     },
     onHide() {
-      $(this).dropdown('clear', true);
+      $fomanticDropdownOptions.dropdown('clear', true);
     },
   });
-  $dialog.modal({
+  showFomanticModal(elDetailDialog, {
     async onShow() {
       try {
         const params = new URLSearchParams();
@@ -74,45 +78,47 @@ function showContentHistoryDetail(issueBaseUrl, commentId, historyId, itemTitleH
         const response = await GET(url);
         const resp = await response.json();
 
-        const commentDiffData = $dialog.find('.comment-diff-data')[0];
-        commentDiffData?.classList.remove('is-loading');
+        const commentDiffData = elDetailDialog.querySelector('.comment-diff-data')!;
+        commentDiffData.classList.remove('is-loading');
         commentDiffData.innerHTML = resp.diffHtml;
         // there is only one option "item[data-option-item=delete]", so the dropdown can be entirely shown/hidden.
         if (resp.canSoftDelete) {
-          showElem($dialog.find('.dialog-header-options'));
+          showElem(elOptionsDropdown);
         }
       } catch (error) {
         console.error('Error:', error);
       }
     },
     onHidden() {
-      $dialog.remove();
+      elDetailDialog.remove();
     },
-  }).modal('show');
+  });
 }
 
-function showContentHistoryMenu(issueBaseUrl, $item, commentId) {
-  const $headerLeft = $item.find('.comment-header-left');
-  const menuHtml = `
-  <div class="ui dropdown interact-fg content-history-menu" data-comment-id="${commentId}">
-    &bull; ${i18nTextEdited}${svg('octicon-triangle-down', 14, 'dropdown icon')}
-    <div class="menu">
+function showContentHistoryMenu(issueBaseUrl: string, elCommentItem: Element, commentId: string) {
+  const elHeaderLeft = elCommentItem.querySelector('.comment-header-left')!;
+  const menuHtml = html`
+    <div class="ui dropdown interact-fg content-history-menu tw-flex-shrink-0" data-comment-id="${commentId}">
+      &bull; ${i18nTextEdited}${svgRaw('octicon-triangle-down', 14, 'dropdown icon')}
+      <div class="menu">
+      </div>
     </div>
-  </div>`;
+  `;
 
-  $headerLeft.find(`.content-history-menu`).remove();
-  $headerLeft.append($(menuHtml));
-  $headerLeft.find('.dropdown').dropdown({
+  elHeaderLeft.querySelector(`.ui.dropdown.content-history-menu`)?.remove(); // remove the old one if exists
+  elHeaderLeft.append(createElementFromHTML(menuHtml));
+
+  const elDropdown = elHeaderLeft.querySelector('.ui.dropdown.content-history-menu')!;
+  const $fomanticDropdown = fomanticQuery(elDropdown);
+  $fomanticDropdown.dropdown({
     action: 'hide',
     apiSettings: {
-      cache: false,
       url: `${issueBaseUrl}/content-history/list?comment_id=${commentId}`,
     },
-    saveRemoteData: false,
     onHide() {
-      $(this).dropdown('change values', null);
+      $fomanticDropdown.dropdown('change values', null);
     },
-    onChange(value, itemHtml, $item) {
+    onChange(value: string, itemHtml: string, $item: JQueryElem) {
       if (value && !$item.find('[data-history-is-deleted=1]').length) {
         showContentHistoryDetail(issueBaseUrl, commentId, value, itemHtml);
       }
@@ -121,15 +127,14 @@ function showContentHistoryMenu(issueBaseUrl, $item, commentId) {
 }
 
 export async function initRepoIssueContentHistory() {
-  const issueIndex = $('#issueIndex').val();
-  if (!issueIndex) return;
+  const issuePageInfo = parseIssuePageInfo();
+  if (!issuePageInfo.issueNumber) return;
 
-  const $itemIssue = $('.repository.issue .timeline-item.comment.first'); // issue(PR) main content
-  const $comments = $('.repository.issue .comment-list .comment'); // includes: issue(PR) comments, review comments, code comments
-  if (!$itemIssue.length && !$comments.length) return;
+  const elIssueDescription = document.querySelector('.repository.issue .timeline-item.comment.issue-content-comment'); // issue(PR) main content
+  const elComments = document.querySelectorAll('.repository.issue .comment-list .comment'); // includes: issue(PR) comments, review comments, code comments
+  if (!elIssueDescription && !elComments.length) return;
 
-  const repoLink = $('#repolink').val();
-  const issueBaseUrl = `${appSubUrl}/${repoLink}/issues/${issueIndex}`;
+  const issueBaseUrl = `${issuePageInfo.repoLink}/issues/${issuePageInfo.issueNumber}`;
 
   try {
     const response = await GET(`${issueBaseUrl}/content-history/overview`);
@@ -140,13 +145,13 @@ export async function initRepoIssueContentHistory() {
     i18nTextDeleteFromHistoryConfirm = resp.i18n.textDeleteFromHistoryConfirm;
     i18nTextOptions = resp.i18n.textOptions;
 
-    if (resp.editedHistoryCountMap[0] && $itemIssue.length) {
-      showContentHistoryMenu(issueBaseUrl, $itemIssue, '0');
+    if (resp.editedHistoryCountMap[0] && elIssueDescription) {
+      showContentHistoryMenu(issueBaseUrl, elIssueDescription, '0');
     }
-    for (const [commentId, _editedCount] of Object.entries(resp.editedHistoryCountMap)) {
+    for (const commentId of Object.keys(resp.editedHistoryCountMap)) {
       if (commentId === '0') continue;
-      const $itemComment = $(`#issuecomment-${commentId}`);
-      showContentHistoryMenu(issueBaseUrl, $itemComment, commentId);
+      const elIssueComment = document.querySelector(`#issuecomment-${commentId}`);
+      if (elIssueComment) showContentHistoryMenu(issueBaseUrl, elIssueComment, commentId);
     }
   } catch (error) {
     console.error('Error:', error);

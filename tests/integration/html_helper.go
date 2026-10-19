@@ -4,8 +4,10 @@
 package integration
 
 import (
-	"bytes"
+	"io"
 	"testing"
+
+	"gitea.dev/modules/test"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/stretchr/testify/assert"
@@ -17,22 +19,16 @@ type HTMLDoc struct {
 }
 
 // NewHTMLParser parse html file
-func NewHTMLParser(t testing.TB, body *bytes.Buffer) *HTMLDoc {
+func NewHTMLParser(t testing.TB, body io.Reader) *HTMLDoc {
 	t.Helper()
 	doc, err := goquery.NewDocumentFromReader(body)
 	assert.NoError(t, err)
 	return &HTMLDoc{doc: doc}
 }
 
-// GetInputValueByID for get input value by id
-func (doc *HTMLDoc) GetInputValueByID(id string) string {
-	text, _ := doc.doc.Find("#" + id).Attr("value")
-	return text
-}
-
 // GetInputValueByName for get input value by name
 func (doc *HTMLDoc) GetInputValueByName(name string) string {
-	text, _ := doc.doc.Find("input[name=\"" + name + "\"]").Attr("value")
+	text, _ := doc.doc.Find(`input[name="` + name + `"]`).Attr("value")
 	return text
 }
 
@@ -43,17 +39,24 @@ func (doc *HTMLDoc) Find(selector string) *goquery.Selection {
 	return doc.doc.Find(selector)
 }
 
-// GetCSRF for getting CSRF token value from input
-func (doc *HTMLDoc) GetCSRF() string {
-	return doc.GetInputValueByName("_csrf")
+// AssertHTMLElement check if the element by selector exists or does not exist depending on checkExists
+func AssertHTMLElement[T int | bool](t testing.TB, doc *HTMLDoc, selector string, checkExists T) {
+	t.Helper()
+	sel := doc.doc.Find(selector)
+	switch v := any(checkExists).(type) {
+	case bool:
+		assert.Equal(t, v, sel.Length() > 0)
+	case int:
+		assert.Equal(t, v, sel.Length())
+	}
 }
 
-// AssertElement check if element by selector exists or does not exist depending on checkExists
-func (doc *HTMLDoc) AssertElement(t testing.TB, selector string, checkExists bool) {
-	sel := doc.doc.Find(selector)
-	if checkExists {
-		assert.Equal(t, 1, sel.Length())
-	} else {
-		assert.Equal(t, 0, sel.Length())
+func assertHTMLEq(t testing.TB, expected, actual string) {
+	t.Helper()
+	if expected == actual { // fast path
+		return
 	}
+	exp := test.NormalizeHTMLAttributes(t, expected)
+	act := test.NormalizeHTMLAttributes(t, actual)
+	assert.Equal(t, exp, act)
 }

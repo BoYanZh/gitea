@@ -1,34 +1,30 @@
 <script lang="ts" setup>
-import {SvgIcon} from '../svg.ts';
+import SvgIcon from './SvgIcon.vue';
 import {
   Chart,
   Tooltip,
   BarElement,
-  LinearScale,
-  TimeScale,
   type ChartOptions,
+  type ChartData,
+  type ChartDataset,
 } from 'chart.js';
 import {GET} from '../modules/fetch.ts';
-import {Bar} from 'vue-chartjs';
+import ChartCanvas from './ChartCanvas.vue';
 import {
   startDaysBetween,
   firstStartDateAfterDate,
   fillEmptyStartDaysWithZeroes,
   type DayData,
+  type DayDataObject,
 } from '../utils/time.ts';
 import {chartJsColors} from '../utils/color.ts';
+import {errorMessage} from '../modules/errors.ts';
 import {sleep} from '../utils.ts';
-import 'chartjs-adapter-dayjs-4/dist/chartjs-adapter-dayjs-4.esm';
-import {onMounted, ref} from 'vue';
+import {computed, onMounted, shallowRef} from 'vue';
 
 const {pageData} = window.config;
 
-Chart.defaults.color = chartJsColors.text;
-Chart.defaults.borderColor = chartJsColors.border;
-
 Chart.register(
-  TimeScale,
-  LinearScale,
   BarElement,
   Tooltip,
 );
@@ -41,10 +37,10 @@ defineProps<{
   };
 }>();
 
-const isLoading = ref(false);
-const errorText = ref('');
-const repoLink = ref(pageData.repoLink || []);
-const data = ref<DayData[]>([]);
+const isLoading = shallowRef(false);
+const errorText = shallowRef('');
+const repoLink = pageData.repoLink!;
+const data = shallowRef<DayData[]>([]);
 
 onMounted(() => {
   fetchGraphData();
@@ -55,29 +51,31 @@ async function fetchGraphData() {
   try {
     let response: Response;
     do {
-      response = await GET(`${repoLink.value}/activity/recent-commits/data`);
+      response = await GET(`${repoLink}/activity/recent-commits/data`);
       if (response.status === 202) {
         await sleep(1000); // wait for 1 second before retrying
       }
     } while (response.status === 202);
     if (response.ok) {
-      const data = await response.json();
-      const start = Object.values(data)[0].week;
+      const dayDataObj: DayDataObject = await response.json();
+      const start = Object.values(dayDataObj)[0].week;
       const end = firstStartDateAfterDate(new Date());
       const startDays = startDaysBetween(start, end);
-      data.value = fillEmptyStartDaysWithZeroes(startDays, data).slice(-52);
+      data.value = fillEmptyStartDaysWithZeroes(startDays, dayDataObj).slice(-52);
       errorText.value = '';
     } else {
       errorText.value = response.statusText;
     }
   } catch (err) {
-    errorText.value = err.message;
+    errorText.value = errorMessage(err);
   } finally {
     isLoading.value = false;
   }
 }
 
-function toGraphData(data) {
+const graphData = computed(() => toGraphData(data.value));
+
+function toGraphData(data: DayData[]): ChartData<'bar'> {
   return {
     datasets: [
       {
@@ -86,15 +84,14 @@ function toGraphData(data) {
         backgroundColor: chartJsColors['commits'],
         borderWidth: 0,
         tension: 0.3,
-      },
+      } as unknown as ChartDataset<'bar'>,
     ],
   };
 }
 
-const options = {
+const options: ChartOptions<'bar'> = {
   responsive: true,
   maintainAspectRatio: false,
-  animation: true,
   scales: {
     x: {
       type: 'time',
@@ -120,23 +117,23 @@ const options = {
 
 <template>
   <div>
-    <div class="ui header tw-flex tw-items-center tw-justify-between">
+    <div class="ui header">
       {{ isLoading ? locale.loadingTitle : errorText ? locale.loadingTitleFailed: "Number of commits in the past year" }}
     </div>
     <div class="tw-flex ui segment main-graph">
-      <div v-if="isLoading || errorText !== ''" class="gt-tc tw-m-auto">
+      <div v-if="isLoading || errorText !== ''" class="tw-m-auto">
         <div v-if="isLoading">
-          <SvgIcon name="octicon-sync" class="tw-mr-2 job-status-rotate"/>
+          <SvgIcon name="gitea-running" class="tw-mr-2 rotate-clockwise"/>
           {{ locale.loadingInfo }}
         </div>
-        <div v-else class="text red">
+        <div v-else class="tw-text-red">
           <SvgIcon name="octicon-x-circle-fill"/>
           {{ errorText }}
         </div>
       </div>
-      <Bar
-        v-memo="data" v-if="data.length !== 0"
-        :data="toGraphData(data)" :options="options"
+      <ChartCanvas
+        v-if="data.length !== 0"
+        type="bar" :data="graphData" :options="options"
       />
     </div>
   </div>

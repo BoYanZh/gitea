@@ -8,7 +8,6 @@ package common
 
 import (
 	"bytes"
-	"regexp"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -16,8 +15,6 @@ import (
 	"github.com/yuin/goldmark/text"
 	"github.com/yuin/goldmark/util"
 )
-
-var wwwURLRegxp = regexp.MustCompile(`^www\.[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]{2,6}((?:/|[#?])[-a-zA-Z0-9@:%_\+.~#!?&//=\(\);,'">\^{}\[\]` + "`" + `]*)?`)
 
 type linkifyParser struct{}
 
@@ -60,10 +57,10 @@ func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 	var protocol []byte
 	typ := ast.AutoLinkURL
 	if bytes.HasPrefix(line, protoHTTP) || bytes.HasPrefix(line, protoHTTPS) || bytes.HasPrefix(line, protoFTP) {
-		m = LinkRegex.FindSubmatchIndex(line)
+		m = GlobalVars().LinkifyRegex.FindSubmatchIndex(line)
 	}
 	if m == nil && bytes.HasPrefix(line, domainWWW) {
-		m = wwwURLRegxp.FindSubmatchIndex(line)
+		m = GlobalVars().wwwURLRegexp.FindSubmatchIndex(line)
 		protocol = []byte("http")
 	}
 	if m != nil {
@@ -73,9 +70,10 @@ func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 		} else if lastChar == ')' {
 			closing := 0
 			for i := m[1] - 1; i >= m[0]; i-- {
-				if line[i] == ')' {
+				switch line[i] {
+				case ')':
 					closing++
-				} else if line[i] == '(' {
+				case '(':
 					closing--
 				}
 			}
@@ -83,6 +81,7 @@ func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 				m[1] -= closing
 			}
 		} else if lastChar == ';' {
+			// exclude HTML entity reference, e.g.: exclude "&nbsp;" from "http://example.com?foo=1&nbsp;"
 			i := m[1] - 2
 			for ; i >= m[0]; i-- {
 				if util.IsAlphaNumeric(line[i]) {
@@ -92,7 +91,7 @@ func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 			}
 			if i != m[1]-2 {
 				if line[i] == '&' {
-					m[1] -= m[1] - i
+					m[1] = i
 				}
 			}
 		}

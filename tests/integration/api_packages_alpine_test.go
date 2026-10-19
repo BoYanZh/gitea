@@ -14,13 +14,12 @@ import (
 	"net/http"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	alpine_module "code.gitea.io/gitea/modules/packages/alpine"
-	alpine_service "code.gitea.io/gitea/services/packages/alpine"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	alpine_module "gitea.dev/modules/packages/alpine"
+	alpine_service "gitea.dev/services/packages/alpine"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -121,18 +120,18 @@ AACAX/AKARNTyAAoAAA=`
 						AddBasicAuth(user.Name)
 					MakeRequest(t, req, http.StatusCreated)
 
-					pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypeAlpine)
+					pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeAlpine)
 					assert.NoError(t, err)
 					assert.Len(t, pvs, 1)
 
-					pd, err := packages.GetPackageDescriptor(db.DefaultContext, pvs[0])
+					pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
 					assert.NoError(t, err)
 					assert.Nil(t, pd.SemVer)
 					assert.IsType(t, &alpine_module.VersionMetadata{}, pd.Metadata)
 					assert.Equal(t, packageName, pd.Package.Name)
 					assert.Equal(t, packageVersion, pd.Version.Version)
 
-					pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pvs[0].ID)
+					pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
 					assert.NoError(t, err)
 					assert.NotEmpty(t, pfs)
 					assert.Condition(t, func() bool {
@@ -148,7 +147,7 @@ AACAX/AKARNTyAAoAAA=`
 
 								assert.True(t, pf.IsLead)
 
-								pfps, err := packages.GetProperties(db.DefaultContext, packages.PropertyTypeFile, pf.ID)
+								pfps, err := packages.GetProperties(t.Context(), packages.PropertyTypeFile, pf.ID)
 								assert.NoError(t, err)
 
 								for _, pfp := range pfps {
@@ -266,6 +265,36 @@ AACAX/AKARNTyAAoAAA=`
 					}
 
 					req = NewRequest(t, "DELETE", fmt.Sprintf("%s/%s/%s/noarch/gitea-noarch-1.4-r0.apk", rootURL, branch, repository)).
+						AddBasicAuth(user.Name)
+					MakeRequest(t, req, http.StatusNoContent)
+				})
+
+				t.Run("NoArchOnly", func(t *testing.T) {
+					defer tests.PrintCurrentTest(t)()
+
+					// A repository that only contains noarch packages has no per-architecture index,
+					// but apk always requests the index for its own architecture (e.g. x86_64).
+					// That request must fall back to the noarch index instead of 404ing.
+					noarchRepository := repository + "-noarchonly"
+
+					req := NewRequestWithBody(t, "PUT", fmt.Sprintf("%s/%s/%s", rootURL, branch, noarchRepository), bytes.NewReader(noarchContent)).
+						AddBasicAuth(user.Name)
+					MakeRequest(t, req, http.StatusCreated)
+
+					req = NewRequest(t, "GET", fmt.Sprintf("%s/%s/%s/x86_64/APKINDEX.tar.gz", rootURL, branch, noarchRepository))
+					resp := MakeRequest(t, req, http.StatusOK)
+
+					content, err := readIndexContent(resp.Body)
+					assert.NoError(t, err)
+
+					assert.Contains(t, content, "C:Q1kbH5WoIPFccQYyATanaKXd2cJcc=\n")
+					assert.Contains(t, content, "A:noarch\n")
+
+					// The noarch index is still directly retrievable too.
+					req = NewRequest(t, "GET", fmt.Sprintf("%s/%s/%s/noarch/APKINDEX.tar.gz", rootURL, branch, noarchRepository))
+					MakeRequest(t, req, http.StatusOK)
+
+					req = NewRequest(t, "DELETE", fmt.Sprintf("%s/%s/%s/noarch/gitea-noarch-1.4-r0.apk", rootURL, branch, noarchRepository)).
 						AddBasicAuth(user.Name)
 					MakeRequest(t, req, http.StatusNoContent)
 				})

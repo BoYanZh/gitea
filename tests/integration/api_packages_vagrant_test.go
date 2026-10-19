@@ -7,19 +7,20 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/json"
-	vagrant_module "code.gitea.io/gitea/modules/packages/vagrant"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/json"
+	vagrant_module "gitea.dev/modules/packages/vagrant"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -35,7 +36,7 @@ func TestPackageVagrant(t *testing.T) {
 	packageDescription := "Test Description"
 	packageProvider := "virtualbox"
 
-	filename := fmt.Sprintf("%s.box", packageProvider)
+	filename := packageProvider + ".box"
 
 	infoContent, _ := json.Marshal(map[string]string{
 		"description": packageDescription,
@@ -53,13 +54,14 @@ func TestPackageVagrant(t *testing.T) {
 	archive.Close()
 	zw.Close()
 	content := buf.Bytes()
+	contentChecksum := sha512.Sum512(content)
 
 	root := fmt.Sprintf("/api/packages/%s/vagrant", user.Name)
 
 	t.Run("Authenticate", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
-		authenticateURL := fmt.Sprintf("%s/authenticate", root)
+		authenticateURL := root + "/authenticate"
 
 		req := NewRequest(t, "GET", authenticateURL)
 		MakeRequest(t, req, http.StatusUnauthorized)
@@ -90,24 +92,24 @@ func TestPackageVagrant(t *testing.T) {
 		resp := MakeRequest(t, req, http.StatusOK)
 		assert.True(t, strings.HasPrefix(resp.Header().Get("Content-Type"), "application/json"))
 
-		pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypeVagrant)
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeVagrant)
 		assert.NoError(t, err)
 		assert.Len(t, pvs, 1)
 
-		pd, err := packages.GetPackageDescriptor(db.DefaultContext, pvs[0])
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
 		assert.NoError(t, err)
 		assert.NotNil(t, pd.SemVer)
 		assert.IsType(t, &vagrant_module.Metadata{}, pd.Metadata)
 		assert.Equal(t, packageName, pd.Package.Name)
 		assert.Equal(t, packageVersion, pd.Version.Version)
 
-		pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pvs[0].ID)
+		pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
 		assert.NoError(t, err)
 		assert.Len(t, pfs, 1)
 		assert.Equal(t, filename, pfs[0].Name)
 		assert.True(t, pfs[0].IsLead)
 
-		pb, err := packages.GetBlobByID(db.DefaultContext, pfs[0].BlobID)
+		pb, err := packages.GetBlobByID(t.Context(), pfs[0].BlobID)
 		assert.NoError(t, err)
 		assert.Equal(t, int64(len(content)), pb.Size)
 
@@ -153,8 +155,7 @@ func TestPackageVagrant(t *testing.T) {
 			Versions         []*versionMetadata `json:"versions"`
 		}
 
-		var result packageMetadata
-		DecodeJSON(t, resp, &result)
+		result := DecodeJSON(t, resp, &packageMetadata{})
 
 		assert.Equal(t, packageName, result.Name)
 		assert.Equal(t, packageDescription, result.Description)
@@ -166,6 +167,6 @@ func TestPackageVagrant(t *testing.T) {
 		provider := version.Providers[0]
 		assert.Equal(t, packageProvider, provider.Name)
 		assert.Equal(t, "sha512", provider.ChecksumType)
-		assert.Equal(t, "259bebd6160acad695016d22a45812e26f187aaf78e71a4c23ee3201528346293f991af3468a8c6c5d2a21d7d9e1bdc1bf79b87110b2fddfcc5a0d45963c7c30", provider.Checksum)
+		assert.Equal(t, hex.EncodeToString(contentChecksum[:]), provider.Checksum)
 	})
 }

@@ -7,36 +7,39 @@ import (
 	"errors"
 	"net/http"
 
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/setting"
-	shared "code.gitea.io/gitea/routers/web/shared/secrets"
-	shared_user "code.gitea.io/gitea/routers/web/shared/user"
-	"code.gitea.io/gitea/services/context"
+	actions_model "gitea.dev/models/actions"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	shared "gitea.dev/routers/web/shared/secrets"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
 )
 
 const (
 	// TODO: Separate secrets from runners when layout is ready
-	tplRepoSecrets base.TplName = "repo/settings/actions"
-	tplOrgSecrets  base.TplName = "org/settings/actions"
-	tplUserSecrets base.TplName = "user/settings/actions"
+	tplRepoSecrets templates.TplName = "repo/settings/actions"
+	tplOrgSecrets  templates.TplName = "org/settings/actions"
+	tplUserSecrets templates.TplName = "user/settings/actions"
 )
 
 type secretsCtx struct {
-	OwnerID         int64
-	RepoID          int64
+	Owner           *user_model.User
+	Repo            *repo_model.Repository
+	BelongingScope  actions_model.BelongingScope
 	IsRepo          bool
 	IsOrg           bool
 	IsUser          bool
-	SecretsTemplate base.TplName
+	SecretsTemplate templates.TplName
 	RedirectLink    string
 }
 
 func getSecretsCtx(ctx *context.Context) (*secretsCtx, error) {
 	if ctx.Data["PageIsRepoSettings"] == true {
 		return &secretsCtx{
-			OwnerID:         0,
-			RepoID:          ctx.Repo.Repository.ID,
+			Repo:            ctx.Repo.Repository,
+			BelongingScope:  actions_model.BelongingScopeRepo(ctx.Repo.Repository.ID),
 			IsRepo:          true,
 			SecretsTemplate: tplRepoSecrets,
 			RedirectLink:    ctx.Repo.RepoLink + "/settings/actions/secrets",
@@ -44,14 +47,13 @@ func getSecretsCtx(ctx *context.Context) (*secretsCtx, error) {
 	}
 
 	if ctx.Data["PageIsOrgSettings"] == true {
-		err := shared_user.LoadHeaderCount(ctx)
-		if err != nil {
-			ctx.ServerError("LoadHeaderCount", err)
-			return nil, nil
+		if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+			ctx.ServerError("RenderUserOrgHeader", err)
+			return nil, nil //nolint:nilnil // error is already handled by ctx.ServerError
 		}
 		return &secretsCtx{
-			OwnerID:         ctx.ContextUser.ID,
-			RepoID:          0,
+			Owner:           ctx.ContextUser,
+			BelongingScope:  actions_model.BelongingScopeOwner(ctx.ContextUser.ID),
 			IsOrg:           true,
 			SecretsTemplate: tplOrgSecrets,
 			RedirectLink:    ctx.Org.OrgLink + "/settings/actions/secrets",
@@ -60,8 +62,8 @@ func getSecretsCtx(ctx *context.Context) (*secretsCtx, error) {
 
 	if ctx.Data["PageIsUserSettings"] == true {
 		return &secretsCtx{
-			OwnerID:         ctx.Doer.ID,
-			RepoID:          0,
+			Owner:           ctx.Doer,
+			BelongingScope:  actions_model.BelongingScopeOwner(ctx.Doer.ID),
 			IsUser:          true,
 			SecretsTemplate: tplUserSecrets,
 			RedirectLink:    setting.AppSubURL + "/user/settings/actions/secrets",
@@ -75,7 +77,6 @@ func Secrets(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("actions.actions")
 	ctx.Data["PageType"] = "secrets"
 	ctx.Data["PageIsSharedSettingsSecrets"] = true
-	ctx.Data["UserDisabledFeatures"] = user_model.DisabledFeaturesWithLoginType(ctx.Doer)
 
 	sCtx, err := getSecretsCtx(ctx)
 	if err != nil {
@@ -87,7 +88,7 @@ func Secrets(ctx *context.Context) {
 		ctx.Data["DisableSSH"] = setting.SSH.Disabled
 	}
 
-	shared.SetSecretsContext(ctx, sCtx.OwnerID, sCtx.RepoID)
+	shared.SetSecretsContext(ctx, sCtx.BelongingScope)
 	if ctx.Written() {
 		return
 	}
@@ -108,8 +109,9 @@ func SecretsPost(ctx *context.Context) {
 
 	shared.PerformSecretsPost(
 		ctx,
-		sCtx.OwnerID,
-		sCtx.RepoID,
+		sCtx.BelongingScope,
+		sCtx.Owner,
+		sCtx.Repo,
 		sCtx.RedirectLink,
 	)
 }
@@ -122,8 +124,9 @@ func SecretsDelete(ctx *context.Context) {
 	}
 	shared.PerformSecretsDelete(
 		ctx,
-		sCtx.OwnerID,
-		sCtx.RepoID,
+		sCtx.BelongingScope,
+		sCtx.Owner,
+		sCtx.Repo,
 		sCtx.RedirectLink,
 	)
 }

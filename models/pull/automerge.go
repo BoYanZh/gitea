@@ -7,21 +7,23 @@ import (
 	"context"
 	"fmt"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/timeutil"
 )
 
 // AutoMerge represents a pull request scheduled for merging when checks succeed
 type AutoMerge struct {
-	ID          int64                 `xorm:"pk autoincr"`
-	PullID      int64                 `xorm:"UNIQUE"`
-	DoerID      int64                 `xorm:"INDEX NOT NULL"`
-	Doer        *user_model.User      `xorm:"-"`
-	MergeStyle  repo_model.MergeStyle `xorm:"varchar(30)"`
-	Message     string                `xorm:"LONGTEXT"`
-	CreatedUnix timeutil.TimeStamp    `xorm:"created"`
+	ID                     int64                 `xorm:"pk autoincr"`
+	PullID                 int64                 `xorm:"UNIQUE"`
+	DoerID                 int64                 `xorm:"INDEX NOT NULL"`
+	Doer                   *user_model.User      `xorm:"-"`
+	MergeStyle             repo_model.MergeStyle `xorm:"varchar(30)"`
+	Message                string                `xorm:"LONGTEXT"`
+	DeleteBranchAfterMerge bool
+	CreatedUnix            timeutil.TimeStamp `xorm:"created"`
+	MergedCommitID         string             `xorm:"VARCHAR(64)"`
 }
 
 // TableName return database table name for xorm
@@ -49,7 +51,7 @@ func IsErrAlreadyScheduledToAutoMerge(err error) bool {
 }
 
 // ScheduleAutoMerge schedules a pull request to be merged when all checks succeed
-func ScheduleAutoMerge(ctx context.Context, doer *user_model.User, pullID int64, style repo_model.MergeStyle, message string) error {
+func ScheduleAutoMerge(ctx context.Context, doer *user_model.User, pullID int64, style repo_model.MergeStyle, message string, deleteBranchAfterMerge bool) error {
 	// Check if we already have a merge scheduled for that pull request
 	if exists, _, err := GetScheduledMergeByPullID(ctx, pullID); err != nil {
 		return err
@@ -58,10 +60,11 @@ func ScheduleAutoMerge(ctx context.Context, doer *user_model.User, pullID int64,
 	}
 
 	_, err := db.GetEngine(ctx).Insert(&AutoMerge{
-		DoerID:     doer.ID,
-		PullID:     pullID,
-		MergeStyle: style,
-		Message:    message,
+		DoerID:                 doer.ID,
+		PullID:                 pullID,
+		MergeStyle:             style,
+		Message:                message,
+		DeleteBranchAfterMerge: deleteBranchAfterMerge,
 	})
 	return err
 }
@@ -74,24 +77,16 @@ func GetScheduledMergeByPullID(ctx context.Context, pullID int64) (bool, *AutoMe
 		return false, nil, err
 	}
 
-	doer, err := user_model.GetUserByID(ctx, scheduledPRM.DoerID)
-	if err != nil {
-		return false, nil, err
-	}
-
-	scheduledPRM.Doer = doer
-	return true, scheduledPRM, nil
+	scheduledPRM.DoerID, scheduledPRM.Doer, err = user_model.GetPossibleUserByID(ctx, scheduledPRM.DoerID)
+	return true, scheduledPRM, err
 }
 
-// DeleteScheduledAutoMerge delete a scheduled pull request
-func DeleteScheduledAutoMerge(ctx context.Context, pullID int64) error {
-	exist, scheduledPRM, err := GetScheduledMergeByPullID(ctx, pullID)
-	if err != nil {
-		return err
-	} else if !exist {
-		return db.ErrNotExist{Resource: "auto_merge", ID: pullID}
-	}
+func GetScheduledMergePullIDsSince(ctx context.Context, since timeutil.TimeStamp) ([]int64, error) {
+	var pullIDs []int64
+	err := db.GetEngine(ctx).Table(&AutoMerge{}).Where("created_unix >= ?", since).Cols("pull_id").Find(&pullIDs)
+	return pullIDs, err
+}
 
-	_, err = db.GetEngine(ctx).ID(scheduledPRM.ID).Delete(&AutoMerge{})
-	return err
+func DeleteScheduledAutoMerge(ctx context.Context, pullID int64) (int64, error) {
+	return db.GetEngine(ctx).Where("pull_id = ?", pullID).Delete(&AutoMerge{})
 }

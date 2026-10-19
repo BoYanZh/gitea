@@ -4,13 +4,15 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/packages/container/helm"
-	"code.gitea.io/gitea/modules/validation"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/packages"
+	"gitea.dev/modules/packages/container/helm"
+	"gitea.dev/modules/validation"
 
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -71,19 +73,44 @@ type Manifest struct {
 	Size     int64  `json:"size"`
 }
 
+func IsMediaTypeValid(mt string) bool {
+	return strings.HasPrefix(mt, "application/vnd.docker.") || strings.HasPrefix(mt, "application/vnd.oci.")
+}
+
+func IsMediaTypeImageManifest(mt string) bool {
+	return strings.EqualFold(mt, oci.MediaTypeImageManifest) || strings.EqualFold(mt, "application/vnd.docker.distribution.manifest.v2+json")
+}
+
+func IsMediaTypeImageIndex(mt string) bool {
+	return strings.EqualFold(mt, oci.MediaTypeImageIndex) || strings.EqualFold(mt, "application/vnd.docker.distribution.manifest.list.v2+json")
+}
+
+const maxImageConfigSize = 8 * 1024 * 1024
+
 // ParseImageConfig parses the metadata of an image config
-func ParseImageConfig(mt string, r io.Reader) (*Metadata, error) {
-	if strings.EqualFold(mt, helm.ConfigMediaType) {
+func ParseImageConfig(mediaType string, r io.Reader) (*Metadata, error) {
+	r = packages.NewLimitedReader(r, maxImageConfigSize)
+	if strings.EqualFold(mediaType, helm.ConfigMediaType) {
 		return parseHelmConfig(r)
 	}
 
 	// fallback to OCI Image Config
-	return parseOCIImageConfig(r)
+	// FIXME: this fallback is not right, we should strictly check the media type in the future
+	metadata, err := parseOCIImageConfig(r)
+	if err != nil {
+		if !IsMediaTypeImageManifest(mediaType) && !errors.Is(err, packages.ErrContentTooLarge) {
+			return &Metadata{Platform: "unknown/unknown"}, nil
+		}
+		return nil, err
+	}
+	return metadata, nil
 }
 
 func parseOCIImageConfig(r io.Reader) (*Metadata, error) {
 	var image oci.Image
-	if err := json.NewDecoder(r).Decode(&image); err != nil {
+	// FIXME: JSON-KEY-CASE: here seems a abuse of the case-insensitive decoding feature, spec is case-sensitive
+	// https://github.com/opencontainers/image-spec/blob/main/schema/config-schema.json
+	if err := json.NewDecoderCaseInsensitive(r).Decode(&image); err != nil {
 		return nil, err
 	}
 

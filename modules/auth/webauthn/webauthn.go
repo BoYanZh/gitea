@@ -4,13 +4,14 @@
 package webauthn
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/gob"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/models/auth"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -21,57 +22,64 @@ var WebAuthn *webauthn.WebAuthn
 
 // Init initializes the WebAuthn instance from the config.
 func Init() {
-	gob.Register(&webauthn.SessionData{})
+	gob.Register(&webauthn.SessionData{}) // TODO: CHI-SESSION-GOB-REGISTER.
 
 	appURL, _ := protocol.FullyQualifiedOrigin(setting.AppURL)
 
 	WebAuthn = &webauthn.WebAuthn{
 		Config: &webauthn.Config{
-			RPDisplayName: setting.AppName,
-			RPID:          setting.Domain,
-			RPOrigins:     []string{appURL},
-			AuthenticatorSelection: protocol.AuthenticatorSelection{
-				UserVerification: protocol.VerificationDiscouraged,
-			},
-			AttestationPreference: protocol.PreferDirectAttestation,
+			RPDisplayName:         setting.AppName,
+			RPID:                  setting.AppDomain,
+			RPOrigins:             []string{appURL},
+			AttestationPreference: protocol.PreferNoAttestation, // Gitea never verifies attestation
+			// WebKit (Safari on iOS and macOS) returns an unsolicited "appid" client
+			// extension output even when the relying party did not request it. Since the
+			// webauthn library upgrade to v0.18, the default policy fails such ceremonies
+			// ('Client returned the appid extension output which was not requested'), breaking
+			// every passkey and security-key login from Safari on iOS. Ignore unsolicited
+			// extension outputs, the same policy other relying parties adopted for the
+			// same WebKit behavior.
+			ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyIgnore,
 		},
 	}
 }
 
-// User represents an implementation of webauthn.User based on User model
-type User user_model.User
+// user represents an implementation of webauthn.User based on User model
+type user struct {
+	ctx  context.Context
+	User *user_model.User
+
+	defaultAuthFlags protocol.AuthenticatorFlags
+}
+
+var _ webauthn.User = (*user)(nil)
+
+func NewWebAuthnUser(ctx context.Context, u *user_model.User, defaultAuthFlags ...protocol.AuthenticatorFlags) webauthn.User {
+	return &user{ctx: ctx, User: u, defaultAuthFlags: util.OptionalArg(defaultAuthFlags)}
+}
 
 // WebAuthnID implements the webauthn.User interface
-func (u *User) WebAuthnID() []byte {
+func (u *user) WebAuthnID() []byte {
 	id := make([]byte, 8)
-	binary.PutVarint(id, u.ID)
+	binary.PutVarint(id, u.User.ID)
 	return id
 }
 
 // WebAuthnName implements the webauthn.User interface
-func (u *User) WebAuthnName() string {
-	if u.LoginName == "" {
-		return u.Name
-	}
-	return u.LoginName
+func (u *user) WebAuthnName() string {
+	return util.IfZero(u.User.LoginName, u.User.Name)
 }
 
 // WebAuthnDisplayName implements the webauthn.User interface
-func (u *User) WebAuthnDisplayName() string {
-	return (*user_model.User)(u).DisplayName()
-}
-
-// WebAuthnIcon implements the webauthn.User interface
-func (u *User) WebAuthnIcon() string {
-	return (*user_model.User)(u).AvatarLink(db.DefaultContext)
+func (u *user) WebAuthnDisplayName() string {
+	return u.User.DisplayName()
 }
 
 // WebAuthnCredentials implements the webauthn.User interface
-func (u *User) WebAuthnCredentials() []webauthn.Credential {
-	dbCreds, err := auth.GetWebAuthnCredentialsByUID(db.DefaultContext, u.ID)
+func (u *user) WebAuthnCredentials() []webauthn.Credential {
+	dbCreds, err := auth.GetWebAuthnCredentialsByUID(u.ctx, u.User.ID)
 	if err != nil {
 		return nil
 	}
-
-	return dbCreds.ToCredentials()
+	return dbCreds.ToCredentials(u.defaultAuthFlags)
 }

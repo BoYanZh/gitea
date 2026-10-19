@@ -1,0 +1,111 @@
+// Copyright 2016 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package gitgraph
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"strings"
+
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/setting"
+)
+
+const gitLogGraphFormatSep = "^" // disallowed char in git ref names
+
+// GetCommitGraph return a list of commit (GraphItems) from all branches
+func GetCommitGraph(ctx context.Context, gitRepo *git.Repository, page, maxAllowedColors int, hidePRRefs bool, refs, files []string) (*Graph, error) {
+	format := "DATA:" + strings.Join([]string{
+		"%D",  // ref names without the " (", ")" wrapping.
+		"%H",  // commit hash
+		"%ad", // author date (format respects --date= option)
+		"%h",  // abbreviated commit hash
+		"%s",  // subject
+	}, gitLogGraphFormatSep)
+
+	page = max(page, 1)
+	graphCmd := gitcmd.NewCommand("log", "--graph", "--date-order", "--decorate=full")
+
+	if hidePRRefs {
+		graphCmd.AddArguments("--exclude=" + git.PullPrefix + "*")
+	}
+
+	if len(refs) == 0 {
+		graphCmd.AddArguments("--tags", "--branches")
+	}
+
+	graphCmd.AddArguments("--find-copies", "--find-renames", "--date=iso-strict").
+		AddOptionFormat("-n %d", setting.UI.GraphMaxCommitNum*page).
+		AddOptionFormat("--pretty=format:%s", format)
+
+	if len(refs) > 0 {
+		graphCmd.AddDynamicArguments(refs...)
+	}
+	if len(files) > 0 {
+		graphCmd.AddDashesAndList(files...)
+	}
+	graph := NewGraph()
+
+	commitsToSkip := setting.UI.GraphMaxCommitNum * (page - 1)
+
+	stdoutReader, stdoutReaderClose := graphCmd.MakeStdoutPipe()
+	defer stdoutReaderClose()
+	if err := graphCmd.
+		WithRepo(gitRepo).
+		WithPipelineFunc(func(ctx gitcmd.Context) error {
+			scanner := bufio.NewScanner(stdoutReader)
+			parser := &Parser{}
+			parser.firstInUse = -1
+			parser.maxAllowedColors = maxAllowedColors
+			if maxAllowedColors > 0 {
+				parser.availableColors = make([]int, maxAllowedColors)
+				for i := range parser.availableColors {
+					parser.availableColors[i] = i + 1
+				}
+			} else {
+				parser.availableColors = []int{1, 2}
+			}
+			for commitsToSkip > 0 && scanner.Scan() {
+				line := scanner.Bytes()
+				dataIdx := bytes.Index(line, []byte("DATA:"))
+				if dataIdx < 0 {
+					dataIdx = len(line)
+				}
+				starIdx := bytes.IndexByte(line, '*')
+				if starIdx >= 0 && starIdx < dataIdx {
+					commitsToSkip--
+				}
+				parser.ParseGlyphs(line[:dataIdx])
+			}
+
+			row := 0
+
+			// Skip initial non-commit lines
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if bytes.IndexByte(line, '*') >= 0 {
+					if err := parser.AddLineToGraph(graph, row, line); err != nil {
+						return ctx.CancelPipeline(err)
+					}
+					break
+				}
+				parser.ParseGlyphs(line)
+			}
+
+			for scanner.Scan() {
+				row++
+				line := scanner.Bytes()
+				if err := parser.AddLineToGraph(graph, row, line); err != nil {
+					return ctx.CancelPipeline(err)
+				}
+			}
+			return scanner.Err()
+		}).
+		RunWithStderr(ctx); err != nil {
+		return graph, err
+	}
+	return graph, nil
+}

@@ -8,10 +8,10 @@ import (
 	"io"
 	"net/http"
 
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/proxy"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/system"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/proxy"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/system"
 
 	"github.com/hashicorp/go-version"
 )
@@ -34,7 +34,7 @@ func GiteaUpdateChecker(httpEndpoint string) error {
 		},
 	}
 
-	req, err := http.NewRequest("GET", httpEndpoint, nil)
+	req, err := http.NewRequest(http.MethodGet, httpEndpoint, nil)
 	if err != nil {
 		return err
 	}

@@ -4,15 +4,14 @@
 package integration
 
 import (
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 
-	repo_module "code.gitea.io/gitea/modules/repository"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	repo_module "gitea.dev/modules/repository"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -23,8 +22,7 @@ func TestAPIListLabelTemplates(t *testing.T) {
 	req := NewRequest(t, "GET", "/api/v1/label/templates")
 	resp := MakeRequest(t, req, http.StatusOK)
 
-	var templateList []string
-	DecodeJSON(t, resp, &templateList)
+	templateList := DecodeJSON(t, resp, []string{})
 
 	for i := range repo_module.LabelTemplateFiles {
 		assert.Equal(t, repo_module.LabelTemplateFiles[i].DisplayName, templateList[i])
@@ -42,12 +40,11 @@ func TestAPIGetLabelTemplateInfo(t *testing.T) {
 	// Use the first template for the test
 	templateName := repo_module.LabelTemplateFiles[0].DisplayName
 
-	urlStr := fmt.Sprintf("/api/v1/label/templates/%s", url.PathEscape(templateName))
+	urlStr := "/api/v1/label/templates/" + url.PathEscape(templateName)
 	req := NewRequest(t, "GET", urlStr)
 	resp := MakeRequest(t, req, http.StatusOK)
 
-	var templateInfo []api.LabelTemplate
-	DecodeJSON(t, resp, &templateInfo)
+	templateInfo := DecodeJSON(t, resp, []api.LabelTemplate{})
 
 	labels, err := repo_module.LoadTemplateLabelsByDisplayName(templateName)
 	assert.NoError(t, err)

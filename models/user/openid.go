@@ -7,12 +7,11 @@ import (
 	"context"
 	"fmt"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/util"
-)
+	"gitea.dev/models/db"
+	"gitea.dev/modules/util"
 
-// ErrOpenIDNotExist openid is not known
-var ErrOpenIDNotExist = util.NewNotExistErrorf("OpenID is unknown")
+	"xorm.io/builder"
+)
 
 // UserOpenID is the list of all OpenID identities of a user.
 // Since this is a middle table, name it OpenID is not suitable, so we ignore the lint here
@@ -46,7 +45,7 @@ func isOpenIDUsed(ctx context.Context, uri string) (bool, error) {
 		return true, nil
 	}
 
-	return db.GetEngine(ctx).Get(&UserOpenID{URI: uri})
+	return db.Exist[UserOpenID](ctx, builder.Eq{"uri": uri})
 }
 
 // ErrOpenIDAlreadyUsed represents a "OpenIDAlreadyUsed" kind of error.
@@ -81,6 +80,17 @@ func AddUserOpenID(ctx context.Context, openid *UserOpenID) error {
 	return db.Insert(ctx, openid)
 }
 
+// GetUserOpenIDByID returns the OpenID with the given ID owned by uid.
+func GetUserOpenIDByID(ctx context.Context, id, uid int64) (*UserOpenID, error) {
+	oid, has, err := db.Get[UserOpenID](ctx, builder.Eq{"id": id, "uid": uid})
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, util.NewNotExistErrorf("OpenID is unknown")
+	}
+	return oid, nil
+}
+
 // DeleteUserOpenID deletes an openid address of given user.
 func DeleteUserOpenID(ctx context.Context, openid *UserOpenID) (err error) {
 	var deleted int64
@@ -99,13 +109,19 @@ func DeleteUserOpenID(ctx context.Context, openid *UserOpenID) (err error) {
 	if err != nil {
 		return err
 	} else if deleted != 1 {
-		return ErrOpenIDNotExist
+		return util.NewNotExistErrorf("OpenID is unknown")
 	}
 	return nil
 }
 
 // ToggleUserOpenIDVisibility toggles visibility of an openid address of given user.
-func ToggleUserOpenIDVisibility(ctx context.Context, id int64) (err error) {
-	_, err = db.GetEngine(ctx).Exec("update `user_open_id` set `show` = not `show` where `id` = ?", id)
-	return err
+func ToggleUserOpenIDVisibility(ctx context.Context, id int64, user *User) error {
+	affected, err := db.GetEngine(ctx).Exec("update `user_open_id` set `show` = not `show` where `id` = ? AND uid = ?", id, user.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := affected.RowsAffected(); n != 1 {
+		return util.NewNotExistErrorf("OpenID is unknown")
+	}
+	return nil
 }

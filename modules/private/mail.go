@@ -6,7 +6,7 @@ package private
 import (
 	"context"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
 )
 
 // Email structure holds a data for sending general emails
@@ -23,7 +23,7 @@ type Email struct {
 func SendEmail(ctx context.Context, subject, message string, to []string) (*ResponseText, ResponseExtra) {
 	reqURL := setting.LocalURL + "api/internal/mail/send"
 
-	req := newInternalRequest(ctx, reqURL, "POST", Email{
+	req := newInternalRequestAPI(ctx, reqURL, "POST", Email{
 		Subject: subject,
 		Message: message,
 		To:      to,

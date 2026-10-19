@@ -4,39 +4,28 @@
 package cmd
 
 import (
-	"fmt"
+	"context"
 
-	"code.gitea.io/gitea/modules/private"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/private"
+	"gitea.dev/modules/setting"
 
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
-func runSendMail(c *cli.Context) error {
-	ctx, cancel := installSignals()
-	defer cancel()
-
+func runSendMail(ctx context.Context, c *cli.Command) error {
 	setting.MustInstalled()
 
-	if err := argsSet(c, "title"); err != nil {
-		return err
-	}
-
 	subject := c.String("title")
-	confirmSkiped := c.Bool("force")
+	confirmSkipped := c.Bool("force")
 	body := c.String("content")
 
-	if !confirmSkiped {
+	if !confirmSkipped {
 		if len(body) == 0 {
-			fmt.Print("warning: Content is empty")
+			cprintln(c, "warning: Content is empty")
 		}
 
-		fmt.Print("Proceed with sending email? [Y/n] ")
-		isConfirmed, err := confirm()
-		if err != nil {
-			return err
-		} else if !isConfirmed {
-			fmt.Println("The mail was not sent")
+		if !confirm(c.Reader, c.Writer, "Proceed with sending email? [Y/n] ") {
+			cprintln(c, "The mail was not sent")
 			return nil
 		}
 	}
@@ -45,6 +34,6 @@ func runSendMail(c *cli.Context) error {
 	if extra.HasError() {
 		return handleCliResponseExtra(extra)
 	}
-	_, _ = fmt.Printf("Sent %s email(s) to all users\n", respText.Text)
+	cprintf(c, "Sent %s email(s) to all users\n", respText.Text)
 	return nil
 }

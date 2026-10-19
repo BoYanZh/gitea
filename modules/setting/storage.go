@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -30,12 +31,7 @@ var storageTypes = []StorageType{
 
 // IsValidStorageType returns true if the given storage type is valid
 func IsValidStorageType(storageType StorageType) bool {
-	for _, t := range storageTypes {
-		if t == storageType {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(storageTypes, storageType)
 }
 
 // MinioStorageConfig represents the configuration for a minio storage
@@ -43,6 +39,7 @@ type MinioStorageConfig struct {
 	Endpoint           string `ini:"MINIO_ENDPOINT" json:",omitempty"`
 	AccessKeyID        string `ini:"MINIO_ACCESS_KEY_ID" json:",omitempty"`
 	SecretAccessKey    string `ini:"MINIO_SECRET_ACCESS_KEY" json:",omitempty"`
+	IamEndpoint        string `ini:"MINIO_IAM_ENDPOINT" json:",omitempty"`
 	Bucket             string `ini:"MINIO_BUCKET" json:",omitempty"`
 	Location           string `ini:"MINIO_LOCATION" json:",omitempty"`
 	BasePath           string `ini:"MINIO_BASE_PATH" json:",omitempty"`
@@ -62,7 +59,6 @@ func (cfg *MinioStorageConfig) ToShadow() {
 	}
 }
 
-// MinioStorageConfig represents the configuration for a minio storage
 type AzureBlobStorageConfig struct {
 	Endpoint    string `ini:"AZURE_BLOB_ENDPOINT" json:",omitempty"`
 	AccountName string `ini:"AZURE_BLOB_ACCOUNT_NAME" json:",omitempty"`
@@ -107,20 +103,20 @@ const storageSectionName = "storage"
 func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
 	storageSec := rootCfg.Section(storageSectionName)
 	// Global Defaults
-	storageSec.Key("STORAGE_TYPE").MustString("local")
-	storageSec.Key("MINIO_ENDPOINT").MustString("localhost:9000")
-	storageSec.Key("MINIO_ACCESS_KEY_ID").MustString("")
-	storageSec.Key("MINIO_SECRET_ACCESS_KEY").MustString("")
-	storageSec.Key("MINIO_BUCKET").MustString("gitea")
-	storageSec.Key("MINIO_LOCATION").MustString("us-east-1")
-	storageSec.Key("MINIO_USE_SSL").MustBool(false)
-	storageSec.Key("MINIO_INSECURE_SKIP_VERIFY").MustBool(false)
-	storageSec.Key("MINIO_CHECKSUM_ALGORITHM").MustString("default")
-	storageSec.Key("MINIO_BUCKET_LOOKUP_TYPE").MustString("auto")
-	storageSec.Key("AZURE_BLOB_ENDPOINT").MustString("")
-	storageSec.Key("AZURE_BLOB_ACCOUNT_NAME").MustString("")
-	storageSec.Key("AZURE_BLOB_ACCOUNT_KEY").MustString("")
-	storageSec.Key("AZURE_BLOB_CONTAINER").MustString("gitea")
+	storageSec.Key("STORAGE_TYPE").MustString("local")               // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_ENDPOINT").MustString("localhost:9000")    // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_ACCESS_KEY_ID").MustString("")             // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_SECRET_ACCESS_KEY").MustString("")         // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_BUCKET").MustString("gitea")               // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_LOCATION").MustString("us-east-1")         // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_USE_SSL").MustBool(false)                  // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_INSECURE_SKIP_VERIFY").MustBool(false)     // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_CHECKSUM_ALGORITHM").MustString("default") // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("MINIO_BUCKET_LOOKUP_TYPE").MustString("auto")    // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("AZURE_BLOB_ENDPOINT").MustString("")             // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("AZURE_BLOB_ACCOUNT_NAME").MustString("")         // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("AZURE_BLOB_ACCOUNT_KEY").MustString("")          // FIXME: INI-MUST-SIDE-EFFECT
+	storageSec.Key("AZURE_BLOB_CONTAINER").MustString("gitea")       // FIXME: INI-MUST-SIDE-EFFECT
 	return storageSec
 }
 
@@ -161,7 +157,7 @@ const (
 	targetSecIsSec                                  // target section is from the name seciont [name]
 )
 
-func getStorageSectionByType(rootCfg ConfigProvider, typ string) (ConfigSection, targetSecType, error) { //nolint:unparam
+func getStorageSectionByType(rootCfg ConfigProvider, typ string) (ConfigSection, targetSecType, error) { //nolint:unparam // FIXME: targetSecType is always 0, wrong design?
 	targetSec, err := rootCfg.GetSection(storageSectionName + "." + typ)
 	if err != nil {
 		if !IsValidStorageType(StorageType(typ)) {
@@ -175,11 +171,11 @@ func getStorageSectionByType(rootCfg ConfigProvider, typ string) (ConfigSection,
 	targetType := targetSec.Key("STORAGE_TYPE").String()
 	if targetType == "" {
 		if !IsValidStorageType(StorageType(typ)) {
-			return nil, 0, fmt.Errorf("unknow storage type %q", typ)
+			return nil, 0, fmt.Errorf("unknown storage type %q", typ)
 		}
 		targetSec.Key("STORAGE_TYPE").SetValue(typ)
 	} else if !IsValidStorageType(StorageType(targetType)) {
-		return nil, 0, fmt.Errorf("unknow storage type %q for section storage.%v", targetType, typ)
+		return nil, 0, fmt.Errorf("unknown storage type %q for section storage.%v", targetType, typ)
 	}
 
 	return targetSec, targetSecIsTyp, nil
@@ -205,12 +201,12 @@ func getStorageTargetSection(rootCfg ConfigProvider, name, typ string, sec Confi
 		}
 	}
 
-	// check stoarge name thirdly
+	// check storage name thirdly
 	targetSec, _ := rootCfg.GetSection(storageSectionName + "." + name)
 	if targetSec != nil {
 		targetType := targetSec.Key("STORAGE_TYPE").String()
-		switch {
-		case targetType == "":
+		switch targetType {
+		case "":
 			if targetSec.Key("PATH").String() == "" { // both storage type and path are empty, use default
 				return getDefaultStorageSection(rootCfg), targetSecIsDefault, nil
 			}
@@ -286,7 +282,7 @@ func getStorageForLocal(targetSec, overrideSec ConfigSection, tp targetSecType, 
 	return &storage, nil
 }
 
-func getStorageForMinio(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) { //nolint:dupl
+func getStorageForMinio(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) { //nolint:dupl // duplicates azure setup
 	var storage Storage
 	storage.Type = StorageType(targetSec.Key("STORAGE_TYPE").String())
 	if err := targetSec.MapTo(&storage.MinioConfig); err != nil {
@@ -315,7 +311,7 @@ func getStorageForMinio(targetSec, overrideSec ConfigSection, tp targetSecType, 
 	return &storage, nil
 }
 
-func getStorageForAzureBlob(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) { //nolint:dupl
+func getStorageForAzureBlob(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) { //nolint:dupl // duplicates minio setup
 	var storage Storage
 	storage.Type = StorageType(targetSec.Key("STORAGE_TYPE").String())
 	if err := targetSec.MapTo(&storage.AzureBlobConfig); err != nil {

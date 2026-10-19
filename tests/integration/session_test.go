@@ -5,33 +5,31 @@ package integration
 
 import (
 	"testing"
+	"time"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/auth"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func Test_RegenerateSession(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
+func TestUpdateSession(t *testing.T) {
+	defer tests.PrintCurrentTest(t)()
+	defer timeutil.MockSet(time.Now())()
+	key := "0123456789abcdef"
+	for _, create := range []bool{true, true, false} {
+		require.NoError(t, auth.UpdateSession(t.Context(), key, []byte("data"), create))
+	}
+	sess, exist, err := auth.GetSession(t.Context(), key)
+	require.NoError(t, err)
+	require.True(t, exist)
+	assert.Equal(t, []byte("data"), sess.Data)
 
-	assert.NoError(t, unittest.PrepareTestDatabase())
-
-	key := "new_key890123456"  // it must be 16 characters long
-	key2 := "new_key890123457" // it must be 16 characters
-	exist, err := auth.ExistSession(db.DefaultContext, key)
-	assert.NoError(t, err)
+	require.NoError(t, auth.DestroySession(t.Context(), key))
+	require.NoError(t, auth.UpdateSession(t.Context(), key, []byte("data"), false))
+	_, exist, err = auth.GetSession(t.Context(), key)
+	require.NoError(t, err)
 	assert.False(t, exist)
-
-	sess, err := auth.RegenerateSession(db.DefaultContext, "", key)
-	assert.NoError(t, err)
-	assert.EqualValues(t, key, sess.Key)
-	assert.Len(t, sess.Data, 0)
-
-	sess, err = auth.ReadSession(db.DefaultContext, key2)
-	assert.NoError(t, err)
-	assert.EqualValues(t, key2, sess.Key)
-	assert.Len(t, sess.Data, 0)
 }

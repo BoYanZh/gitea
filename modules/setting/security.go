@@ -8,13 +8,53 @@ import (
 	"os"
 	"strings"
 
-	"code.gitea.io/gitea/modules/auth/password/hash"
-	"code.gitea.io/gitea/modules/generate"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/auth/password/hash"
+	"gitea.dev/modules/egress/policy"
+	"gitea.dev/modules/generate"
+	"gitea.dev/modules/log"
 )
 
+// Security settings
+var Security = struct {
+	// TODO: move more settings to this struct in future
+	XFrameOptions       string
+	XContentTypeOptions string
+
+	ContentSecurityPolicyGeneral string // it only supports empty (default policy) or "unset", maybe it can support more in the future
+	EgressMode                   string
+	AllowedHostList              string
+}{
+	XFrameOptions:       "SAMEORIGIN",
+	XContentTypeOptions: "nosniff",
+	EgressMode:          "lax",
+}
+
+// normalizePolicyMode validates a lax/strict egress policy EGRESS_MODE value, empty defaults to lax
+func normalizePolicyMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "":
+		return "lax"
+	case "lax", "strict":
+		return mode
+	default:
+		log.Fatal("Invalid egress policy EGRESS_MODE %q, use lax or strict", mode)
+		return ""
+	}
+}
+
+// checkHostList reports the entries an egress host list drops, a dropped block entry would allow a blocked host so it stops startup
+func checkHostList(key, hostList string, isBlockList bool) {
+	rejected := policy.NewAllowList(hostList, policy.Lax).Rejected()
+	for _, reason := range rejected {
+		LogStartupProblem(1, log.ERROR, "%s ignores an invalid entry: %s", key, reason)
+	}
+	if isBlockList && len(rejected) > 0 {
+		log.Fatal("%s has invalid entries, fix them so no blocked host is allowed", key)
+	}
+}
+
 var (
-	// Security settings
 	InstallLock                        bool
 	SecretKey                          string
 	InternalToken                      string // internal access token
@@ -24,10 +64,11 @@ var (
 	ReverseProxyAuthEmail              string
 	ReverseProxyAuthFullName           string
 	ReverseProxyLimit                  int
+	ReverseProxyLogoutRedirect         string
 	ReverseProxyTrustedProxies         []string
 	MinPasswordLength                  int
 	ImportLocalPaths                   bool
-	DisableGitHooks                    bool
+	DisableGitHooks                    = true
 	DisableWebhooks                    bool
 	OnlyAllowPushIfGiteaEnvironmentSet bool
 	PasswordComplexity                 []string
@@ -35,9 +76,8 @@ var (
 	PasswordCheckPwn                   bool
 	SuccessfulTokensCacheSize          int
 	DisableQueryAuthToken              bool
-	CSRFCookieName                     = "_csrf"
-	CSRFCookieHTTPOnly                 = true
 	RecordUserSignupMetadata           = false
+	TwoFactorAuthEnforced              = false
 )
 
 // loadSecret load the secret from ini by uriKey or verbatimKey, only one of them could be set
@@ -103,22 +143,22 @@ func generateSaveInternalToken(rootCfg ConfigProvider) {
 
 func loadSecurityFrom(rootCfg ConfigProvider) {
 	sec := rootCfg.Section("security")
-	InstallLock = HasInstallLock(rootCfg)
 	LogInRememberDays = sec.Key("LOGIN_REMEMBER_DAYS").MustInt(31)
 	SecretKey = loadSecret(sec, "SECRET_KEY_URI", "SECRET_KEY")
 	if SecretKey == "" {
 		// FIXME: https://github.com/go-gitea/gitea/issues/16832
 		// Until it supports rotating an existing secret key, we shouldn't move users off of the widely used default value
-		SecretKey = "!#@FDEWREWR&*(" //nolint:gosec
+		SecretKey = "!#@FDEWREWR&*("
 	}
 
-	CookieRememberName = sec.Key("COOKIE_REMEMBER_NAME").MustString("gitea_incredible")
+	CookieRememberName = sec.Key("COOKIE_REMEMBER_NAME").MustString("gitea_remember")
 
 	ReverseProxyAuthUser = sec.Key("REVERSE_PROXY_AUTHENTICATION_USER").MustString("X-WEBAUTH-USER")
 	ReverseProxyAuthEmail = sec.Key("REVERSE_PROXY_AUTHENTICATION_EMAIL").MustString("X-WEBAUTH-EMAIL")
 	ReverseProxyAuthFullName = sec.Key("REVERSE_PROXY_AUTHENTICATION_FULL_NAME").MustString("X-WEBAUTH-FULLNAME")
 
 	ReverseProxyLimit = sec.Key("REVERSE_PROXY_LIMIT").MustInt(1)
+	ReverseProxyLogoutRedirect = sec.Key("REVERSE_PROXY_LOGOUT_REDIRECT").String()
 	ReverseProxyTrustedProxies = sec.Key("REVERSE_PROXY_TRUSTED_PROXIES").Strings(",")
 	if len(ReverseProxyTrustedProxies) == 0 {
 		ReverseProxyTrustedProxies = []string{"127.0.0.0/8", "::1/128"}
@@ -137,9 +177,27 @@ func loadSecurityFrom(rootCfg ConfigProvider) {
 		log.Fatal("The provided password hash algorithm was invalid: %s", sec.Key("PASSWORD_HASH_ALGO").MustString(""))
 	}
 
-	CSRFCookieHTTPOnly = sec.Key("CSRF_COOKIE_HTTP_ONLY").MustBool(true)
 	PasswordCheckPwn = sec.Key("PASSWORD_CHECK_PWN").MustBool(false)
 	SuccessfulTokensCacheSize = sec.Key("SUCCESSFUL_TOKENS_CACHE_SIZE").MustInt(20)
+
+	if err := sec.MapTo(&Security); err != nil {
+		log.Fatal("Failed to map security settings: %v", err)
+	}
+	egressModeSet := sec.HasKey("EGRESS_MODE")
+	Security.EgressMode = normalizePolicyMode(sec.Key("EGRESS_MODE").String())
+	checkHostList("[security] ALLOWED_HOST_LIST", Security.AllowedHostList, false)
+	if Security.AllowedHostList != "" && !egressModeSet {
+		LogStartupProblem(1, log.WARN, "[security] ALLOWED_HOST_LIST only restricts private hosts in the default lax mode, set EGRESS_MODE = strict to allow only the listed hosts, or lax to keep this")
+	}
+
+	twoFactorAuth := sec.Key("TWO_FACTOR_AUTH").String()
+	switch twoFactorAuth {
+	case "":
+	case "enforced":
+		TwoFactorAuthEnforced = true
+	default:
+		log.Fatal("Invalid two-factor auth option: %s", twoFactorAuth)
+	}
 
 	InternalToken = loadSecret(sec, "INTERNAL_TOKEN_URI", "INTERNAL_TOKEN")
 	if InstallLock && InternalToken == "" {

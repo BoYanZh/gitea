@@ -1,0 +1,43 @@
+// Copyright 2025 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package user
+
+import (
+	"context"
+
+	"gitea.dev/models/db"
+)
+
+func GetUsersMapByIDs(ctx context.Context, userIDs []int64) (map[int64]*User, error) {
+	userMaps := make(map[int64]*User, len(userIDs))
+	if len(userIDs) == 0 {
+		return userMaps, nil
+	}
+
+	err := db.QueryAndProcessByChunk(userIDs, func(chunk []int64) (out []*User, err error) {
+		err = db.GetEngine(ctx).In("id", chunk).Find(&out)
+		return out, err
+	}, func(user *User) error {
+		userMaps[user.ID] = user
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return userMaps, nil
+}
+
+func GetPossibleUserFromMap(userID int64, usererMaps map[int64]*User) *User {
+	if userID == 0 {
+		return nil
+	}
+	if newFunc, ok := globalVars().systemUserNewFuncs[userID]; ok {
+		return newFunc()
+	}
+	user, ok := usererMaps[userID]
+	if !ok {
+		return NewGhostUser()
+	}
+	return user
+}

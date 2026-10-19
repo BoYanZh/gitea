@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"hash"
 	"math/big"
@@ -23,10 +24,10 @@ import (
 	"strings"
 	"time"
 
-	user_model "code.gitea.io/gitea/models/user"
-	chef_module "code.gitea.io/gitea/modules/packages/chef"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/services/auth"
+	user_model "gitea.dev/models/user"
+	chef_module "gitea.dev/modules/packages/chef"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/auth"
 )
 
 const (
@@ -60,7 +61,7 @@ func (a *Auth) Verify(req *http.Request, w http.ResponseWriter, store auth.DataS
 		return nil, err
 	}
 	if u == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil // the auth method is not applicable
 	}
 
 	pub, err := getUserPublicKey(req.Context(), u)
@@ -77,7 +78,12 @@ func (a *Auth) Verify(req *http.Request, w http.ResponseWriter, store auth.DataS
 		return nil, err
 	}
 
-	if err := verifySignedHeaders(req, version, pub.(*rsa.PublicKey)); err != nil {
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("public key is not a RSA key")
+	}
+
+	if err := verifySignedHeaders(req, version, rsaPub); err != nil {
 		return nil, err
 	}
 
@@ -87,7 +93,7 @@ func (a *Auth) Verify(req *http.Request, w http.ResponseWriter, store auth.DataS
 func getUserFromRequest(req *http.Request) (*user_model.User, error) {
 	username := req.Header.Get("X-Ops-Userid")
 	if username == "" {
-		return nil, nil
+		return nil, nil //nolint:nilnil // the auth method is not applicable
 	}
 
 	return user_model.GetUserByName(req.Context(), username)
@@ -121,7 +127,7 @@ func verifyTimestamp(req *http.Request) error {
 	}
 
 	if diff > maxTimeDifference {
-		return fmt.Errorf("time difference")
+		return errors.New("time difference")
 	}
 
 	return nil
@@ -190,7 +196,7 @@ func getAuthorizationData(req *http.Request) ([]byte, error) {
 	tmp := make([]string, len(valueList))
 	for k, v := range valueList {
 		if k > len(tmp) {
-			return nil, fmt.Errorf("invalid X-Ops-Authorization headers")
+			return nil, errors.New("invalid X-Ops-Authorization headers")
 		}
 		tmp[k-1] = v
 	}
@@ -267,7 +273,7 @@ func verifyDataOld(signature, data []byte, pub *rsa.PublicKey) error {
 	}
 
 	if !slices.Equal(out[skip:], data) {
-		return fmt.Errorf("could not verify signature")
+		return errors.New("could not verify signature")
 	}
 
 	return nil

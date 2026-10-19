@@ -9,23 +9,23 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"uuid"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/web/middleware"
-	"code.gitea.io/gitea/services/auth/source/sspi"
-	gitea_context "code.gitea.io/gitea/services/context"
-
-	gouuid "github.com/google/uuid"
+	audit_model "gitea.dev/models/audit"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/auth/source/sspi"
+	gitea_context "gitea.dev/services/context"
 )
 
 const (
-	tplSignIn base.TplName = "user/auth/signin"
+	tplSignIn templates.TplName = "user/auth/signin"
 )
 
 type SSPIAuth interface {
@@ -47,7 +47,9 @@ var (
 // The SSPI plugin is expected to be executed last, as it returns 401 status code if negotiation
 // fails (or if negotiation should continue), which would prevent other authentication methods
 // to execute at all.
-type SSPI struct{}
+type SSPI struct {
+	CreateSession bool
+}
 
 // Name represents the name of auth method
 func (s *SSPI) Name() string {
@@ -64,7 +66,7 @@ func (s *SSPI) Verify(req *http.Request, w http.ResponseWriter, store DataStore,
 		return nil, sspiAuthErrInit
 	}
 	if !s.shouldAuthenticate(req) {
-		return nil, nil
+		return nil, nil //nolint:nilnil // the auth method is not applicable
 	}
 
 	cfg, err := s.getConfig(req.Context())
@@ -89,7 +91,7 @@ func (s *SSPI) Verify(req *http.Request, w http.ResponseWriter, store DataStore,
 		store.GetData()["EnableSSPI"] = true
 		// in this case, the Verify function is called in Gitea's web context
 		// FIXME: it doesn't look good to render the page here, why not redirect?
-		gitea_context.GetWebContext(req).HTML(http.StatusUnauthorized, tplSignIn)
+		gitea_context.GetWebContext(req.Context()).HTML(http.StatusUnauthorized, tplSignIn)
 		return nil, err
 	}
 	if outToken != "" {
@@ -98,7 +100,7 @@ func (s *SSPI) Verify(req *http.Request, w http.ResponseWriter, store DataStore,
 
 	username := sanitizeUsername(userInfo.Username, cfg)
 	if len(username) == 0 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // the auth method is not applicable
 	}
 	log.Info("Authenticated as %s\n", username)
 
@@ -110,18 +112,20 @@ func (s *SSPI) Verify(req *http.Request, w http.ResponseWriter, store DataStore,
 		}
 		if !cfg.AutoCreateUsers {
 			log.Error("User '%s' not found", username)
-			return nil, nil
+			return nil, nil //nolint:nilnil // the auth method is not applicable
 		}
 		user, err = s.newUser(req.Context(), username, cfg)
 		if err != nil {
 			log.Error("CreateUser: %v", err)
 			return nil, err
 		}
+	} else if !user.IsIndividual() {
+		log.Trace("SSPI Authorization: user %q is not an individual, ignoring", username)
+		return nil, nil //nolint:nilnil // the auth method is not applicable
 	}
 
-	// Make sure requests to API paths and PWA resources do not create a new session
-	if !middleware.IsAPIPath(req) && !isAttachmentDownload(req) {
-		handleSignIn(w, req, sess, user)
+	if s.CreateSession {
+		handleSignInNonInteractive(w, req, sess, user)
 	}
 
 	log.Trace("SSPI Authorization: Logged in user %-v", user)
@@ -143,28 +147,20 @@ func (s *SSPI) getConfig(ctx context.Context) (*sspi.Source, error) {
 	if len(sources) > 1 {
 		return nil, errors.New("more than one active login source of type SSPI found")
 	}
-	return sources[0].Cfg.(*sspi.Source), nil
+	return auth.MustSourceCfg[*sspi.Source](sources[0]), nil
 }
 
 func (s *SSPI) shouldAuthenticate(req *http.Request) (shouldAuth bool) {
-	shouldAuth = false
-	path := strings.TrimSuffix(req.URL.Path, "/")
-	if path == "/user/login" {
-		if req.FormValue("user_name") != "" && req.FormValue("password") != "" {
-			shouldAuth = false
-		} else if req.FormValue("auth_with_sspi") == "1" {
-			shouldAuth = true
-		}
-	} else if middleware.IsAPIPath(req) || isAttachmentDownload(req) {
-		shouldAuth = true
-	}
+	// SSPI is only applicable for login requests with "auth_with_sspi" form value set to "1"
+	// See the template code with "auth_with_sspi"
+	shouldAuth = req.URL.Path == "/user/login" && req.FormValue("auth_with_sspi") == "1"
 	return shouldAuth
 }
 
 // newUser creates a new user object for the purpose of automatic registration
 // and populates its name and email with the information present in request headers.
 func (s *SSPI) newUser(ctx context.Context, username string, cfg *sspi.Source) (*user_model.User, error) {
-	email := gouuid.New().String() + "@localhost.localdomain"
+	email := uuid.New().String() + "@localhost.localdomain"
 	user := &user_model.User{
 		Name:     username,
 		Email:    email,
@@ -179,6 +175,8 @@ func (s *SSPI) newUser(ctx context.Context, username string, cfg *sspi.Source) (
 	if err := user_model.CreateUser(ctx, user, &user_model.Meta{}, overwriteDefault); err != nil {
 		return nil, err
 	}
+
+	audit.RecordAs(ctx, user_model.NewAuthSourceUser(), audit_model.UserCreate, user)
 
 	return user, nil
 }

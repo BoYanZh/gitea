@@ -6,18 +6,12 @@ package db
 import (
 	"fmt"
 
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/util"
 )
 
 // ErrCancelled represents an error due to context cancellation
 type ErrCancelled struct {
 	Message string
-}
-
-// IsErrCancelled checks if an error is a ErrCancelled.
-func IsErrCancelled(err error) bool {
-	_, ok := err.(ErrCancelled)
-	return ok
 }
 
 func (err ErrCancelled) Error() string {
@@ -65,7 +59,7 @@ func (err ErrNotExist) Error() string {
 	if err.ID != 0 {
 		return fmt.Sprintf("%s does not exist [id: %d]", name, err.ID)
 	}
-	return fmt.Sprintf("%s does not exist", name)
+	return name + " does not exist"
 }
 
 // Unwrap unwraps this as a ErrNotExist err

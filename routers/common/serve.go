@@ -4,40 +4,42 @@
 package common
 
 import (
-	"io"
+	"path"
 	"time"
 
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/httpcache"
-	"code.gitea.io/gitea/modules/httplib"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/services/context"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/services/context"
 )
 
 // ServeBlob download a git.Blob
-func ServeBlob(ctx *context.Base, filePath string, blob *git.Blob, lastModified *time.Time) error {
-	if httpcache.HandleGenericETagTimeCache(ctx.Req, ctx.Resp, `"`+blob.ID.String()+`"`, lastModified) {
+func ServeBlob(ctx *context.Base, repo *repo_model.Repository, filePath string, blob *git.Blob, lastModified *time.Time) error {
+	if httpcache.HandleGenericETagPrivateCache(ctx.Req, ctx.Resp, `"`+blob.ID.String()+`"`, lastModified) {
 		return nil
 	}
 
-	dataRc, err := blob.DataAsync()
+	if err := repo.LoadOwner(ctx); err != nil {
+		return err
+	}
+
+	dataRc, err := blob.DataAsync(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err = dataRc.Close(); err != nil {
-			log.Error("ServeBlob: Close: %v", err)
-		}
-	}()
+	defer dataRc.Close()
 
-	httplib.ServeContentByReader(ctx.Req, ctx.Resp, filePath, blob.Size(), dataRc)
+	if lastModified == nil {
+		lastModified = new(time.Time)
+	}
+	httplib.ServeUserContentByReader(ctx.Req, ctx.Resp, blob.Size(ctx), dataRc, httplib.ServeHeaderOptions{
+		Filename:      path.Base(filePath),
+		CacheIsPublic: !repo.IsPrivate && repo.Owner.Visibility == structs.VisibleTypePublic,
+		CacheDuration: setting.StaticCacheTime,
+		LastModified:  *lastModified,
+	})
 	return nil
-}
-
-func ServeContentByReader(ctx *context.Base, filePath string, size int64, reader io.Reader) {
-	httplib.ServeContentByReader(ctx.Req, ctx.Resp, filePath, size, reader)
-}
-
-func ServeContentByReadSeeker(ctx *context.Base, filePath string, modTime *time.Time, reader io.ReadSeeker) {
-	httplib.ServeContentByReadSeeker(ctx.Req, ctx.Resp, filePath, modTime, reader)
 }

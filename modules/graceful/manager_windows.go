@@ -1,5 +1,6 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
+
 // This code is heavily inspired by the archived gofacebook/gracenet/net.go handler
 
 //go:build windows
@@ -12,8 +13,8 @@ import (
 	"strconv"
 	"time"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
 
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
@@ -41,8 +42,7 @@ func (g *Manager) start() {
 	// Make SVC process
 	run := svc.Run
 
-	//lint:ignore SA1019 We use IsAnInteractiveSession because IsWindowsService has a different permissions profile
-	isAnInteractiveSession, err := svc.IsAnInteractiveSession() //nolint:staticcheck
+	isAnInteractiveSession, err := svc.IsAnInteractiveSession() //nolint:staticcheck // must use IsAnInteractiveSession because IsWindowsService has a different permissions profile
 	if err != nil {
 		log.Error("Unable to ascertain if running as an Windows Service: %v", err)
 		return

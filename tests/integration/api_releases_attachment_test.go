@@ -1,0 +1,70 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"fmt"
+	"net/http"
+	"testing"
+
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func testAPIEditReleaseAttachmentWithUnallowedFile(t *testing.T) {
+	// Limit the allowed release types (since by default there is no restriction)
+	defer test.MockVariableValue(&setting.Repository.Release.AllowedTypes, ".exe")()
+	attachment := unittest.AssertExistsAndLoadBean(t, &repo_model.Attachment{ID: 9})
+	release := unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: attachment.ReleaseID})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: attachment.RepoID})
+	repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	session := loginUser(t, repoOwner.Name)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+
+	filename := "file.bad"
+	urlStr := fmt.Sprintf("/api/v1/repos/%s/%s/releases/%d/assets/%d", repoOwner.Name, repo.Name, release.ID, attachment.ID)
+	req := NewRequestWithValues(t, "PATCH", urlStr, map[string]string{
+		"name": filename,
+	}).AddTokenAuth(token)
+
+	session.MakeRequest(t, req, http.StatusUnprocessableEntity)
+}
+
+func testAPIDraftReleaseAttachmentAccess(t *testing.T) {
+	attachment := unittest.AssertExistsAndLoadBean(t, &repo_model.Attachment{ID: 13})
+	release := unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: attachment.ReleaseID})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: attachment.RepoID})
+	repoOwner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+	reader := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+
+	listURL := fmt.Sprintf("/api/v1/repos/%s/%s/releases/%d/assets", repoOwner.Name, repo.Name, release.ID)
+	getURL := fmt.Sprintf("/api/v1/repos/%s/%s/releases/%d/assets/%d", repoOwner.Name, repo.Name, release.ID, attachment.ID)
+
+	MakeRequest(t, NewRequest(t, "GET", listURL), http.StatusNotFound)
+	MakeRequest(t, NewRequest(t, "GET", getURL), http.StatusNotFound)
+
+	readerToken := getUserToken(t, reader.LowerName, auth_model.AccessTokenScopeReadRepository)
+	MakeRequest(t, NewRequest(t, "GET", listURL).AddTokenAuth(readerToken), http.StatusNotFound)
+	MakeRequest(t, NewRequest(t, "GET", getURL).AddTokenAuth(readerToken), http.StatusNotFound)
+
+	ownerReadToken := getUserToken(t, repoOwner.LowerName, auth_model.AccessTokenScopeReadRepository)
+	MakeRequest(t, NewRequest(t, "GET", listURL).AddTokenAuth(ownerReadToken), http.StatusNotFound)
+	MakeRequest(t, NewRequest(t, "GET", getURL).AddTokenAuth(ownerReadToken), http.StatusNotFound)
+	ownerToken := getUserToken(t, repoOwner.LowerName, auth_model.AccessTokenScopeWriteRepository)
+	resp := MakeRequest(t, NewRequest(t, "GET", listURL).AddTokenAuth(ownerToken), http.StatusOK)
+	attachments := DecodeJSON(t, resp, []*api.Attachment{})
+	if assert.Len(t, attachments, 1) {
+		assert.Equal(t, attachment.ID, attachments[0].ID)
+	}
+
+	MakeRequest(t, NewRequest(t, "GET", getURL).AddTokenAuth(ownerToken), http.StatusOK)
+}

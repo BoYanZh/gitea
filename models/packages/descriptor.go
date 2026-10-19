@@ -9,29 +9,32 @@ import (
 	"fmt"
 	"net/url"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/packages/alpine"
-	"code.gitea.io/gitea/modules/packages/cargo"
-	"code.gitea.io/gitea/modules/packages/chef"
-	"code.gitea.io/gitea/modules/packages/composer"
-	"code.gitea.io/gitea/modules/packages/conan"
-	"code.gitea.io/gitea/modules/packages/conda"
-	"code.gitea.io/gitea/modules/packages/container"
-	"code.gitea.io/gitea/modules/packages/cran"
-	"code.gitea.io/gitea/modules/packages/debian"
-	"code.gitea.io/gitea/modules/packages/helm"
-	"code.gitea.io/gitea/modules/packages/maven"
-	"code.gitea.io/gitea/modules/packages/npm"
-	"code.gitea.io/gitea/modules/packages/nuget"
-	"code.gitea.io/gitea/modules/packages/pub"
-	"code.gitea.io/gitea/modules/packages/pypi"
-	"code.gitea.io/gitea/modules/packages/rpm"
-	"code.gitea.io/gitea/modules/packages/rubygems"
-	"code.gitea.io/gitea/modules/packages/swift"
-	"code.gitea.io/gitea/modules/packages/vagrant"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/packages/alpine"
+	"gitea.dev/modules/packages/arch"
+	"gitea.dev/modules/packages/cargo"
+	"gitea.dev/modules/packages/chef"
+	"gitea.dev/modules/packages/composer"
+	"gitea.dev/modules/packages/conan"
+	"gitea.dev/modules/packages/conda"
+	"gitea.dev/modules/packages/container"
+	"gitea.dev/modules/packages/cran"
+	"gitea.dev/modules/packages/debian"
+	"gitea.dev/modules/packages/helm"
+	"gitea.dev/modules/packages/maven"
+	"gitea.dev/modules/packages/npm"
+	"gitea.dev/modules/packages/nuget"
+	"gitea.dev/modules/packages/pub"
+	"gitea.dev/modules/packages/pypi"
+	"gitea.dev/modules/packages/rpm"
+	"gitea.dev/modules/packages/rubygems"
+	"gitea.dev/modules/packages/swift"
+	"gitea.dev/modules/packages/vagrant"
+	"gitea.dev/modules/util"
 
 	"github.com/hashicorp/go-version"
 )
@@ -51,8 +54,11 @@ func (l PackagePropertyList) GetByName(name string) string {
 
 // PackageDescriptor describes a package
 type PackageDescriptor struct {
-	Package           *Package
-	Owner             *user_model.User
+	// basic package info
+	Package *Package
+	Owner   *user_model.User
+
+	// package version info
 	Repository        *repo_model.Repository
 	Version           *PackageVersion
 	SemVer            *version.Version
@@ -75,19 +81,24 @@ func (pd *PackageDescriptor) PackageWebLink() string {
 	return fmt.Sprintf("%s/-/packages/%s/%s", pd.Owner.HomeLink(), string(pd.Package.Type), url.PathEscape(pd.Package.LowerName))
 }
 
+// PackageSettingsLink returns the relative package settings link
+func (pd *PackageDescriptor) PackageSettingsLink() string {
+	return fmt.Sprintf("%s/-/packages/settings/%s/%s", pd.Owner.HomeLink(), string(pd.Package.Type), url.PathEscape(pd.Package.LowerName))
+}
+
 // VersionWebLink returns the relative package version web link
 func (pd *PackageDescriptor) VersionWebLink() string {
 	return fmt.Sprintf("%s/%s", pd.PackageWebLink(), url.PathEscape(pd.Version.LowerVersion))
 }
 
 // PackageHTMLURL returns the absolute package HTML URL
-func (pd *PackageDescriptor) PackageHTMLURL() string {
-	return fmt.Sprintf("%s/-/packages/%s/%s", pd.Owner.HTMLURL(), string(pd.Package.Type), url.PathEscape(pd.Package.LowerName))
+func (pd *PackageDescriptor) PackageHTMLURL(ctx context.Context) string {
+	return fmt.Sprintf("%s/-/packages/%s/%s", pd.Owner.HTMLURL(ctx), string(pd.Package.Type), url.PathEscape(pd.Package.LowerName))
 }
 
 // VersionHTMLURL returns the absolute package version HTML URL
-func (pd *PackageDescriptor) VersionHTMLURL() string {
-	return fmt.Sprintf("%s/%s", pd.PackageHTMLURL(), url.PathEscape(pd.Version.LowerVersion))
+func (pd *PackageDescriptor) VersionHTMLURL(ctx context.Context) string {
+	return fmt.Sprintf("%s/%s", pd.PackageHTMLURL(ctx), url.PathEscape(pd.Version.LowerVersion))
 }
 
 // CalculateBlobSize returns the total blobs size in bytes
@@ -101,19 +112,26 @@ func (pd *PackageDescriptor) CalculateBlobSize() int64 {
 
 // GetPackageDescriptor gets the package description for a version
 func GetPackageDescriptor(ctx context.Context, pv *PackageVersion) (*PackageDescriptor, error) {
-	p, err := GetPackageByID(ctx, pv.PackageID)
+	return GetPackageDescriptorWithCache(ctx, pv, cache.NewEphemeralCache())
+}
+
+func GetPackageDescriptorWithCache(ctx context.Context, pv *PackageVersion, c *cache.EphemeralCache) (*PackageDescriptor, error) {
+	p, err := cache.GetWithEphemeralCache(ctx, c, "package", pv.PackageID, GetPackageByID)
 	if err != nil {
 		return nil, err
 	}
-	o, err := user_model.GetUserByID(ctx, p.OwnerID)
+	o, err := cache.GetWithEphemeralCache(ctx, c, "user", p.OwnerID, user_model.GetUserByID)
 	if err != nil {
 		return nil, err
 	}
-	repository, err := repo_model.GetRepositoryByID(ctx, p.RepoID)
-	if err != nil && !repo_model.IsErrRepoNotExist(err) {
-		return nil, err
+	var repository *repo_model.Repository
+	if p.RepoID > 0 {
+		repository, err = cache.GetWithEphemeralCache(ctx, c, "repo", p.RepoID, repo_model.GetRepositoryByID)
+		if err != nil && !repo_model.IsErrRepoNotExist(err) {
+			return nil, err
+		}
 	}
-	creator, err := user_model.GetUserByID(ctx, pv.CreatorID)
+	creator, err := cache.GetWithEphemeralCache(ctx, c, "user", pv.CreatorID, user_model.GetUserByID)
 	if err != nil {
 		if errors.Is(err, util.ErrNotExist) {
 			creator = user_model.NewGhostUser()
@@ -141,15 +159,21 @@ func GetPackageDescriptor(ctx context.Context, pv *PackageVersion) (*PackageDesc
 		return nil, err
 	}
 
-	pfds, err := GetPackageFileDescriptors(ctx, pfs)
-	if err != nil {
-		return nil, err
+	pfds := make([]*PackageFileDescriptor, 0, len(pfs))
+	for _, pf := range pfs {
+		pfd, err := getPackageFileDescriptor(ctx, pf, c)
+		if err != nil {
+			return nil, err
+		}
+		pfds = append(pfds, pfd)
 	}
 
 	var metadata any
 	switch p.Type {
 	case TypeAlpine:
 		metadata = &alpine.VersionMetadata{}
+	case TypeArch:
+		metadata = &arch.VersionMetadata{}
 	case TypeCargo:
 		metadata = &cargo.Metadata{}
 	case TypeChef:
@@ -188,10 +212,12 @@ func GetPackageDescriptor(ctx context.Context, pv *PackageVersion) (*PackageDesc
 		metadata = &rubygems.Metadata{}
 	case TypeSwift:
 		metadata = &swift.Metadata{}
+	case TypeTerraformState:
+		// terraform packages have no metadata
 	case TypeVagrant:
 		metadata = &vagrant.Metadata{}
 	default:
-		panic(fmt.Sprintf("unknown package type: %s", string(p.Type)))
+		panic("unknown package type: " + string(p.Type))
 	}
 	if metadata != nil {
 		if err := json.Unmarshal([]byte(pv.MetadataJSON), &metadata); err != nil {
@@ -213,9 +239,22 @@ func GetPackageDescriptor(ctx context.Context, pv *PackageVersion) (*PackageDesc
 	}, nil
 }
 
+// DescriptorMetadata returns the descriptor's metadata, which getPackageDescriptor has created from the package type
+func DescriptorMetadata[T interface{ *E }, E any](pd *PackageDescriptor) T {
+	metadata, ok := pd.Metadata.(T)
+	if !ok {
+		panic(fmt.Errorf("package %s of type %s has metadata type %T instead of %T", pd.Package.Name, pd.Package.Type, pd.Metadata, metadata))
+	}
+	return metadata
+}
+
 // GetPackageFileDescriptor gets a package file descriptor for a package file
 func GetPackageFileDescriptor(ctx context.Context, pf *PackageFile) (*PackageFileDescriptor, error) {
-	pb, err := GetBlobByID(ctx, pf.BlobID)
+	return getPackageFileDescriptor(ctx, pf, cache.NewEphemeralCache())
+}
+
+func getPackageFileDescriptor(ctx context.Context, pf *PackageFile, c *cache.EphemeralCache) (*PackageFileDescriptor, error) {
+	pb, err := cache.GetWithEphemeralCache(ctx, c, "package_file_blob", pf.BlobID, GetBlobByID)
 	if err != nil {
 		return nil, err
 	}
@@ -245,9 +284,22 @@ func GetPackageFileDescriptors(ctx context.Context, pfs []*PackageFile) ([]*Pack
 
 // GetPackageDescriptors gets the package descriptions for the versions
 func GetPackageDescriptors(ctx context.Context, pvs []*PackageVersion) ([]*PackageDescriptor, error) {
+	return getPackageDescriptors(ctx, pvs, cache.NewEphemeralCache())
+}
+
+// GetAllPackageDescriptors gets all package descriptors for a package
+func GetAllPackageDescriptors(ctx context.Context, p *Package) ([]*PackageDescriptor, error) {
+	pvs := make([]*PackageVersion, 0, 10)
+	if err := db.GetEngine(ctx).Where("package_id = ?", p.ID).Find(&pvs); err != nil {
+		return nil, err
+	}
+	return getPackageDescriptors(ctx, pvs, cache.NewEphemeralCache())
+}
+
+func getPackageDescriptors(ctx context.Context, pvs []*PackageVersion, c *cache.EphemeralCache) ([]*PackageDescriptor, error) {
 	pds := make([]*PackageDescriptor, 0, len(pvs))
 	for _, pv := range pvs {
-		pd, err := GetPackageDescriptor(ctx, pv)
+		pd, err := GetPackageDescriptorWithCache(ctx, pv, c)
 		if err != nil {
 			return nil, err
 		}

@@ -4,114 +4,73 @@
 package user
 
 import (
-	goctx "context"
-	"errors"
+	stdCtx "context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	"code.gitea.io/gitea/models/db"
-	git_model "code.gitea.io/gitea/models/git"
-	issues_model "code.gitea.io/gitea/models/issues"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unit"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/services/context"
-	issue_service "code.gitea.io/gitea/services/issue"
-	pull_service "code.gitea.io/gitea/services/pull"
+	activities_model "gitea.dev/models/activities"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+	issue_service "gitea.dev/services/issue"
+	"gitea.dev/services/notifications"
+	pull_service "gitea.dev/services/pull"
 )
 
 const (
-	tplNotification              base.TplName = "user/notification/notification"
-	tplNotificationDiv           base.TplName = "user/notification/notification_div"
-	tplNotificationSubscriptions base.TplName = "user/notification/notification_subscriptions"
+	tplNotification              templates.TplName = "user/notification/notification"
+	tplNotificationDiv           templates.TplName = "user/notification/notification_div"
+	tplNotificationSubscriptions templates.TplName = "user/notification/notification_subscriptions"
 )
 
-// GetNotificationCount is the middleware that sets the notification count in the context
-func GetNotificationCount(ctx *context.Context) {
-	if strings.HasPrefix(ctx.Req.URL.Path, "/api") {
-		return
-	}
-
-	if !ctx.IsSigned {
-		return
-	}
-
-	ctx.Data["NotificationUnreadCount"] = func() int64 {
-		count, err := db.Count[activities_model.Notification](ctx, activities_model.FindNotificationOptions{
-			UserID: ctx.Doer.ID,
-			Status: []activities_model.NotificationStatus{activities_model.NotificationStatusUnread},
-		})
-		if err != nil {
-			if err != goctx.Canceled {
-				log.Error("Unable to GetNotificationCount for user:%-v: %v", ctx.Doer, err)
-			}
-			return -1
-		}
-
-		return count
-	}
-}
-
-// Notifications is the notifications page
+// Notifications is the notification list page
 func Notifications(ctx *context.Context) {
-	getNotifications(ctx)
+	prepareUserNotificationsData(ctx)
 	if ctx.Written() {
 		return
 	}
 	if ctx.FormBool("div-only") {
-		ctx.Data["SequenceNumber"] = ctx.FormString("sequence-number")
 		ctx.HTML(http.StatusOK, tplNotificationDiv)
 		return
 	}
 	ctx.HTML(http.StatusOK, tplNotification)
 }
 
-func getNotifications(ctx *context.Context) {
-	var (
-		keyword = ctx.FormTrim("q")
-		status  activities_model.NotificationStatus
-		page    = ctx.FormInt("page")
-		perPage = ctx.FormInt("perPage")
-	)
-	if page < 1 {
-		page = 1
-	}
-	if perPage < 1 {
-		perPage = 20
-	}
-
-	switch keyword {
-	case "read":
-		status = activities_model.NotificationStatusRead
-	default:
-		status = activities_model.NotificationStatusUnread
-	}
+func prepareUserNotificationsData(ctx *context.Context) {
+	pageType := ctx.FormString("type", ctx.FormString("q")) // "q" is the legacy query parameter for "page type"
+	page := max(1, ctx.FormInt("page"))
+	perPage := util.IfZero(ctx.FormInt("perPage"), 20) // this value is never used or exposed ....
+	queryStatus := util.Iif(pageType == "read", activities_model.NotificationStatusRead, activities_model.NotificationStatusUnread)
 
 	total, err := db.Count[activities_model.Notification](ctx, activities_model.FindNotificationOptions{
 		UserID: ctx.Doer.ID,
-		Status: []activities_model.NotificationStatus{status},
+		Status: []activities_model.NotificationStatus{queryStatus},
 	})
 	if err != nil {
 		ctx.ServerError("ErrGetNotificationCount", err)
 		return
 	}
 
-	// redirect to last page if request page is more than total pages
-	pager := context.NewPagination(int(total), perPage, page, 5)
-	if pager.Paginater.Current() < page {
-		ctx.Redirect(fmt.Sprintf("%s/notifications?q=%s&page=%d", setting.AppSubURL, url.QueryEscape(ctx.FormString("q")), pager.Paginater.Current()))
-		return
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(perPage).CurPage(page).Build()
+	if pager.Paginator.Current() < page {
+		// use the last page if the requested page is more than total pages
+		page = pager.Paginator.Current()
+		pager = context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(perPage).CurPage(page).Build()
 	}
 
-	statuses := []activities_model.NotificationStatus{status, activities_model.NotificationStatusPinned}
+	statuses := []activities_model.NotificationStatus{queryStatus, activities_model.NotificationStatusPinned}
 	nls, err := db.Find[activities_model.Notification](ctx, activities_model.FindNotificationOptions{
 		ListOptions: db.ListOptions{
 			PageSize: perPage,
@@ -137,6 +96,12 @@ func getNotifications(ctx *context.Context) {
 	notifications = notifications.Without(failures)
 	if err := repos.LoadAttributes(ctx); err != nil {
 		ctx.ServerError("LoadAttributes", err)
+		return
+	}
+	failCount += len(failures)
+	notifications, failures, err = filterNotificationsByRepoAccess(ctx, ctx.Doer, notifications)
+	if err != nil {
+		ctx.ServerError("filterNotificationsByRepoAccess", err)
 		return
 	}
 	failCount += len(failures)
@@ -167,72 +132,95 @@ func getNotifications(ctx *context.Context) {
 		ctx.Flash.Error(fmt.Sprintf("ERROR: %d notifications were removed due to missing parts - check the logs", failCount))
 	}
 
-	ctx.Data["Title"] = ctx.Tr("notifications")
-	ctx.Data["Keyword"] = keyword
-	ctx.Data["Status"] = status
-	ctx.Data["Notifications"] = notifications
+	var unreadNotificationIDs []int64
+	for _, n := range notifications {
+		if n.Status == activities_model.NotificationStatusUnread {
+			unreadNotificationIDs = append(unreadNotificationIDs, n.ID)
+		}
+	}
 
-	pager.SetDefaultParams(ctx)
+	ctx.Data["Title"] = ctx.Tr("notifications")
+	ctx.Data["PageType"] = pageType
+	ctx.Data["Notifications"] = notifications
+	ctx.Data["CurUnreadNotificationIDs"] = strings.Join(base.Int64sToStrings(unreadNotificationIDs), ",")
+	ctx.Data["Link"] = setting.AppSubURL + "/notifications"
+	ctx.Data["SequenceNumber"] = ctx.FormString("sequence-number")
+
+	pager.RemoveParam(container.SetOf("div-only", "sequence-number"))
 	ctx.Data["Page"] = pager
+	ctx.Data["PageQueryParams"] = templates.QueryBuild(pager.GetParams(), "page", page)
+}
+
+func filterNotificationsByRepoAccess(ctx stdCtx.Context, doer *user_model.User, notifications activities_model.NotificationList) (activities_model.NotificationList, []int, error) {
+	failures := make([]int, 0)
+	for i, notification := range notifications {
+		if notification.Repository == nil {
+			continue
+		}
+		perm, err := access_model.GetIndividualUserRepoPermission(ctx, notification.Repository, doer)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !perm.HasAnyUnitAccessOrPublicAccess() {
+			failures = append(failures, i)
+		}
+	}
+	return notifications.Without(failures), failures, nil
 }
 
 // NotificationStatusPost is a route for changing the status of a notification
 func NotificationStatusPost(ctx *context.Context) {
-	var (
-		notificationID = ctx.FormInt64("notification_id")
-		statusStr      = ctx.FormString("status")
-		status         activities_model.NotificationStatus
-	)
-
-	switch statusStr {
-	case "read":
-		status = activities_model.NotificationStatusRead
-	case "unread":
-		status = activities_model.NotificationStatusUnread
-	case "pinned":
-		status = activities_model.NotificationStatusPinned
+	notificationID := ctx.FormInt64("notification_id")
+	var newStatus activities_model.NotificationStatus
+	switch ctx.FormString("notification_action") {
+	case "mark_as_read":
+		newStatus = activities_model.NotificationStatusRead
+	case "mark_as_unread":
+		newStatus = activities_model.NotificationStatusUnread
+	case "pin":
+		newStatus = activities_model.NotificationStatusPinned
 	default:
-		ctx.ServerError("InvalidNotificationStatus", errors.New("Invalid notification status"))
-		return
+		return // ignore user's invalid input
 	}
-
-	if _, err := activities_model.SetNotificationStatus(ctx, notificationID, ctx.Doer, status); err != nil {
+	if _, err := notifications.SetNotificationStatus(ctx, notificationID, ctx.Doer, newStatus); err != nil {
 		ctx.ServerError("SetNotificationStatus", err)
 		return
 	}
 
-	if !ctx.FormBool("noredirect") {
-		url := fmt.Sprintf("%s/notifications?page=%s", setting.AppSubURL, url.QueryEscape(ctx.FormString("page")))
-		ctx.Redirect(url, http.StatusSeeOther)
-	}
-
-	getNotifications(ctx)
+	prepareUserNotificationsData(ctx)
 	if ctx.Written() {
 		return
 	}
-	ctx.Data["Link"] = setting.AppSubURL + "/notifications"
-	ctx.Data["SequenceNumber"] = ctx.Req.PostFormValue("sequence-number")
-
 	ctx.HTML(http.StatusOK, tplNotificationDiv)
 }
 
 // NotificationPurgePost is a route for 'purging' the list of notifications - marking all unread as read
 func NotificationPurgePost(ctx *context.Context) {
-	err := activities_model.UpdateNotificationStatuses(ctx, ctx.Doer, activities_model.NotificationStatusUnread, activities_model.NotificationStatusRead)
-	if err != nil {
-		ctx.ServerError("UpdateNotificationStatuses", err)
+	if err := notifications.MarkAllRead(ctx, ctx.Doer); err != nil {
+		ctx.ServerError("MarkAllRead", err)
 		return
 	}
+	ctx.JSONRedirect(setting.AppSubURL + "/notifications")
+}
 
-	ctx.Redirect(setting.AppSubURL+"/notifications", http.StatusSeeOther)
+// NotificationPurgePagePost is a route for marking only the notifications on the current page as read
+func NotificationPurgePagePost(ctx *context.Context) {
+	nl, err := activities_model.GetNotificationsByIDs(ctx, ctx.FormStringInt64s("ids"), ctx.Doer.ID)
+	if err != nil {
+		ctx.ServerError("GetNotificationsByIDs", err)
+		return
+	}
+	_, err = notifications.SetManyNotificationStatuses(ctx, nl, ctx.Doer, activities_model.NotificationStatusRead)
+	if err != nil {
+		ctx.ServerError("SetManyNotificationStatuses", err)
+		return
+	}
+	ctx.JSONRedirect("")
 }
 
 // NotificationSubscriptions returns the list of subscribed issues
 func NotificationSubscriptions(ctx *context.Context) {
-	page := ctx.FormInt("page")
-	if page < 1 {
-		page = 1
-	}
+	page := max(ctx.FormInt("page"), 1)
 
 	sortType := ctx.FormString("sort")
 	ctx.Data["SortType"] = sortType
@@ -300,28 +288,15 @@ func NotificationSubscriptions(ctx *context.Context) {
 		return
 	}
 
-	commitStatuses, lastStatus, err := pull_service.GetIssuesAllCommitStatus(ctx, issues)
+	commitStatuses, lastStatus, err := pull_service.GetIssuesAllCommitStatus(ctx, ctx.Doer, issues)
 	if err != nil {
 		ctx.ServerError("GetIssuesAllCommitStatus", err)
 		return
 	}
-	if !ctx.Repo.CanRead(unit.TypeActions) {
-		for key := range commitStatuses {
-			git_model.CommitStatusesHideActionsURL(ctx, commitStatuses[key])
-		}
-	}
 	ctx.Data["CommitLastStatus"] = lastStatus
 	ctx.Data["CommitStatuses"] = commitStatuses
 	ctx.Data["Issues"] = issues
-
 	ctx.Data["IssueRefEndNames"], ctx.Data["IssueRefURLs"] = issue_service.GetRefEndNamesAndURLs(issues, "")
-
-	commitStatus, err := pull_service.GetIssuesLastCommitStatus(ctx, issues)
-	if err != nil {
-		ctx.ServerError("GetIssuesLastCommitStatus", err)
-		return
-	}
-	ctx.Data["CommitStatus"] = commitStatus
 
 	approvalCounts, err := issues.GetApprovalCounts(ctx)
 	if err != nil {
@@ -334,9 +309,10 @@ func NotificationSubscriptions(ctx *context.Context) {
 			return 0
 		}
 		reviewTyp := issues_model.ReviewTypeApprove
-		if typ == "reject" {
+		switch typ {
+		case "reject":
 			reviewTyp = issues_model.ReviewTypeReject
-		} else if typ == "waiting" {
+		case "waiting":
 			reviewTyp = issues_model.ReviewTypeRequest
 		}
 		for _, count := range counts {
@@ -351,13 +327,11 @@ func NotificationSubscriptions(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("notification.subscriptions")
 
 	// redirect to last page if request page is more than total pages
-	pager := context.NewPagination(int(count), setting.UI.IssuePagingNum, page, 5)
-	if pager.Paginater.Current() < page {
-		ctx.Redirect(fmt.Sprintf("/notifications/subscriptions?page=%d", pager.Paginater.Current()))
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(setting.UI.IssuePagingNum).CurPage(page).Build()
+	if pager.Paginator.Current() < page {
+		ctx.Redirect(fmt.Sprintf("/notifications/subscriptions?page=%d", pager.Paginator.Current()))
 		return
 	}
-	pager.AddParamString("sort", sortType)
-	pager.AddParamString("state", state)
 	ctx.Data["Page"] = pager
 
 	ctx.HTML(http.StatusOK, tplNotificationSubscriptions)
@@ -365,10 +339,7 @@ func NotificationSubscriptions(ctx *context.Context) {
 
 // NotificationWatching returns the list of watching repos
 func NotificationWatching(ctx *context.Context) {
-	page := ctx.FormInt("page")
-	if page < 1 {
-		page = 1
-	}
+	page := max(ctx.FormInt("page"), 1)
 
 	keyword := ctx.FormTrim("q")
 	ctx.Data["Keyword"] = keyword
@@ -416,7 +387,7 @@ func NotificationWatching(ctx *context.Context) {
 	private := ctx.FormOptionalBool("private")
 	ctx.Data["IsPrivate"] = private
 
-	repos, count, err := repo_model.SearchRepository(ctx, &repo_model.SearchRepoOptions{
+	repos, count, err := repo_model.SearchRepository(ctx, repo_model.SearchRepoOptions{
 		ListOptions: db.ListOptions{
 			PageSize: setting.UI.User.RepoPagingNum,
 			Page:     page,
@@ -439,28 +410,18 @@ func NotificationWatching(ctx *context.Context) {
 		ctx.ServerError("SearchRepository", err)
 		return
 	}
-	total := int(count)
-	ctx.Data["Total"] = total
+	ctx.Data["Total"] = count
 	ctx.Data["Repos"] = repos
 
+	watches, err := repo_model.GetUserWatches(ctx, ctx.Doer.ID, repos.IDs())
+	if err != nil {
+		ctx.ServerError("GetUserWatches", err)
+		return
+	}
+	ctx.Data["Watches"] = watches
+
 	// redirect to last page if request page is more than total pages
-	pager := context.NewPagination(total, setting.UI.User.RepoPagingNum, page, 5)
-	pager.SetDefaultParams(ctx)
-	if archived.Has() {
-		pager.AddParamString("archived", fmt.Sprint(archived.Value()))
-	}
-	if fork.Has() {
-		pager.AddParamString("fork", fmt.Sprint(fork.Value()))
-	}
-	if mirror.Has() {
-		pager.AddParamString("mirror", fmt.Sprint(mirror.Value()))
-	}
-	if template.Has() {
-		pager.AddParamString("template", fmt.Sprint(template.Value()))
-	}
-	if private.Has() {
-		pager.AddParamString("private", fmt.Sprint(private.Value()))
-	}
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(setting.UI.User.RepoPagingNum).CurPage(page).Build()
 	ctx.Data["Page"] = pager
 
 	ctx.Data["Status"] = 2

@@ -10,11 +10,11 @@ import (
 	"sort"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/storage"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/storage"
 )
 
 // Check represents a Doctor check
@@ -36,7 +36,7 @@ func initDBSkipLogger(ctx context.Context) error {
 		return fmt.Errorf("db.InitEngine: %w", err)
 	}
 	// some doctor sub-commands need to use git command
-	if err := git.InitFull(ctx); err != nil {
+	if err := git.InitFull(); err != nil {
 		return fmt.Errorf("git.InitFull: %w", err)
 	}
 	return nil
@@ -48,7 +48,7 @@ type doctorCheckLogger struct {
 
 var _ log.BaseLogger = (*doctorCheckLogger)(nil)
 
-func (d *doctorCheckLogger) Log(skip int, level log.Level, format string, v ...any) {
+func (d *doctorCheckLogger) Log(skip int, event *log.Event, format string, v ...any) {
 	_, _ = fmt.Fprintf(os.Stdout, format+"\n", v...)
 }
 
@@ -62,11 +62,11 @@ type doctorCheckStepLogger struct {
 
 var _ log.BaseLogger = (*doctorCheckStepLogger)(nil)
 
-func (d *doctorCheckStepLogger) Log(skip int, level log.Level, format string, v ...any) {
-	levelChar := fmt.Sprintf("[%s]", strings.ToUpper(level.String()[0:1]))
+func (d *doctorCheckStepLogger) Log(skip int, event *log.Event, format string, v ...any) {
+	levelChar := fmt.Sprintf("[%s]", strings.ToUpper(event.Level.String()[0:1]))
 	var levelArg any = levelChar
 	if d.colorize {
-		levelArg = log.NewColoredValue(levelChar, level.ColorAttributes()...)
+		levelArg = log.NewColoredValue(levelChar, event.Level.ColorAttributes()...)
 	}
 	args := append([]any{levelArg}, v...)
 	_, _ = fmt.Fprintf(os.Stdout, " - %s "+format+"\n", args...)

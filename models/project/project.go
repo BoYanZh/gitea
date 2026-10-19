@@ -8,14 +8,14 @@ import (
 	"fmt"
 	"html/template"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/optional"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
 )
@@ -97,6 +97,9 @@ type Project struct {
 	Type         Type
 
 	RenderedContent template.HTML `xorm:"-"`
+	NumOpenIssues   int64         `xorm:"-"`
+	NumClosedIssues int64         `xorm:"-"`
+	NumIssues       int64         `xorm:"-"`
 
 	CreatedUnix    timeutil.TimeStamp `xorm:"INDEX created"`
 	UpdatedUnix    timeutil.TimeStamp `xorm:"INDEX updated"`
@@ -126,6 +129,14 @@ func (p *Project) LoadRepo(ctx context.Context) (err error) {
 	return err
 }
 
+func ProjectLinkForOrg(org *user_model.User, projectID int64) string { //nolint:revive // export stutter
+	return fmt.Sprintf("%s/-/projects/%d", org.HomeLink(), projectID)
+}
+
+func ProjectLinkForRepo(repo *repo_model.Repository, projectID int64) string { //nolint:revive // export stutter
+	return fmt.Sprintf("%s/projects/%d", repo.Link(), projectID)
+}
+
 // Link returns the project's relative URL.
 func (p *Project) Link(ctx context.Context) string {
 	if p.OwnerID > 0 {
@@ -134,7 +145,7 @@ func (p *Project) Link(ctx context.Context) string {
 			log.Error("LoadOwner: %v", err)
 			return ""
 		}
-		return fmt.Sprintf("%s/-/projects/%d", p.Owner.HomeLink(), p.ID)
+		return ProjectLinkForOrg(p.Owner, p.ID)
 	}
 	if p.RepoID > 0 {
 		err := p.LoadRepo(ctx)
@@ -142,7 +153,7 @@ func (p *Project) Link(ctx context.Context) string {
 			log.Error("LoadRepo: %v", err)
 			return ""
 		}
-		return fmt.Sprintf("%s/projects/%d", p.Repo.Link(), p.ID)
+		return ProjectLinkForRepo(p.Repo, p.ID)
 	}
 	return ""
 }
@@ -225,7 +236,7 @@ func (opts SearchOptions) ToConds() builder.Cond {
 }
 
 func (opts SearchOptions) ToOrders() string {
-	return opts.OrderBy.String()
+	return util.IfZero(opts.OrderBy.String(), "id")
 }
 
 func GetSearchOrderByBySortType(sortType string) db.SearchOrderBy {
@@ -236,12 +247,17 @@ func GetSearchOrderByBySortType(sortType string) db.SearchOrderBy {
 		return db.SearchOrderByRecentUpdated
 	case "leastupdate":
 		return db.SearchOrderByLeastUpdated
+	case "alphabetically":
+		return "title ASC"
+	case "reversealphabetically":
+		return "title DESC"
 	default:
 		return db.SearchOrderByNewest
 	}
 }
 
 // NewProject creates a new Project
+// The title will be cut off at 255 characters if it's longer than 255 characters.
 func NewProject(ctx context.Context, p *Project) error {
 	if !IsTemplateTypeValid(p.TemplateType) {
 		p.TemplateType = TemplateTypeNone
@@ -254,6 +270,8 @@ func NewProject(ctx context.Context, p *Project) error {
 	if !IsTypeValid(p.Type) {
 		return util.NewInvalidArgumentErrorf("project type is not valid")
 	}
+
+	p.Title = util.EllipsisDisplayString(p.Title, 255)
 
 	return db.WithTx(ctx, func(ctx context.Context) error {
 		if err := db.Insert(ctx, p); err != nil {
@@ -275,6 +293,27 @@ func GetProjectByID(ctx context.Context, id int64) (*Project, error) {
 	p := new(Project)
 
 	has, err := db.GetEngine(ctx).ID(id).Get(p)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, ErrProjectNotExist{ID: id}
+	}
+
+	return p, nil
+}
+
+// GetProjectsMapByIDs returns projects by a list of IDs.
+func GetProjectsMapByIDs(ctx context.Context, ids []int64) (map[int64]*Project, error) {
+	projects := make(map[int64]*Project, len(ids))
+	if len(ids) == 0 {
+		return projects, nil
+	}
+	return projects, db.GetEngine(ctx).In("id", ids).Find(&projects)
+}
+
+func GetProjectByIDAndOwner(ctx context.Context, id, ownerID int64) (*Project, error) {
+	p := new(Project)
+	has, err := db.GetEngine(ctx).ID(id).And("owner_id = ?", ownerID).Get(p)
 	if err != nil {
 		return nil, err
 	} else if !has {
@@ -308,6 +347,7 @@ func UpdateProject(ctx context.Context, p *Project) error {
 		p.CardType = CardTypeTextOnly
 	}
 
+	p.Title = util.EllipsisDisplayString(p.Title, 255)
 	_, err := db.GetEngine(ctx).ID(p.ID).Cols(
 		"title",
 		"description",
@@ -340,41 +380,25 @@ func updateRepositoryProjectCount(ctx context.Context, repoID int64) error {
 
 // ChangeProjectStatusByRepoIDAndID toggles a project between opened and closed
 func ChangeProjectStatusByRepoIDAndID(ctx context.Context, repoID, projectID int64, isClosed bool) error {
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		p := new(Project)
 
-	p := new(Project)
+		has, err := db.GetEngine(ctx).ID(projectID).Where("repo_id = ?", repoID).Get(p)
+		if err != nil {
+			return err
+		} else if !has {
+			return ErrProjectNotExist{ID: projectID, RepoID: repoID}
+		}
 
-	has, err := db.GetEngine(ctx).ID(projectID).Where("repo_id = ?", repoID).Get(p)
-	if err != nil {
-		return err
-	} else if !has {
-		return ErrProjectNotExist{ID: projectID, RepoID: repoID}
-	}
-
-	if err := changeProjectStatus(ctx, p, isClosed); err != nil {
-		return err
-	}
-
-	return committer.Commit()
+		return changeProjectStatus(ctx, p, isClosed)
+	})
 }
 
 // ChangeProjectStatus toggle a project between opened and closed
 func ChangeProjectStatus(ctx context.Context, p *Project, isClosed bool) error {
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-
-	if err := changeProjectStatus(ctx, p, isClosed); err != nil {
-		return err
-	}
-
-	return committer.Commit()
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		return changeProjectStatus(ctx, p, isClosed)
+	})
 }
 
 func changeProjectStatus(ctx context.Context, p *Project, isClosed bool) error {

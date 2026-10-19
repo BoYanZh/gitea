@@ -6,12 +6,12 @@ package integration
 import (
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/test"
+	"gitea.dev/models/db"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
 
 	"github.com/stretchr/testify/assert"
-	"xorm.io/xorm"
 )
 
 type TestCollationTbl struct {
@@ -20,7 +20,7 @@ type TestCollationTbl struct {
 }
 
 func TestDatabaseCollation(t *testing.T) {
-	x := db.GetEngine(db.DefaultContext).(*xorm.Engine)
+	x := unittest.GetXORMEngine()
 
 	// all created tables should use case-sensitive collation by default
 	_, _ = x.Exec("DROP TABLE IF EXISTS test_collation_tbl")
@@ -73,8 +73,11 @@ func TestDatabaseCollation(t *testing.T) {
 
 	t.Run("Convert tables to utf8mb4_bin", func(t *testing.T) {
 		defer test.MockVariableValue(&setting.Database.CharsetCollation, "utf8mb4_bin")()
-		assert.NoError(t, db.ConvertDatabaseTable())
 		r, err := db.CheckCollations(x)
+		assert.NoError(t, err)
+		assert.Equal(t, "utf8mb4_bin", r.ExpectedCollation)
+		assert.NoError(t, db.ConvertDatabaseTable())
+		r, err = db.CheckCollations(x)
 		assert.NoError(t, err)
 		assert.Equal(t, "utf8mb4_bin", r.DatabaseCollation)
 		assert.True(t, r.CollationEquals(r.ExpectedCollation, r.DatabaseCollation))

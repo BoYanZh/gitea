@@ -4,20 +4,22 @@
 package web
 
 import (
-	goctx "context"
+	"bufio"
 	"fmt"
+	"net"
 	"net/http"
 	"reflect"
+	"slices"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/web/routing"
-	"code.gitea.io/gitea/modules/web/types"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/web/routing"
+	"gitea.dev/modules/web/types"
 )
 
 var responseStatusProviders = map[reflect.Type]func(req *http.Request) types.ResponseStatusProvider{}
 
 func RegisterResponseStatusProvider[T any](fn func(req *http.Request) types.ResponseStatusProvider) {
-	responseStatusProviders[reflect.TypeOf((*T)(nil)).Elem()] = fn
+	responseStatusProviders[reflect.TypeFor[T]()] = fn
 }
 
 // responseWriter is a wrapper of http.ResponseWriter, to check whether the response has been written
@@ -48,34 +50,38 @@ func (r *responseWriter) WriteHeader(statusCode int) {
 	r.respWriter.WriteHeader(statusCode)
 }
 
+func (r *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := r.respWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
 var (
-	httpReqType    = reflect.TypeOf((*http.Request)(nil))
-	respWriterType = reflect.TypeOf((*http.ResponseWriter)(nil)).Elem()
-	cancelFuncType = reflect.TypeOf((*goctx.CancelFunc)(nil)).Elem()
+	httpReqType    = reflect.TypeFor[*http.Request]()
+	respWriterType = reflect.TypeFor[http.ResponseWriter]()
 )
 
 // preCheckHandler checks whether the handler is valid, developers could get first-time feedback, all mistakes could be found at startup
 func preCheckHandler(fn reflect.Value, argsIn []reflect.Value) {
 	hasStatusProvider := false
 	for _, argIn := range argsIn {
-		if _, hasStatusProvider = argIn.Interface().(types.ResponseStatusProvider); hasStatusProvider {
+		if _, hasStatusProvider = reflect.TypeAssert[types.ResponseStatusProvider](argIn); hasStatusProvider {
 			break
 		}
 	}
 	if !hasStatusProvider {
 		panic(fmt.Sprintf("handler should have at least one ResponseStatusProvider argument, but got %s", fn.Type()))
 	}
-	if fn.Type().NumOut() != 0 && fn.Type().NumIn() != 1 {
-		panic(fmt.Sprintf("handler should have no return value or only one argument, but got %s", fn.Type()))
-	}
-	if fn.Type().NumOut() == 1 && fn.Type().Out(0) != cancelFuncType {
-		panic(fmt.Sprintf("handler should return a cancel function, but got %s", fn.Type()))
+	if fn.Type().NumOut() != 0 {
+		panic(fmt.Sprintf("handler should have no return value other than registered ones, but got %s", fn.Type()))
 	}
 }
 
 func prepareHandleArgsIn(resp http.ResponseWriter, req *http.Request, fn reflect.Value, fnInfo *routing.FuncInfo) []reflect.Value {
 	defer func() {
-		if err := recover(); err != nil {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("%v\n%s", recovered, log.Stack(2))
 			log.Error("unable to prepare handler arguments for %s: %v", fnInfo.String(), err)
 			panic(err)
 		}
@@ -105,21 +111,15 @@ func prepareHandleArgsIn(resp http.ResponseWriter, req *http.Request, fn reflect
 	return argsIn
 }
 
-func handleResponse(fn reflect.Value, ret []reflect.Value) goctx.CancelFunc {
-	if len(ret) == 1 {
-		if cancelFunc, ok := ret[0].Interface().(goctx.CancelFunc); ok {
-			return cancelFunc
-		}
-		panic(fmt.Sprintf("unsupported return type: %s", ret[0].Type()))
-	} else if len(ret) > 1 {
+func handleResponse(fn reflect.Value, ret []reflect.Value) {
+	if len(ret) != 0 {
 		panic(fmt.Sprintf("unsupported return values: %s", fn.Type()))
 	}
-	return nil
 }
 
 func hasResponseBeenWritten(argsIn []reflect.Value) bool {
 	for _, argIn := range argsIn {
-		if statusProvider, ok := argIn.Interface().(types.ResponseStatusProvider); ok {
+		if statusProvider, ok := reflect.TypeAssert[types.ResponseStatusProvider](argIn); ok {
 			if statusProvider.WrittenStatus() != 0 {
 				return true
 			}
@@ -128,11 +128,21 @@ func hasResponseBeenWritten(argsIn []reflect.Value) bool {
 	return false
 }
 
-func wrapHandlerProvider[T http.Handler](hp func(next http.Handler) T, funcInfo *routing.FuncInfo) func(next http.Handler) http.Handler {
+type middlewareProvider = func(next http.Handler) http.Handler
+
+func executeMiddlewaresHandler(w http.ResponseWriter, r *http.Request, middlewares []middlewareProvider, endpoint http.HandlerFunc) {
+	handler := endpoint
+	for _, middleware := range slices.Backward(middlewares) {
+		handler = middleware(handler).ServeHTTP
+	}
+	handler(w, r)
+}
+
+func wrapHandlerProvider[T http.Handler](hp func(next http.Handler) T, funcInfo *routing.FuncInfo) middlewareProvider {
 	return func(next http.Handler) http.Handler {
 		h := hp(next) // this handle could be dynamically generated, so we can't use it for debug info
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			routing.UpdateFuncInfo(req.Context(), funcInfo)
+			defer routing.RecordFuncInfo(req.Context(), funcInfo)()
 			h.ServeHTTP(resp, req)
 		})
 	}
@@ -140,14 +150,14 @@ func wrapHandlerProvider[T http.Handler](hp func(next http.Handler) T, funcInfo 
 
 // toHandlerProvider converts a handler to a handler provider
 // A handler provider is a function that takes a "next" http.Handler, it can be used as a middleware
-func toHandlerProvider(handler any) func(next http.Handler) http.Handler {
+func toHandlerProvider(handler any) middlewareProvider {
 	funcInfo := routing.GetFuncInfo(handler)
 	fn := reflect.ValueOf(handler)
 	if fn.Type().Kind() != reflect.Func {
 		panic(fmt.Sprintf("handler must be a function, but got %s", fn.Type()))
 	}
 
-	if hp, ok := handler.(func(next http.Handler) http.Handler); ok {
+	if hp, ok := handler.(middlewareProvider); ok {
 		return wrapHandlerProvider(hp, funcInfo)
 	} else if hp, ok := handler.(func(http.Handler) http.HandlerFunc); ok {
 		return wrapHandlerProvider(hp, funcInfo)
@@ -168,14 +178,11 @@ func toHandlerProvider(handler any) func(next http.Handler) http.Handler {
 				return // it's doing pre-check, just return
 			}
 
-			routing.UpdateFuncInfo(req.Context(), funcInfo)
+			defer routing.RecordFuncInfo(req.Context(), funcInfo)()
 			ret := fn.Call(argsIn)
 
-			// handle the return value, and defer the cancel function if there is one
-			cancelFunc := handleResponse(fn, ret)
-			if cancelFunc != nil {
-				defer cancelFunc()
-			}
+			// handle the return value (no-op at the moment)
+			handleResponse(fn, ret)
 
 			// if the response has not been written, call the next handler
 			if next != nil && !hasResponseBeenWritten(argsIn) {

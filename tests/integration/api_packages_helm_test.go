@@ -12,16 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	helm_module "code.gitea.io/gitea/modules/packages/helm"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	helm_module "gitea.dev/modules/packages/helm"
+	"gitea.dev/modules/setting"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 func TestPackageHelm(t *testing.T) {
@@ -52,7 +51,7 @@ dependencies:
 	zw := gzip.NewWriter(&buf)
 	archive := tar.NewWriter(zw)
 	archive.WriteHeader(&tar.Header{
-		Name: fmt.Sprintf("%s/Chart.yaml", packageName),
+		Name: packageName + "/Chart.yaml",
 		Mode: 0o600,
 		Size: int64(len(chartContent)),
 	})
@@ -61,7 +60,47 @@ dependencies:
 	zw.Close()
 	content := buf.Bytes()
 
+	// The signature is invalid, but the repository isn't verifying it.
+	provContent := `-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+apiVersion: v2
+description: ` + packageDescription + `
+name: ` + packageName + `
+type: application
+version: ` + packageVersion + `
+maintainers:
+- - name: ` + packageAuthor + `
+dependencies:
+- - name: dep1
+repository: https://example.com/
+
+...
+files:
+  ` + filename + `: sha256:d31d2f08b885ec696c37c7f7ef106709aaf5e8575b6d3dc5d52112ed29a9cb92
+-----BEGIN PGP SIGNATURE-----
+
+wsBcBAEBCgAQBQJdy0ReCRCEO7+YH8GHYgAAfhUIADx3pHHLLINv0MFkiEYpX/Kd
+nvHFBNps7hXqSocsg0a9Fi1LRAc3OpVh3knjPfHNGOy8+xOdhbqpdnB+5ty8YopI
+mYMWp6cP/Mwpkt7/gP1ecWFMevicbaFH5AmJCBihBaKJE4R1IX49/wTIaLKiWkv2
+cR64bmZruQPSW83UTNULtdD7kuTZXeAdTMjAK0NECsCz9/eK5AFggP4CDf7r2zNi
+hZsNrzloIlBZlGGns6mUOTO42J/+JojnOLIhI3Psd0HBD2bTlsm/rSfty4yZUs7D
+qtgooNdohoyGSzR5oapd7fEvauRQswJxOA0m0V+u9/eyLR0+JcYB8Udi1prnWf8=
+=aHfz
+-----END PGP SIGNATURE-----`
+
 	url := fmt.Sprintf("/api/packages/%s/helm", user.Name)
+
+	t.Run("UploadProvFileWithoutChart", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+
+		provURL := url + "/api/prov"
+
+		// Attempt to upload provenance file without chart to back it.
+		req := NewRequestWithBody(t, "POST", provURL, bytes.NewReader([]byte(provContent))).
+			AddBasicAuth(user.Name)
+		MakeRequest(t, req, http.StatusNotFound)
+	})
 
 	t.Run("Upload", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
@@ -72,37 +111,68 @@ dependencies:
 			AddBasicAuth(user.Name)
 		MakeRequest(t, req, http.StatusCreated)
 
-		pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypeHelm)
+		pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeHelm)
 		assert.NoError(t, err)
 		assert.Len(t, pvs, 1)
 
-		pd, err := packages.GetPackageDescriptor(db.DefaultContext, pvs[0])
+		pd, err := packages.GetPackageDescriptor(t.Context(), pvs[0])
 		assert.NoError(t, err)
 		assert.NotNil(t, pd.SemVer)
 		assert.IsType(t, &helm_module.Metadata{}, pd.Metadata)
 		assert.Equal(t, packageName, pd.Package.Name)
 		assert.Equal(t, packageVersion, pd.Version.Version)
 
-		pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pvs[0].ID)
+		pfs, err := packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
 		assert.NoError(t, err)
 		assert.Len(t, pfs, 1)
 		assert.Equal(t, filename, pfs[0].Name)
 		assert.True(t, pfs[0].IsLead)
 
-		pb, err := packages.GetBlobByID(db.DefaultContext, pfs[0].BlobID)
+		pb, err := packages.GetBlobByID(t.Context(), pfs[0].BlobID)
 		assert.NoError(t, err)
 		assert.Equal(t, int64(len(content)), pb.Size)
 
 		req = NewRequestWithBody(t, "POST", uploadURL, bytes.NewReader(content)).
 			AddBasicAuth(user.Name)
 		MakeRequest(t, req, http.StatusCreated)
+
+		provURL := url + "/api/prov"
+
+		// Upload Provenance file
+		req = NewRequestWithBody(t, "POST", provURL, bytes.NewReader([]byte(provContent))).
+			AddBasicAuth(user.Name)
+		MakeRequest(t, req, http.StatusCreated)
+
+		pvs, err = packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeHelm)
+		assert.NoError(t, err)
+		assert.Len(t, pvs, 1)
+
+		pfs, err = packages.GetFilesByVersionID(t.Context(), pvs[0].ID)
+		assert.NoError(t, err)
+		assert.Len(t, pfs, 2)
+
+		var provFile *packages.PackageFile
+		for _, pf := range pfs {
+			if pf.Name == filename+".prov" {
+				provFile = pf
+				break
+			}
+		}
+		assert.NotNil(t, provFile)
+		assert.False(t, provFile.IsLead)
+
+		req = NewRequest(t, "GET", fmt.Sprintf("%s/%s.prov", url, filename)).
+			AddBasicAuth(user.Name)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		assert.Equal(t, provContent, resp.Body.String())
 	})
 
 	t.Run("Download", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
 		checkDownloadCount := func(count int64) {
-			pvs, err := packages.GetVersionsByPackageType(db.DefaultContext, user.ID, packages.TypeHelm)
+			pvs, err := packages.GetVersionsByPackageType(t.Context(), user.ID, packages.TypeHelm)
 			assert.NoError(t, err)
 			assert.Len(t, pvs, 1)
 			assert.Equal(t, count, pvs[0].DownloadCount)
@@ -122,7 +192,7 @@ dependencies:
 	t.Run("Index", func(t *testing.T) {
 		defer tests.PrintCurrentTest(t)()
 
-		req := NewRequest(t, "GET", fmt.Sprintf("%s/index.yaml", url)).
+		req := NewRequest(t, "GET", url+"/index.yaml").
 			AddBasicAuth(user.Name)
 		resp := MakeRequest(t, req, http.StatusOK)
 

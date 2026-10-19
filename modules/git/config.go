@@ -1,0 +1,214 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package git
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+
+	"gitea.dev/modules/consts"
+	"gitea.dev/modules/git/gitcmd"
+	"gitea.dev/modules/setting"
+)
+
+// syncGitConfig only modifies gitconfig, won't change global variables (otherwise there will be data-race problem)
+func syncGitConfig(ctx context.Context) (err error) {
+	if err = os.MkdirAll(gitcmd.HomeDir(), os.ModePerm); err != nil {
+		return fmt.Errorf("unable to prepare git home directory %s, err: %w", gitcmd.HomeDir(), err)
+	}
+
+	// Git requires setting user.name and user.email in order to commit changes - old comment: "if they're not set just add some defaults"
+	// TODO: need to confirm whether users really need to change these values manually. It seems that these values are dummy only and not really used.
+	// If these values are not really used, then they can be set (overwritten) directly without considering about existence.
+	for configKey, defaultValue := range map[string]string{
+		"user.name":  "Gitea",
+		"user.email": "gitea@fake.local",
+	} {
+		if err := configSetNonExist(ctx, configKey, defaultValue); err != nil {
+			return err
+		}
+	}
+
+	// Set git some configurations - these must be set to these values for gitea to work correctly
+	if err := configSet(ctx, "core.quotePath", "false"); err != nil {
+		return err
+	}
+
+	if err := configSet(ctx, "receive.advertisePushOptions", "true"); err != nil {
+		return err
+	}
+
+	// reject malformed objects on push and fetch, e.g. duplicate tree entries
+	// that the web UI and checkout can resolve differently
+	if err := configSet(ctx, "transfer.fsckObjects", "true"); err != nil {
+		return err
+	}
+	// ignore harmless issues found in real-world histories, same as Gitaly:
+	// https://gitlab.com/gitlab-org/gitaly/-/blob/bd3bba454181f52331cca441b3417bbd2de4b1cb/internal/git/gitcmd/command_description.go#L506-547
+	for _, prefix := range []string{"fsck", "fetch.fsck", "receive.fsck"} {
+		for _, key := range []string{
+			"badTimezone",            // e.g. +051800 written by Grit 2.3.1 to 2.4
+			"missingSpaceBeforeDate", // e.g. dateless tags from git-cvsimport before git 1.5.3
+			"zeroPaddedFilemode",     // e.g. 040000 written by Grit before 2.1
+		} {
+			if err := configSet(ctx, fmt.Sprintf("%s.%s", prefix, key), "ignore"); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := configSet(ctx, "core.commitGraph", "true"); err != nil {
+		return err
+	}
+
+	if err := configSet(ctx, "gc.writeCommitGraph", "true"); err != nil {
+		return err
+	}
+
+	if err := configSet(ctx, "fetch.writeCommitGraph", "true"); err != nil {
+		return err
+	}
+
+	// set support for AGit flow
+	if err := configAddNonExist(ctx, "receive.procReceiveRefs", "refs/for"); err != nil {
+		return err
+	}
+
+	// Due to CVE-2022-24765, git now denies access to git directories which are not owned by current user.
+	// However, some docker users and samba users find it difficult to configure their systems correctly,
+	// so that Gitea's git repositories are owned by the Gitea user.
+	// (Possibly Windows Service users - but ownership in this case should really be set correctly on the filesystem.)
+	// See issue: https://github.com/go-gitea/gitea/issues/19455
+	// As Gitea now always use its internal git config file, and access to the git repositories is managed through Gitea,
+	// it is now safe to set "safe.directory=*" for internal usage only.
+	// Although this setting is only supported by some new git versions, it is also tolerated by earlier versions
+	if err := configAddNonExist(ctx, "safe.directory", "*"); err != nil {
+		return err
+	}
+
+	if consts.IsWindows {
+		if err := configSet(ctx, "core.longpaths", "true"); err != nil {
+			return err
+		}
+		if setting.Git.DisableCoreProtectNTFS {
+			err = configSet(ctx, "core.protectNTFS", "false")
+		} else {
+			err = configUnsetAll(ctx, "core.protectNTFS", "false")
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	if !setting.Git.DisablePartialClone {
+		if err = configSet(ctx, "uploadpack.allowfilter", "true"); err != nil {
+			return err
+		}
+		err = configSet(ctx, "uploadpack.allowAnySHA1InWant", "true")
+	} else {
+		if err = configUnsetAll(ctx, "uploadpack.allowfilter", "true"); err != nil {
+			return err
+		}
+		err = configUnsetAll(ctx, "uploadpack.allowAnySHA1InWant", "true")
+	}
+	if err != nil {
+		return err
+	}
+
+	// Gitea used to write "90", which git reads as a date in 1990
+	if err := configUnsetAll(ctx, "gc.reflogExpire", "90"); err != nil {
+		return err
+	}
+
+	// Apply user's git config options last so they take precedence over builtin defaults
+	for k, v := range setting.GitConfig.Options {
+		if err = configSet(ctx, strings.ToLower(k), v); err != nil {
+			return err
+		}
+	}
+
+	GlobalConfig = &GlobalConfigStruct{}
+	// HINT: GIT-DIFF-TREE-UI-CONFIG: Git's bug: git-diff-tree loads config with /* no "diff" UI options */ (since 20 years ago).
+	// https://github.com/git/git/blame/5d2e7709234afea1b6ddb25cd4f60d3d5fb3c200/builtin/diff-tree.c#L127
+	// Although document and manual say that "git-diff-tree" supports "diff.orderfile" option, but it is not actually supported.
+	// So we need to apply the diff.orderfile explicitly in our code.
+	GlobalConfig.DiffOrderFile, _ = configGet(ctx, "diff.orderfile")
+	return nil
+}
+
+func configGet(ctx context.Context, key string) (string, error) {
+	stdout, _, err := gitcmd.NewCommand("config", "--global", "--get").AddDynamicArguments(key).RunStdString(ctx)
+	if err != nil && !gitcmd.IsErrorExitCode(err, 1) {
+		return "", fmt.Errorf("failed to get git config %s, err: %w", key, err)
+	}
+	return strings.TrimRight(stdout, "\r\n"), nil
+}
+
+func configSet(ctx context.Context, key, value string) error {
+	stdout, _, err := gitcmd.NewCommand("config", "--global", "--get").
+		AddDynamicArguments(key).
+		RunStdString(ctx)
+	if err != nil && !gitcmd.IsErrorExitCode(err, 1) {
+		return fmt.Errorf("failed to get git config %s, err: %w", key, err)
+	}
+
+	currValue := strings.TrimSpace(stdout)
+	if currValue == value {
+		return nil
+	}
+
+	if _, _, err = gitcmd.NewCommand("config", "--global", "--replace-all").
+		AddDynamicArguments(key, value).
+		RunStdString(ctx); err != nil {
+		return fmt.Errorf("failed to set git global config %s, err: %w", key, err)
+	}
+
+	return nil
+}
+
+func configSetNonExist(ctx context.Context, key, value string) error {
+	_, _, err := gitcmd.NewCommand("config", "--global", "--get").AddDynamicArguments(key).RunStdString(ctx)
+	if err == nil {
+		// already exist
+		return nil
+	}
+	if gitcmd.IsErrorExitCode(err, 1) {
+		// not exist, set new config
+		_, _, err = gitcmd.NewCommand("config", "--global").AddDynamicArguments(key, value).RunStdString(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to set git global config %s, err: %w", key, err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("failed to get git config %s, err: %w", key, err)
+}
+
+func configAddNonExist(ctx context.Context, key, value string) error {
+	_, _, err := gitcmd.NewCommand("config", "--global", "--get").AddDynamicArguments(key, "^"+regexp.QuoteMeta(value)+"$").RunStdString(ctx)
+	if err == nil {
+		// already exist
+		return nil
+	}
+	if gitcmd.IsErrorExitCode(err, 1) {
+		// not exist, add new config
+		_, _, err = gitcmd.NewCommand("config", "--global", "--add").AddDynamicArguments(key, value).RunStdString(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to add git global config %s, err: %w", key, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("failed to get git config %s, err: %w", key, err)
+}
+
+func configUnsetAll(ctx context.Context, key, value string) error {
+	_, _, err := gitcmd.NewCommand("config", "--global", "--unset-all").AddDynamicArguments(key, "^"+regexp.QuoteMeta(value)+"$").RunStdString(ctx)
+	if err != nil && !gitcmd.IsErrorExitCode(err, 5) { // 5: no such key or no matching value
+		return fmt.Errorf("failed to unset git global config %s, err: %w", key, err)
+	}
+	return nil
+}

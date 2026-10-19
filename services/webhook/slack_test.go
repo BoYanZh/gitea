@@ -4,13 +4,12 @@
 package webhook
 
 import (
-	"context"
 	"testing"
 
-	webhook_model "code.gitea.io/gitea/models/webhook"
-	"code.gitea.io/gitea/modules/json"
-	api "code.gitea.io/gitea/modules/structs"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
+	webhook_model "gitea.dev/models/webhook"
+	"gitea.dev/modules/json"
+	api "gitea.dev/modules/structs"
+	webhook_module "gitea.dev/modules/webhook"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -115,6 +114,12 @@ func TestSlackPayload(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Equal(t, "[<http://localhost:3000/test/repo|test/repo>] Repository created by <https://try.gitea.io/user1|user1>", pl.Text)
+
+		p.Action = api.HookRepoRenamed
+		p.Changes = &api.ChangesPayload{Name: &api.ChangesFromPayload{From: "old-repo"}}
+		pl, err = sc.Repository(p)
+		require.NoError(t, err)
+		assert.Equal(t, "[<http://localhost:3000/test/repo|test/repo>] Repository renamed from old-repo by <https://try.gitea.io/user1|user1>", pl.Text)
 	})
 
 	t.Run("Package", func(t *testing.T) {
@@ -178,7 +183,7 @@ func TestSlackJSONPayload(t *testing.T) {
 		PayloadVersion: 2,
 	}
 
-	req, reqBody, err := newSlackRequest(context.Background(), hook, task)
+	req, reqBody, err := newSlackRequest(t.Context(), hook, task)
 	require.NotNil(t, req)
 	require.NotNil(t, reqBody)
 	require.NoError(t, err)
@@ -191,23 +196,4 @@ func TestSlackJSONPayload(t *testing.T) {
 	err = json.NewDecoder(req.Body).Decode(&body)
 	assert.NoError(t, err)
 	assert.Equal(t, "[<http://localhost:3000/test/repo|test/repo>:<http://localhost:3000/test/repo/src/branch/test|test>] 2 new commits pushed by user1", body.Text)
-}
-
-func TestIsValidSlackChannel(t *testing.T) {
-	tt := []struct {
-		channelName string
-		expected    bool
-	}{
-		{"gitea", true},
-		{"#gitea", true},
-		{"  ", false},
-		{"#", false},
-		{" #", false},
-		{"gitea   ", false},
-		{"  gitea", false},
-	}
-
-	for _, v := range tt {
-		assert.Equal(t, v.expected, IsValidSlackChannel(v.channelName))
-	}
 }

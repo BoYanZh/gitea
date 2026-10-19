@@ -7,8 +7,8 @@ import (
 	"sort"
 	"time"
 
-	packages_model "code.gitea.io/gitea/models/packages"
-	nuget_module "code.gitea.io/gitea/modules/packages/nuget"
+	packages_model "gitea.dev/models/packages"
+	nuget_module "gitea.dev/modules/packages/nuget"
 
 	"golang.org/x/text/collate"
 	"golang.org/x/text/language"
@@ -53,15 +53,23 @@ type RegistrationIndexPageItem struct {
 // https://docs.microsoft.com/en-us/nuget/api/registration-base-url-resource#catalog-entry
 type CatalogEntry struct {
 	CatalogLeafURL           string                    `json:"@id"`
-	PackageContentURL        string                    `json:"packageContent"`
-	ID                       string                    `json:"id"`
-	Version                  string                    `json:"version"`
-	Description              string                    `json:"description"`
-	ReleaseNotes             string                    `json:"releaseNotes"`
 	Authors                  string                    `json:"authors"`
-	RequireLicenseAcceptance bool                      `json:"requireLicenseAcceptance"`
-	ProjectURL               string                    `json:"projectURL"`
+	Copyright                string                    `json:"copyright"`
 	DependencyGroups         []*PackageDependencyGroup `json:"dependencyGroups"`
+	Description              string                    `json:"description"`
+	IconURL                  string                    `json:"iconUrl"`
+	ID                       string                    `json:"id"`
+	IsPrerelease             bool                      `json:"isPrerelease"`
+	Language                 string                    `json:"language"`
+	LicenseURL               string                    `json:"licenseUrl"`
+	PackageContentURL        string                    `json:"packageContent"`
+	ProjectURL               string                    `json:"projectUrl"`
+	RequireLicenseAcceptance bool                      `json:"requireLicenseAcceptance"`
+	Summary                  string                    `json:"summary"`
+	Tags                     string                    `json:"tags"`
+	Version                  string                    `json:"version"`
+	ReleaseNotes             string                    `json:"releaseNotes"`
+	Published                time.Time                 `json:"published"`
 }
 
 // https://docs.microsoft.com/en-us/nuget/api/registration-base-url-resource#package-dependency-group
@@ -103,28 +111,35 @@ func createRegistrationIndexResponse(l *linkBuilder, pds []*packages_model.Packa
 }
 
 func createRegistrationIndexPageItem(l *linkBuilder, pd *packages_model.PackageDescriptor) *RegistrationIndexPageItem {
-	metadata := pd.Metadata.(*nuget_module.Metadata)
+	metadata := packages_model.DescriptorMetadata[*nuget_module.Metadata](pd)
 
 	return &RegistrationIndexPageItem{
 		RegistrationLeafURL: l.GetRegistrationLeafURL(pd.Package.Name, pd.Version.Version),
 		PackageContentURL:   l.GetPackageDownloadURL(pd.Package.Name, pd.Version.Version),
 		CatalogEntry: &CatalogEntry{
-			CatalogLeafURL:    l.GetRegistrationLeafURL(pd.Package.Name, pd.Version.Version),
-			PackageContentURL: l.GetPackageDownloadURL(pd.Package.Name, pd.Version.Version),
-			ID:                pd.Package.Name,
-			Version:           pd.Version.Version,
-			Description:       metadata.Description,
-			ReleaseNotes:      metadata.ReleaseNotes,
-			Authors:           metadata.Authors,
-			ProjectURL:        metadata.ProjectURL,
-			DependencyGroups:  createDependencyGroups(pd),
+			CatalogLeafURL:           l.GetRegistrationLeafURL(pd.Package.Name, pd.Version.Version),
+			Authors:                  metadata.Authors,
+			Copyright:                metadata.Copyright,
+			DependencyGroups:         createDependencyGroups(metadata),
+			Description:              metadata.Description,
+			IconURL:                  metadata.IconURL,
+			ID:                       pd.Package.Name,
+			IsPrerelease:             pd.Version.IsPrerelease(),
+			Language:                 metadata.Language,
+			LicenseURL:               metadata.LicenseURL,
+			PackageContentURL:        l.GetPackageDownloadURL(pd.Package.Name, pd.Version.Version),
+			ProjectURL:               metadata.ProjectURL,
+			RequireLicenseAcceptance: metadata.RequireLicenseAcceptance,
+			Summary:                  metadata.Summary,
+			Tags:                     metadata.Tags,
+			Version:                  pd.Version.Version,
+			ReleaseNotes:             metadata.ReleaseNotes,
+			Published:                pd.Version.CreatedUnix.AsLocalTime(),
 		},
 	}
 }
 
-func createDependencyGroups(pd *packages_model.PackageDescriptor) []*PackageDependencyGroup {
-	metadata := pd.Metadata.(*nuget_module.Metadata)
-
+func createDependencyGroups(metadata *nuget_module.Metadata) []*PackageDependencyGroup {
 	dependencyGroups := make([]*PackageDependencyGroup, 0, len(metadata.Dependencies))
 	for k, v := range metadata.Dependencies {
 		dependencies := make([]*PackageDependency, 0, len(v))
@@ -145,22 +160,42 @@ func createDependencyGroups(pd *packages_model.PackageDescriptor) []*PackageDepe
 
 // https://docs.microsoft.com/en-us/nuget/api/registration-base-url-resource#registration-leaf
 type RegistrationLeafResponse struct {
-	RegistrationLeafURL  string    `json:"@id"`
-	Type                 []string  `json:"@type"`
-	Listed               bool      `json:"listed"`
-	PackageContentURL    string    `json:"packageContent"`
-	Published            time.Time `json:"published"`
-	RegistrationIndexURL string    `json:"registration"`
+	RegistrationLeafURL  string       `json:"@id"`
+	Type                 []string     `json:"@type"`
+	PackageContentURL    string       `json:"packageContent"`
+	RegistrationIndexURL string       `json:"registration"`
+	CatalogEntry         CatalogEntry `json:"catalogEntry"`
 }
 
 func createRegistrationLeafResponse(l *linkBuilder, pd *packages_model.PackageDescriptor) *RegistrationLeafResponse {
+	registrationLeafURL := l.GetRegistrationLeafURL(pd.Package.Name, pd.Version.Version)
+	packageDownloadURL := l.GetPackageDownloadURL(pd.Package.Name, pd.Version.Version)
+	metadata := packages_model.DescriptorMetadata[*nuget_module.Metadata](pd)
 	return &RegistrationLeafResponse{
-		Type:                 []string{"Package", "http://schema.nuget.org/catalog#Permalink"},
-		Listed:               true,
-		Published:            pd.Version.CreatedUnix.AsLocalTime(),
-		RegistrationLeafURL:  l.GetRegistrationLeafURL(pd.Package.Name, pd.Version.Version),
-		PackageContentURL:    l.GetPackageDownloadURL(pd.Package.Name, pd.Version.Version),
+		RegistrationLeafURL:  registrationLeafURL,
 		RegistrationIndexURL: l.GetRegistrationIndexURL(pd.Package.Name),
+		PackageContentURL:    packageDownloadURL,
+		Type:                 []string{"Package", "http://schema.nuget.org/catalog#Permalink"},
+		CatalogEntry: CatalogEntry{
+			CatalogLeafURL:           registrationLeafURL,
+			Authors:                  metadata.Authors,
+			Copyright:                metadata.Copyright,
+			DependencyGroups:         createDependencyGroups(metadata),
+			Description:              metadata.Description,
+			IconURL:                  metadata.IconURL,
+			ID:                       pd.Package.Name,
+			IsPrerelease:             pd.Version.IsPrerelease(),
+			Language:                 metadata.Language,
+			LicenseURL:               metadata.LicenseURL,
+			PackageContentURL:        packageDownloadURL,
+			ProjectURL:               metadata.ProjectURL,
+			RequireLicenseAcceptance: metadata.RequireLicenseAcceptance,
+			Summary:                  metadata.Summary,
+			Tags:                     metadata.Tags,
+			Version:                  pd.Version.Version,
+			ReleaseNotes:             metadata.ReleaseNotes,
+			Published:                pd.Version.CreatedUnix.AsLocalTime(),
+		},
 	}
 }
 
@@ -188,13 +223,24 @@ type SearchResultResponse struct {
 
 // https://docs.microsoft.com/en-us/nuget/api/search-query-service-resource#search-result
 type SearchResult struct {
-	ID                   string                 `json:"id"`
-	Version              string                 `json:"version"`
-	Versions             []*SearchResultVersion `json:"versions"`
-	Description          string                 `json:"description"`
-	Authors              string                 `json:"authors"`
-	ProjectURL           string                 `json:"projectURL"`
-	RegistrationIndexURL string                 `json:"registration"`
+	Authors                  string                    `json:"authors"`
+	Copyright                string                    `json:"copyright"`
+	DependencyGroups         []*PackageDependencyGroup `json:"dependencyGroups"`
+	Description              string                    `json:"description"`
+	IconURL                  string                    `json:"iconUrl"`
+	ID                       string                    `json:"id"`
+	IsPrerelease             bool                      `json:"isPrerelease"`
+	Language                 string                    `json:"language"`
+	LicenseURL               string                    `json:"licenseUrl"`
+	ProjectURL               string                    `json:"projectUrl"`
+	RequireLicenseAcceptance bool                      `json:"requireLicenseAcceptance"`
+	Summary                  string                    `json:"summary"`
+	Tags                     string                    `json:"tags"`
+	Title                    string                    `json:"title"`
+	TotalDownloads           int64                     `json:"totalDownloads"`
+	Version                  string                    `json:"version"`
+	Versions                 []*SearchResultVersion    `json:"versions"`
+	RegistrationIndexURL     string                    `json:"registration"`
 }
 
 // https://docs.microsoft.com/en-us/nuget/api/search-query-service-resource#search-result
@@ -230,26 +276,38 @@ func createSearchResultResponse(l *linkBuilder, totalHits int64, pds []*packages
 func createSearchResult(l *linkBuilder, pds []*packages_model.PackageDescriptor) *SearchResult {
 	latest := pds[0]
 	versions := make([]*SearchResultVersion, 0, len(pds))
+	totalDownloads := int64(0)
 	for _, pd := range pds {
 		if latest.SemVer.LessThan(pd.SemVer) {
 			latest = pd
 		}
-
+		totalDownloads += pd.Version.DownloadCount
 		versions = append(versions, &SearchResultVersion{
 			RegistrationLeafURL: l.GetRegistrationLeafURL(pd.Package.Name, pd.Version.Version),
 			Version:             pd.Version.Version,
 		})
 	}
 
-	metadata := latest.Metadata.(*nuget_module.Metadata)
+	metadata := packages_model.DescriptorMetadata[*nuget_module.Metadata](latest)
 
 	return &SearchResult{
-		ID:                   latest.Package.Name,
-		Version:              latest.Version.Version,
-		Versions:             versions,
-		Description:          metadata.Description,
-		Authors:              metadata.Authors,
-		ProjectURL:           metadata.ProjectURL,
-		RegistrationIndexURL: l.GetRegistrationIndexURL(latest.Package.Name),
+		Authors:                  metadata.Authors,
+		Copyright:                metadata.Copyright,
+		Description:              metadata.Description,
+		DependencyGroups:         createDependencyGroups(metadata),
+		IconURL:                  metadata.IconURL,
+		ID:                       latest.Package.Name,
+		IsPrerelease:             latest.Version.IsPrerelease(),
+		Language:                 metadata.Language,
+		LicenseURL:               metadata.LicenseURL,
+		ProjectURL:               metadata.ProjectURL,
+		RequireLicenseAcceptance: metadata.RequireLicenseAcceptance,
+		Summary:                  metadata.Summary,
+		Tags:                     metadata.Tags,
+		Title:                    metadata.Title,
+		TotalDownloads:           totalDownloads,
+		Version:                  latest.Version.Version,
+		Versions:                 versions,
+		RegistrationIndexURL:     l.GetRegistrationIndexURL(latest.Package.Name),
 	}
 }

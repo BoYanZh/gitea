@@ -7,12 +7,11 @@ import (
 	"fmt"
 	golog "log"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/util"
 )
 
 type LogGlobalConfig struct {
@@ -41,7 +40,7 @@ func loadLogGlobalFrom(rootCfg ConfigProvider) {
 	Log.BufferLen = sec.Key("BUFFER_LEN").MustInt(10000)
 	Log.Mode = sec.Key("MODE").MustString("console")
 
-	Log.RootPath = sec.Key("ROOT_PATH").MustString(path.Join(AppWorkPath, "log"))
+	Log.RootPath = sec.Key("ROOT_PATH").MustString(filepath.Join(AppWorkPath, "log"))
 	if !filepath.IsAbs(Log.RootPath) {
 		Log.RootPath = filepath.Join(AppWorkPath, Log.RootPath)
 	}
@@ -57,37 +56,39 @@ func prepareLoggerConfig(rootCfg ConfigProvider) {
 	sec := rootCfg.Section("log")
 
 	if !sec.HasKey("logger.default.MODE") {
-		sec.Key("logger.default.MODE").MustString(",")
+		sec.Key("logger.default.MODE").MustString(",") // FIXME: INI-MUST-SIDE-EFFECT
 	}
 
-	deprecatedSetting(rootCfg, "log", "ACCESS", "log", "logger.access.MODE", "1.21")
-	deprecatedSetting(rootCfg, "log", "ENABLE_ACCESS_LOG", "log", "logger.access.MODE", "1.21")
+	deprecatedSetting(rootCfg, "log", "ACCESS", "log", "logger.access.MODE")
+	deprecatedSetting(rootCfg, "log", "ENABLE_ACCESS_LOG", "log", "logger.access.MODE")
 	if val := sec.Key("ACCESS").String(); val != "" {
-		sec.Key("logger.access.MODE").MustString(val)
+		sec.Key("logger.access.MODE").MustString(val) // FIXME: INI-MUST-SIDE-EFFECT
 	}
 	if sec.HasKey("ENABLE_ACCESS_LOG") && !sec.Key("ENABLE_ACCESS_LOG").MustBool() {
 		sec.Key("logger.access.MODE").SetValue("")
 	}
 
-	deprecatedSetting(rootCfg, "log", "ROUTER", "log", "logger.router.MODE", "1.21")
-	deprecatedSetting(rootCfg, "log", "DISABLE_ROUTER_LOG", "log", "logger.router.MODE", "1.21")
+	deprecatedSetting(rootCfg, "log", "ROUTER", "log", "logger.router.MODE")
+	deprecatedSetting(rootCfg, "log", "DISABLE_ROUTER_LOG", "log", "logger.router.MODE")
 	if val := sec.Key("ROUTER").String(); val != "" {
-		sec.Key("logger.router.MODE").MustString(val)
+		sec.Key("logger.router.MODE").MustString(val) // FIXME: INI-MUST-SIDE-EFFECT
 	}
 	if !sec.HasKey("logger.router.MODE") {
-		sec.Key("logger.router.MODE").MustString(",") // use default logger
+		// Use the default logger.
+		sec.Key("logger.router.MODE").MustString(",") // FIXME: INI-MUST-SIDE-EFFECT
 	}
 	if sec.HasKey("DISABLE_ROUTER_LOG") && sec.Key("DISABLE_ROUTER_LOG").MustBool() {
 		sec.Key("logger.router.MODE").SetValue("")
 	}
 
-	deprecatedSetting(rootCfg, "log", "XORM", "log", "logger.xorm.MODE", "1.21")
-	deprecatedSetting(rootCfg, "log", "ENABLE_XORM_LOG", "log", "logger.xorm.MODE", "1.21")
+	deprecatedSetting(rootCfg, "log", "XORM", "log", "logger.xorm.MODE")
+	deprecatedSetting(rootCfg, "log", "ENABLE_XORM_LOG", "log", "logger.xorm.MODE")
 	if val := sec.Key("XORM").String(); val != "" {
-		sec.Key("logger.xorm.MODE").MustString(val)
+		sec.Key("logger.xorm.MODE").MustString(val) // FIXME: INI-MUST-SIDE-EFFECT
 	}
 	if !sec.HasKey("logger.xorm.MODE") {
-		sec.Key("logger.xorm.MODE").MustString(",") // use default logger
+		// Use the default logger.
+		sec.Key("logger.xorm.MODE").MustString(",") // FIXME: INI-MUST-SIDE-EFFECT
 	}
 	if sec.HasKey("ENABLE_XORM_LOG") && !sec.Key("ENABLE_XORM_LOG").MustBool() {
 		sec.Key("logger.xorm.MODE").SetValue("")
@@ -228,8 +229,8 @@ func initLoggerByName(manager *log.LoggerManager, rootCfg ConfigProvider, logger
 	}
 
 	var eventWriters []log.EventWriter
-	modes := strings.Split(modeVal, ",")
-	for _, modeName := range modes {
+	modes := strings.SplitSeq(modeVal, ",")
+	for modeName := range modes {
 		modeName = strings.TrimSpace(modeName)
 		if modeName == "" {
 			continue
@@ -257,7 +258,7 @@ func initLoggerByName(manager *log.LoggerManager, rootCfg ConfigProvider, logger
 }
 
 func InitSQLLoggersForCli(level log.Level) {
-	log.SetConsoleLogger("xorm", "console", level)
+	log.SetupStderrLogger("xorm", "console-stderr", level)
 }
 
 func IsAccessLogEnabled() bool {

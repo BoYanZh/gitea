@@ -1,0 +1,103 @@
+// Copyright 2025 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package devtest
+
+import (
+	"errors"
+	"io/fs"
+	"net/http"
+	"regexp"
+	"strings"
+
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
+	"gitea.dev/services/mailer"
+
+	"go.yaml.in/yaml/v4"
+)
+
+var mailDarkSchemeQuery = regexp.MustCompile(`@media\s*\(\s*prefers-color-scheme\s*:\s*dark\s*\)`)
+
+func mailPreviewMockData(tmplName string) (map[string]any, error) {
+	mockData := map[string]any{}
+	mockDataContent, err := templates.AssetFS().ReadFile(tmplName + ".devtest.yml")
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return mockData, nil
+		}
+		return nil, err
+	}
+	return mockData, yaml.Unmarshal(mockDataContent, &mockData)
+}
+
+func MailPreviewRender(ctx *context.Context) {
+	tmplName := ctx.PathParam("*")
+	mockData, err := mailPreviewMockData(tmplName)
+	if err != nil {
+		http.Error(ctx.Resp, "Failed to parse mock data: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	mockData["locale"] = ctx.Locale
+	var mailBody strings.Builder
+	if err := mailer.LoadedTemplates().BodyTemplates.ExecuteTemplate(&mailBody, tmplName, mockData); err != nil {
+		http.Error(ctx.Resp, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body := mailBody.String()
+	// emulate mail clients, which resolve "cid:" URIs to the mail's inline attachments
+	body = strings.ReplaceAll(body, `src="cid:`, `src="`+setting.AppSubURL+`/devtest/mail-preview-embed/`)
+	previewStyle := "body {padding: 12px 16px}"
+	// a page can force "color-scheme" on an embedded document but never "prefers-color-scheme"
+	if scheme := ctx.FormString("scheme"); scheme == "light" || scheme == "dark" {
+		body = mailDarkSchemeQuery.ReplaceAllString(body, util.Iif(scheme == "dark", "@media all", "@media not all"))
+		previewStyle += "\n:root {color-scheme: " + scheme + "}"
+	}
+	body = strings.Replace(body, "</head>", "<style>"+previewStyle+"</style></head>", 1)
+	// fragment templates like "mail/base/head" would be sniffed as text/plain otherwise
+	ctx.Resp.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = ctx.Resp.Write([]byte(body))
+}
+
+func MailPreviewEmbed(ctx *context.Context) {
+	content, err := mailer.LoadMailIcon(ctx.PathParam("*"))
+	if err != nil {
+		ctx.NotFound(err)
+		return
+	}
+	ctx.Resp.Header().Set("Content-Type", "image/png")
+	_, _ = ctx.Resp.Write(content)
+}
+
+func prepareMailPreviewRender(ctx *context.Context, tmplName string) {
+	subject := "(default subject)"
+	if mockData, err := mailPreviewMockData(tmplName); err == nil {
+		if mockSubject, ok := mockData["Subject"].(string); ok {
+			subject = util.IfZero(mockSubject, subject)
+		}
+	}
+	tmplSubject := mailer.LoadedTemplates().SubjectTemplates.Lookup(tmplName)
+	// FIXME: MAIL-TEMPLATE-SUBJECT: only "issue" related messages support using subject from templates
+	if tmplSubject != nil {
+		var buf strings.Builder
+		err := tmplSubject.Execute(&buf, nil)
+		if err != nil {
+			subject = "ERROR: " + err.Error()
+		} else {
+			subject = util.IfZero(buf.String(), subject)
+		}
+	}
+	ctx.Data["RenderMailSubject"] = subject
+	ctx.Data["RenderMailTemplateName"] = tmplName
+}
+
+func MailPreview(ctx *context.Context) {
+	ctx.Data["MailTemplateNames"] = mailer.LoadedTemplates().TemplateNames
+	tmplName := ctx.FormString("tmpl")
+	if tmplName != "" {
+		prepareMailPreviewRender(ctx, tmplName)
+	}
+	ctx.HTML(http.StatusOK, "devtest/mail-preview")
+}

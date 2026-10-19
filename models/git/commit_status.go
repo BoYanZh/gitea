@@ -9,38 +9,47 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	asymkey_model "code.gitea.io/gitea/models/asymkey"
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/translation"
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/models/db"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/cache"
+	"gitea.dev/modules/cachegroup"
+	"gitea.dev/modules/commitstatus"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/translation"
+	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
-	"xorm.io/xorm"
 )
 
 // CommitStatus holds a single Status of a single Commit
 type CommitStatus struct {
-	ID          int64                  `xorm:"pk autoincr"`
-	Index       int64                  `xorm:"INDEX UNIQUE(repo_sha_index)"`
-	RepoID      int64                  `xorm:"INDEX UNIQUE(repo_sha_index)"`
-	Repo        *repo_model.Repository `xorm:"-"`
-	State       api.CommitStatusState  `xorm:"VARCHAR(7) NOT NULL"`
-	SHA         string                 `xorm:"VARCHAR(64) NOT NULL INDEX UNIQUE(repo_sha_index)"`
-	TargetURL   string                 `xorm:"TEXT"`
-	Description string                 `xorm:"TEXT"`
-	ContextHash string                 `xorm:"VARCHAR(64) index"`
-	Context     string                 `xorm:"TEXT"`
-	Creator     *user_model.User       `xorm:"-"`
+	ID     int64                          `xorm:"pk autoincr"`
+	RepoID int64                          `xorm:"UNIQUE(repo_sha_index)"`
+	SHA    string                         `xorm:"VARCHAR(64) NOT NULL INDEX UNIQUE(repo_sha_index)"`
+	Index  int64                          `xorm:"INDEX UNIQUE(repo_sha_index)"`
+	Repo   *repo_model.Repository         `xorm:"-"`
+	State  commitstatus.CommitStatusState `xorm:"VARCHAR(7) NOT NULL"`
+
+	// TargetURL points to the commit status page reported by a CI system
+	// If Gitea Actions is used, it is a relative link like "{RepoLink}/actions/runs/{RunID}/jobs{JobID}"
+	TargetURL string `xorm:"TEXT"`
+
+	Description string           `xorm:"TEXT"`
+	ContextHash string           `xorm:"VARCHAR(64) index"`
+	Context     string           `xorm:"TEXT"`
+	Creator     *user_model.User `xorm:"-"`
 	CreatorID   int64
 
 	CreatedUnix timeutil.TimeStamp `xorm:"INDEX created"`
@@ -116,7 +125,7 @@ WHEN NOT MATCHED
 func GetNextCommitStatusIndex(ctx context.Context, repoID int64, sha string) (int64, error) {
 	_, err := git.NewIDFromString(sha)
 	if err != nil {
-		return 0, git.ErrInvalidSHA{SHA: sha}
+		return 0, util.NewInvalidArgumentErrorf("invalid sha: %v", err)
 	}
 
 	switch {
@@ -209,43 +218,70 @@ func (status *CommitStatus) LocaleString(lang translation.Locale) string {
 	return lang.TrString("repo.commitstatus." + status.State.String())
 }
 
-// HideActionsURL set `TargetURL` to an empty string if the status comes from Gitea Actions
-func (status *CommitStatus) HideActionsURL(ctx context.Context) {
+// hideActionsURL set `TargetURL` to an empty string if the status comes from Gitea Actions
+func (status *CommitStatus) hideActionsURL(ctx context.Context) {
+	if _, ok := status.cutTargetURLGiteaActionsPrefix(ctx); ok {
+		status.TargetURL = ""
+	}
+}
+
+func (status *CommitStatus) cutTargetURLGiteaActionsPrefix(ctx context.Context) (string, bool) {
 	if status.RepoID == 0 {
-		return
+		return "", false
 	}
 
 	if status.Repo == nil {
 		if err := status.loadRepository(ctx); err != nil {
 			log.Error("loadRepository: %v", err)
-			return
+			return "", false
 		}
 	}
 
-	prefix := fmt.Sprintf("%s/actions", status.Repo.Link())
-	if strings.HasPrefix(status.TargetURL, prefix) {
-		status.TargetURL = ""
+	prefix := status.Repo.Link() + "/actions"
+	return strings.CutPrefix(status.TargetURL, prefix)
+}
+
+// ParseGiteaActionsTargetURL parses the commit status target URL as Gitea Actions link
+func (status *CommitStatus) ParseGiteaActionsTargetURL(ctx context.Context) (runID, jobID int64, ok bool) {
+	s, ok := status.cutTargetURLGiteaActionsPrefix(ctx)
+	if !ok {
+		return 0, 0, false
 	}
+
+	parts := strings.Split(s, "/") // expect: /runs/{runID}/jobs/{jobID}
+	if len(parts) < 5 || parts[1] != "runs" || parts[3] != "jobs" {
+		return 0, 0, false
+	}
+
+	runID, err1 := strconv.ParseInt(parts[2], 10, 64)
+	jobID, err2 := strconv.ParseInt(parts[4], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return runID, jobID, true
 }
 
 // CalcCommitStatus returns commit status state via some status, the commit statues should order by id desc
 func CalcCommitStatus(statuses []*CommitStatus) *CommitStatus {
-	var lastStatus *CommitStatus
-	state := api.CommitStatusSuccess
+	if len(statuses) == 0 {
+		return nil
+	}
+
+	states := make(commitstatus.CommitStatusStates, 0, len(statuses))
+	targetURL := ""
 	for _, status := range statuses {
-		if status.State.NoBetterThan(state) {
-			state = status.State
-			lastStatus = status
+		states = append(states, status.State)
+		if status.TargetURL != "" {
+			targetURL = status.TargetURL
 		}
 	}
-	if lastStatus == nil {
-		if len(statuses) > 0 {
-			lastStatus = statuses[0]
-		} else {
-			lastStatus = &CommitStatus{}
-		}
+
+	return &CommitStatus{
+		RepoID:    statuses[0].RepoID,
+		SHA:       statuses[0].SHA,
+		State:     states.Combine(),
+		TargetURL: targetURL,
 	}
-	return lastStatus
 }
 
 // CommitStatusOptions holds the options for query commit statuses
@@ -276,17 +312,17 @@ func (opts *CommitStatusOptions) ToConds() builder.Cond {
 func (opts *CommitStatusOptions) ToOrders() string {
 	switch opts.SortType {
 	case "oldest":
-		return "created_unix ASC"
+		return "created_unix ASC, `index` ASC"
 	case "recentupdate":
-		return "updated_unix DESC"
+		return "updated_unix DESC, `index` DESC"
 	case "leastupdate":
-		return "updated_unix ASC"
+		return "updated_unix ASC, `index` ASC"
 	case "leastindex":
 		return "`index` DESC"
 	case "highestindex":
 		return "`index` ASC"
 	default:
-		return "created_unix DESC"
+		return "created_unix DESC, `index` DESC" // timestamps have 1s resolution, `index` keeps paging stable
 	}
 }
 
@@ -298,27 +334,35 @@ type CommitStatusIndex struct {
 	MaxIndex int64  `xorm:"index"`
 }
 
+func makeRepoCommitQuery(ctx context.Context, repoID int64, sha string) db.Session {
+	return db.GetEngine(ctx).Table(&CommitStatus{}).
+		Where("repo_id = ?", repoID).And("sha = ?", sha)
+}
+
 // GetLatestCommitStatus returns all statuses with a unique context for a given commit.
-func GetLatestCommitStatus(ctx context.Context, repoID int64, sha string, listOptions db.ListOptions) ([]*CommitStatus, int64, error) {
-	getBase := func() *xorm.Session {
-		return db.GetEngine(ctx).Table(&CommitStatus{}).
-			Where("repo_id = ?", repoID).And("sha = ?", sha)
-	}
+func GetLatestCommitStatus(ctx context.Context, repoID int64, sha string, listOptions db.ListOptions) ([]*CommitStatus, error) {
 	indices := make([]int64, 0, 10)
-	sess := getBase().Select("max( `index` ) as `index`").
-		GroupBy("context_hash").OrderBy("max( `index` ) desc")
+	sess := makeRepoCommitQuery(ctx, repoID, sha)
+	sess.Select("max( `index` ) as `index`").GroupBy("context_hash").OrderBy("max( `index` ) desc")
 	if !listOptions.IsListAll() {
-		sess = db.SetSessionPagination(sess, &listOptions)
+		db.SetSessionPagination(sess, &listOptions)
 	}
-	count, err := sess.FindAndCount(&indices)
-	if err != nil {
-		return nil, count, err
+	if err := sess.Find(&indices); err != nil {
+		return nil, err
 	}
 	statuses := make([]*CommitStatus, 0, len(indices))
 	if len(indices) == 0 {
-		return statuses, count, nil
+		return statuses, nil
 	}
-	return statuses, count, getBase().And(builder.In("`index`", indices)).Find(&statuses)
+	err := makeRepoCommitQuery(ctx, repoID, sha).And(builder.In("`index`", indices)).Find(&statuses)
+	return statuses, err
+}
+
+func CountLatestCommitStatus(ctx context.Context, repoID int64, sha string) (int64, error) {
+	return makeRepoCommitQuery(ctx, repoID, sha).
+		Select("count(context_hash)").
+		GroupBy("context_hash").
+		Count()
 }
 
 // GetLatestCommitStatusForPairs returns all statuses with a unique context for a given list of repo-sha pairs
@@ -331,7 +375,7 @@ func GetLatestCommitStatusForPairs(ctx context.Context, repoSHAs []RepoSHA) (map
 
 	results := make([]result, 0, len(repoSHAs))
 
-	getBase := func() *xorm.Session {
+	getBase := func() db.Session {
 		return db.GetEngine(ctx).Table(&CommitStatus{})
 	}
 
@@ -377,46 +421,48 @@ func GetLatestCommitStatusForPairs(ctx context.Context, repoSHAs []RepoSHA) (map
 	return repoStatuses, nil
 }
 
-// GetLatestCommitStatusForRepoCommitIDs returns all statuses with a unique context for a given list of repo-sha pairs
-func GetLatestCommitStatusForRepoCommitIDs(ctx context.Context, repoID int64, commitIDs []string) (map[string][]*CommitStatus, error) {
-	type result struct {
+// GetLatestCommitStatusForRepoCommitIDs returns the commit statuses with a unique context for a given list of repo-sha pairs
+// If the provided commit IDs are too many, only the first part and the last part of the commit IDs will be queried.
+func GetLatestCommitStatusForRepoCommitIDs(ctx context.Context, repoID int64, allCommitIDs []string) (map[string][]*CommitStatus, error) {
+	const maxCommitIDs = 500
+	const maxBatchSize = 200
+	queryCommitIDs := allCommitIDs
+	if len(allCommitIDs) > maxCommitIDs {
+		// The commit IDs are usually from "commits list" or "compare" page (create a PR or compare commits), nobody can read so many commits at once.
+		// The commit IDs are usually sorted by time, so we can take the first half and the last half of the commit IDs to get the latest statuses.
+		log.Warn("GetLatestCommitStatusForRepoCommitIDs: too many commit IDs (%d) for repo %d, truncating to %d", len(allCommitIDs), repoID, maxCommitIDs)
+		queryCommitIDs = allCommitIDs[:maxCommitIDs/2]
+		queryCommitIDs = append(queryCommitIDs, allCommitIDs[len(allCommitIDs)-maxCommitIDs/2:]...)
+	}
+
+	baseSql := func() db.Session {
+		return db.GetEngine(ctx).Table(&CommitStatus{}).Where("repo_id = ?", repoID)
+	}
+
+	type shaMaxIndexResult struct {
 		Index int64
 		SHA   string
 	}
-
-	getBase := func() *xorm.Session {
-		return db.GetEngine(ctx).Table(&CommitStatus{}).Where("repo_id = ?", repoID)
-	}
-	results := make([]result, 0, len(commitIDs))
-
-	conds := make([]builder.Cond, 0, len(commitIDs))
-	for _, sha := range commitIDs {
-		conds = append(conds, builder.Eq{"sha": sha})
-	}
-	sess := getBase().And(builder.Or(conds...)).
-		Select("max( `index` ) as `index`, sha").
-		GroupBy("context_hash, sha").OrderBy("max( `index` ) desc")
-
-	err := sess.Find(&results)
+	shaMaxIndexResults := make([]*shaMaxIndexResult, 0, len(allCommitIDs))
+	err := baseSql().And(builder.In("sha", queryCommitIDs)).
+		Select("max(`index`) as `index`, sha").
+		GroupBy("context_hash, sha").
+		Find(&shaMaxIndexResults)
 	if err != nil {
 		return nil, err
 	}
 
 	repoStatuses := make(map[string][]*CommitStatus)
-
-	if len(results) > 0 {
-		statuses := make([]*CommitStatus, 0, len(results))
-
-		conds = make([]builder.Cond, 0, len(results))
-		for _, result := range results {
-			conds = append(conds, builder.Eq{"`index`": result.Index, "sha": result.SHA})
+	for chunk := range slices.Chunk(shaMaxIndexResults, maxBatchSize) {
+		statuses := make([]*CommitStatus, 0, len(chunk))
+		condIndexSha := make([]builder.Cond, 0, len(chunk))
+		for _, res := range chunk {
+			condIndexSha = append(condIndexSha, builder.Eq{"`index`": res.Index, "sha": res.SHA})
 		}
-		err = getBase().And(builder.Or(conds...)).Find(&statuses)
+		err = baseSql().And(builder.Or(condIndexSha...)).Find(&statuses)
 		if err != nil {
 			return nil, err
 		}
-
-		// Group the statuses by commit
 		for _, status := range statuses {
 			repoStatuses[status.SHA] = append(repoStatuses[status.SHA], status)
 		}
@@ -453,40 +499,41 @@ func NewCommitStatus(ctx context.Context, opts NewCommitStatusOptions) error {
 		return fmt.Errorf("NewCommitStatus[nil, %s]: no repository specified", opts.SHA)
 	}
 
-	repoPath := opts.Repo.RepoPath()
 	if opts.Creator == nil {
-		return fmt.Errorf("NewCommitStatus[%s, %s]: no user specified", repoPath, opts.SHA)
+		return fmt.Errorf("NewCommitStatus[%s, %s]: no user specified", opts.Repo.FullName(), opts.SHA)
 	}
 
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return fmt.Errorf("NewCommitStatus[repo_id: %d, user_id: %d, sha: %s]: %w", opts.Repo.ID, opts.Creator.ID, opts.SHA, err)
-	}
-	defer committer.Close()
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		// Get the next Status Index
+		idx, err := GetNextCommitStatusIndex(ctx, opts.Repo.ID, opts.SHA.String())
+		if err != nil {
+			return fmt.Errorf("generate commit status index failed: %w", err)
+		}
 
-	// Get the next Status Index
-	idx, err := GetNextCommitStatusIndex(ctx, opts.Repo.ID, opts.SHA.String())
-	if err != nil {
-		return fmt.Errorf("generate commit status index failed: %w", err)
-	}
+		opts.CommitStatus.Description = strings.TrimSpace(opts.CommitStatus.Description)
+		opts.CommitStatus.Context = strings.TrimSpace(opts.CommitStatus.Context)
+		opts.CommitStatus.TargetURL = strings.TrimSpace(opts.CommitStatus.TargetURL)
+		opts.CommitStatus.ContextHash = strings.TrimSpace(opts.CommitStatus.ContextHash)
+		opts.CommitStatus.SHA = opts.SHA.String()
+		opts.CommitStatus.CreatorID = opts.Creator.ID
+		opts.CommitStatus.RepoID = opts.Repo.ID
+		opts.CommitStatus.Index = idx
+		log.Debug("NewCommitStatus[%s, %s]: %d", opts.Repo.FullName(), opts.SHA, opts.CommitStatus.Index)
 
-	opts.CommitStatus.Description = strings.TrimSpace(opts.CommitStatus.Description)
-	opts.CommitStatus.Context = strings.TrimSpace(opts.CommitStatus.Context)
-	opts.CommitStatus.TargetURL = strings.TrimSpace(opts.CommitStatus.TargetURL)
-	opts.CommitStatus.SHA = opts.SHA.String()
-	opts.CommitStatus.CreatorID = opts.Creator.ID
-	opts.CommitStatus.RepoID = opts.Repo.ID
-	opts.CommitStatus.Index = idx
-	log.Debug("NewCommitStatus[%s, %s]: %d", repoPath, opts.SHA, opts.CommitStatus.Index)
+		// Callers may pre-compute a ContextHash to keep entries that share a
+		// human-readable Context separated (e.g. two workflow files with the
+		// same `name:` — issue #35699). Only derive from Context when unset.
+		if opts.CommitStatus.ContextHash == "" {
+			opts.CommitStatus.ContextHash = HashCommitStatusContext(opts.CommitStatus.Context)
+		}
 
-	opts.CommitStatus.ContextHash = hashCommitStatusContext(opts.CommitStatus.Context)
+		// Insert new CommitStatus
+		if err = db.Insert(ctx, opts.CommitStatus); err != nil {
+			return fmt.Errorf("insert CommitStatus[%s, %s]: %w", opts.Repo.FullName(), opts.SHA, err)
+		}
 
-	// Insert new CommitStatus
-	if _, err = db.GetEngine(ctx).Insert(opts.CommitStatus); err != nil {
-		return fmt.Errorf("insert CommitStatus[%s, %s]: %w", repoPath, opts.SHA, err)
-	}
-
-	return committer.Commit()
+		return nil
+	})
 }
 
 // SignCommitWithStatuses represents a commit with validation of signature and status state.
@@ -496,59 +543,46 @@ type SignCommitWithStatuses struct {
 	*asymkey_model.SignCommit
 }
 
-// ParseCommitsWithStatus checks commits latest statuses and calculates its worst status state
-func ParseCommitsWithStatus(ctx context.Context, oldCommits []*asymkey_model.SignCommit, repo *repo_model.Repository) []*SignCommitWithStatuses {
-	newCommits := make([]*SignCommitWithStatuses, 0, len(oldCommits))
-
-	for _, c := range oldCommits {
-		commit := &SignCommitWithStatuses{
-			SignCommit: c,
-		}
-		statuses, _, err := GetLatestCommitStatus(ctx, repo.ID, commit.ID.String(), db.ListOptions{})
-		if err != nil {
-			log.Error("GetLatestCommitStatus: %v", err)
-		} else {
-			commit.Statuses = statuses
-			commit.Status = CalcCommitStatus(statuses)
-		}
-
-		newCommits = append(newCommits, commit)
-	}
-	return newCommits
-}
-
-// hashCommitStatusContext hash context
-func hashCommitStatusContext(context string) string {
+// HashCommitStatusContext returns the sha1 hash used to dedupe commit statuses
+// by Context. Callers that need to keep statuses with the same display Context
+// separated (e.g. distinct workflow files sharing a `name:`) can mix extra
+// disambiguating data into the input.
+func HashCommitStatusContext(context string) string {
 	return fmt.Sprintf("%x", sha1.Sum([]byte(context)))
 }
 
-// ConvertFromGitCommit converts git commits into SignCommitWithStatuses
-func ConvertFromGitCommit(ctx context.Context, commits []*git.Commit, repo *repo_model.Repository) []*SignCommitWithStatuses {
-	return ParseCommitsWithStatus(ctx,
-		asymkey_model.ParseCommitsWithSignature(
-			ctx,
-			user_model.ValidateCommitsWithEmails(ctx, commits),
-			repo.GetTrustModel(),
-			func(user *user_model.User) (bool, error) {
-				return repo_model.IsOwnerMemberCollaborator(ctx, repo, user.ID)
-			},
-		),
-		repo,
-	)
+// CommitStatusesApplyDoerPermission hides the Gitea Actions url of every status whose repository
+// the doer cannot read the Actions unit of, so the "Details" link does not lead to a 404.
+func CommitStatusesApplyDoerPermission(ctx context.Context, doer *user_model.User, statuses []*CommitStatus) {
+	for _, status := range statuses {
+		if status != nil && !statusRepoCanReadActions(ctx, doer, status) {
+			status.hideActionsURL(ctx)
+		}
+	}
 }
 
-// CommitStatusesHideActionsURL hide Gitea Actions urls
-func CommitStatusesHideActionsURL(ctx context.Context, statuses []*CommitStatus) {
-	idToRepos := make(map[int64]*repo_model.Repository)
-	for _, status := range statuses {
-		if status == nil {
-			continue
-		}
-
-		if status.Repo == nil {
-			status.Repo = idToRepos[status.RepoID]
-		}
-		status.HideActionsURL(ctx)
-		idToRepos[status.RepoID] = status.Repo
+// SignCommitsApplyDoerPermission is CommitStatusesApplyDoerPermission for a list of commits.
+func SignCommitsApplyDoerPermission(ctx context.Context, doer *user_model.User, commits []*SignCommitWithStatuses) {
+	var statuses []*CommitStatus
+	for _, commit := range commits {
+		statuses = append(statuses, commit.Status)
+		statuses = append(statuses, commit.Statuses...)
 	}
+	CommitStatusesApplyDoerPermission(ctx, doer, statuses)
+}
+
+func statusRepoCanReadActions(ctx context.Context, doer *user_model.User, status *CommitStatus) bool {
+	perm, err := cache.GetWithContextCache(ctx, cachegroup.RepoUserPermission, access_model.RepoUserPermissionCacheKey(status.RepoID, doer),
+		func(ctx context.Context, _ string) (access_model.Permission, error) { // only runs on a cache miss
+			if err := status.loadRepository(ctx); err != nil {
+				return access_model.Permission{}, err
+			}
+			return access_model.GetDoerRepoPermission(ctx, status.Repo, doer)
+		},
+	)
+	if err != nil {
+		log.Error("GetDoerRepoPermission[%d]: %v", status.RepoID, err)
+		return false
+	}
+	return perm.CanRead(unit.TypeActions)
 }

@@ -9,9 +9,9 @@ import (
 	"net/http/fcgi"
 	"strings"
 
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
 )
 
 func runHTTP(network, listenAddr, name string, m http.Handler, useProxyProtocol bool) error {
@@ -20,12 +20,6 @@ func runHTTP(network, listenAddr, name string, m http.Handler, useProxyProtocol 
 
 // NoHTTPRedirector tells our cleanup routine that we will not be using a fallback http redirector
 func NoHTTPRedirector() {
-	graceful.GetManager().InformCleanup()
-}
-
-// NoMainListener tells our cleanup routine that we will not be using a possibly provided listener
-// for our main HTTP/HTTPS service
-func NoMainListener() {
 	graceful.GetManager().InformCleanup()
 }
 

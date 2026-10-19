@@ -7,8 +7,10 @@
 		{{end}}
 	</h4>
 	<div class="ui attached segment">
+		{{if .IsFirstTimeRegistration}}
+			<p>{{ctx.Locale.Tr "auth.sign_up_tip"}}</p>
+		{{end}}
 		<form class="ui form" action="{{.SignUpLink}}" method="post">
-			{{.CsrfTokenHtml}}
 			{{if or (not .LinkAccountMode) (and .LinkAccountMode .LinkAccountModeRegister)}}
 			{{template "base/alert" .}}
 			{{end}}
@@ -38,7 +40,7 @@
 				{{template "user/auth/captcha" .}}
 
 				<div class="inline field">
-					<button class="ui primary button tw-w-full">
+					<button type="submit" class="ui primary button tw-w-full">
 						{{if .LinkAccountMode}}
 							{{ctx.Locale.Tr "auth.oauth_signup_submit"}}
 						{{else}}
@@ -47,19 +49,22 @@
 					</button>
 				</div>
 			{{end}}
-
-			{{template "user/auth/oauth_container" .}}
+			{{$showExternalAuthMethods := or .OAuth2Providers .EnableOpenIDSignIn .EnableSSPI}}
+			{{if $showExternalAuthMethods}}
+				<div class="divider divider-text">{{ctx.Locale.Tr "sign_in_or"}}</div>
+				{{template "user/auth/external_auth_methods" .}}
+			{{end}}
 		</form>
 	</div>
 </div>
 
 <div class="ui container fluid">
+	{{if not .LinkAccountMode}}
 	<div class="ui attached segment header top tw-flex tw-flex-col tw-items-center">
-		{{if not .LinkAccountMode}}
 		<div class="field">
 			<span>{{ctx.Locale.Tr "auth.already_have_account"}}</span>
 			<a href="{{AppSubUrl}}/user/login">{{ctx.Locale.Tr "auth.sign_in_now"}}</a>
 		</div>
-		{{end}}
 	</div>
+	{{end}}
 </div>

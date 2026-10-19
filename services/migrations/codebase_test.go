@@ -4,43 +4,37 @@
 package migrations
 
 import (
-	"context"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
-	base "code.gitea.io/gitea/modules/migration"
+	"gitea.dev/models/unittest"
+	base "gitea.dev/modules/migration"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestCodebaseDownloadRepo(t *testing.T) {
-	// Skip tests if Codebase token is not found
-	cloneUser := os.Getenv("CODEBASE_CLONE_USER")
-	clonePassword := os.Getenv("CODEBASE_CLONE_PASSWORD")
 	apiUser := os.Getenv("CODEBASE_API_USER")
 	apiPassword := os.Getenv("CODEBASE_API_TOKEN")
-	if apiUser == "" || apiPassword == "" {
-		t.Skip("skipped test because a CODEBASE_ variable was not in the environment")
-	}
+	liveMode := apiUser != "" && apiPassword != ""
+
+	_, callerFile, _, _ := runtime.Caller(0)
+	fixtureDir := filepath.Join(filepath.Dir(callerFile), "_mock_data/TestCodebaseDownloadRepo")
+	mockServer := unittest.NewMockWebServer(t, "https://api3.codebasehq.com", fixtureDir, liveMode)
 
 	cloneAddr := "https://gitea-test.codebasehq.com/gitea-test/test.git"
-	u, _ := url.Parse(cloneAddr)
-	if cloneUser != "" {
-		u.User = url.UserPassword(cloneUser, clonePassword)
-	}
+	projectURL, _ := url.Parse(cloneAddr)
+	projectURL.User = nil
 
-	factory := &CodebaseDownloaderFactory{}
-	downloader, err := factory.New(context.Background(), base.MigrateOptions{
-		CloneAddr:    u.String(),
-		AuthUsername: apiUser,
-		AuthPassword: apiPassword,
-	})
-	if err != nil {
-		t.Fatalf("Error creating Codebase downloader: %v", err)
-	}
-	repo, err := downloader.GetRepoInfo()
+	ctx := t.Context()
+	downloader := NewCodebaseDownloader(ctx, projectURL, "gitea-test", "test", apiUser, apiPassword)
+	downloader.baseURL, _ = url.Parse(mockServer.URL)
+
+	repo, err := downloader.GetRepoInfo(ctx)
 	assert.NoError(t, err)
 	assertRepositoryEqual(t, &base.Repository{
 		Name:        "test",
@@ -50,26 +44,26 @@ func TestCodebaseDownloadRepo(t *testing.T) {
 		OriginalURL: cloneAddr,
 	}, repo)
 
-	milestones, err := downloader.GetMilestones()
+	milestones, err := downloader.GetMilestones(ctx)
 	assert.NoError(t, err)
 	assertMilestonesEqual(t, []*base.Milestone{
 		{
 			Title:    "Milestone1",
-			Deadline: timePtr(time.Date(2021, time.September, 16, 0, 0, 0, 0, time.UTC)),
+			Deadline: new(time.Date(2021, time.September, 16, 0, 0, 0, 0, time.UTC)),
 		},
 		{
 			Title:    "Milestone2",
-			Deadline: timePtr(time.Date(2021, time.September, 17, 0, 0, 0, 0, time.UTC)),
-			Closed:   timePtr(time.Date(2021, time.September, 17, 0, 0, 0, 0, time.UTC)),
+			Deadline: new(time.Date(2021, time.September, 17, 0, 0, 0, 0, time.UTC)),
+			Closed:   new(time.Date(2021, time.September, 17, 0, 0, 0, 0, time.UTC)),
 			State:    "closed",
 		},
 	}, milestones)
 
-	labels, err := downloader.GetLabels()
+	labels, err := downloader.GetLabels(ctx)
 	assert.NoError(t, err)
 	assert.Len(t, labels, 4)
 
-	issues, isEnd, err := downloader.GetIssues(1, 2)
+	issues, isEnd, err := downloader.GetIssues(ctx, 1, 2)
 	assert.NoError(t, err)
 	assert.True(t, isEnd)
 	assertIssuesEqual(t, []*base.Issue{
@@ -106,7 +100,7 @@ func TestCodebaseDownloadRepo(t *testing.T) {
 		},
 	}, issues)
 
-	comments, _, err := downloader.GetComments(issues[0])
+	comments, _, err := downloader.GetComments(ctx, issues[0])
 	assert.NoError(t, err)
 	assertCommentsEqual(t, []*base.Comment{
 		{
@@ -119,7 +113,7 @@ func TestCodebaseDownloadRepo(t *testing.T) {
 		},
 	}, comments)
 
-	prs, _, err := downloader.GetPullRequests(1, 1)
+	prs, _, err := downloader.GetPullRequests(ctx, 1, 1)
 	assert.NoError(t, err)
 	assertPullRequestsEqual(t, []*base.PullRequest{
 		{
@@ -144,7 +138,7 @@ func TestCodebaseDownloadRepo(t *testing.T) {
 		},
 	}, prs)
 
-	rvs, err := downloader.GetReviews(prs[0])
-	assert.NoError(t, err)
+	rvs, err := downloader.GetReviews(ctx, prs[0])
+	assert.Error(t, err)
 	assert.Empty(t, rvs)
 }

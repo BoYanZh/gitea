@@ -4,15 +4,17 @@
 package org
 
 import (
-	"net/http"
+	"errors"
 
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/modules/label"
-	repo_module "code.gitea.io/gitea/modules/repository"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/forms"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/modules/label"
+	repo_module "gitea.dev/modules/repository"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	shared_label "gitea.dev/routers/web/shared/label"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
 )
 
 // RetrieveLabels find all the labels of an organization
@@ -32,47 +34,45 @@ func RetrieveLabels(ctx *context.Context) {
 
 // NewLabel create new label for organization
 func NewLabel(ctx *context.Context) {
-	form := web.GetForm(ctx).(*forms.CreateLabelForm)
-	ctx.Data["Title"] = ctx.Tr("repo.labels")
-	ctx.Data["PageIsLabels"] = true
-	ctx.Data["PageIsOrgSettings"] = true
-
-	if ctx.HasError() {
-		ctx.Flash.Error(ctx.Data["ErrorMsg"].(string))
-		ctx.Redirect(ctx.Org.OrgLink + "/settings/labels")
+	form := shared_label.GetLabelEditForm(ctx)
+	if ctx.Written() {
 		return
 	}
 
 	l := &issues_model.Label{
-		OrgID:       ctx.Org.Organization.ID,
-		Name:        form.Title,
-		Exclusive:   form.Exclusive,
-		Description: form.Description,
-		Color:       form.Color,
+		OrgID:          ctx.Org.Organization.ID,
+		Name:           form.Title,
+		Exclusive:      form.Exclusive,
+		Description:    form.Description,
+		Color:          form.Color,
+		ExclusiveOrder: form.ExclusiveOrder,
 	}
 	if err := issues_model.NewLabel(ctx, l); err != nil {
 		ctx.ServerError("NewLabel", err)
 		return
 	}
-	ctx.Redirect(ctx.Org.OrgLink + "/settings/labels")
+	ctx.JSONRedirect(ctx.Org.OrgLink + "/settings/labels")
 }
 
 // UpdateLabel update a label's name and color
 func UpdateLabel(ctx *context.Context) {
-	form := web.GetForm(ctx).(*forms.CreateLabelForm)
+	form := shared_label.GetLabelEditForm(ctx)
+	if ctx.Written() {
+		return
+	}
+
 	l, err := issues_model.GetLabelInOrgByID(ctx, ctx.Org.Organization.ID, form.ID)
-	if err != nil {
-		switch {
-		case issues_model.IsErrOrgLabelNotExist(err):
-			ctx.Error(http.StatusNotFound)
-		default:
-			ctx.ServerError("UpdateLabel", err)
-		}
+	if errors.Is(err, util.ErrNotExist) {
+		ctx.JSONErrorNotFound()
+		return
+	} else if err != nil {
+		ctx.ServerError("GetLabelInOrgByID", err)
 		return
 	}
 
 	l.Name = form.Title
 	l.Exclusive = form.Exclusive
+	l.ExclusiveOrder = form.ExclusiveOrder
 	l.Description = form.Description
 	l.Color = form.Color
 	l.SetArchived(form.IsArchived)
@@ -80,12 +80,12 @@ func UpdateLabel(ctx *context.Context) {
 		ctx.ServerError("UpdateLabel", err)
 		return
 	}
-	ctx.Redirect(ctx.Org.OrgLink + "/settings/labels")
+	ctx.JSONRedirect(ctx.Org.OrgLink + "/settings/labels")
 }
 
 // DeleteLabel delete a label
 func DeleteLabel(ctx *context.Context) {
-	if err := issues_model.DeleteLabel(ctx, ctx.Org.Organization.ID, ctx.FormInt64("id")); err != nil {
+	if err := issues_model.DeleteOrgLabel(ctx, ctx.Org.Organization.ID, ctx.FormInt64("id")); err != nil {
 		ctx.Flash.Error("DeleteLabel: " + err.Error())
 	} else {
 		ctx.Flash.Success(ctx.Tr("repo.issues.label_deletion_success"))
@@ -96,16 +96,15 @@ func DeleteLabel(ctx *context.Context) {
 
 // InitializeLabels init labels for an organization
 func InitializeLabels(ctx *context.Context) {
-	form := web.GetForm(ctx).(*forms.InitializeLabelsForm)
+	form := web.GetForm[*forms.InitializeLabelsForm](ctx)
 	if ctx.HasError() {
 		ctx.Redirect(ctx.Org.OrgLink + "/labels")
 		return
 	}
 
 	if err := repo_module.InitializeLabels(ctx, ctx.Org.Organization.ID, form.TemplateName, true); err != nil {
-		if label.IsErrTemplateLoad(err) {
-			originalErr := err.(label.ErrTemplateLoad).OriginalError
-			ctx.Flash.Error(ctx.Tr("repo.issues.label_templates.fail_to_load_file", form.TemplateName, originalErr))
+		if errTemplateLoad, ok := err.(label.ErrTemplateLoad); ok {
+			ctx.Flash.Error(ctx.Tr("repo.issues.label_templates.fail_to_load_file", form.TemplateName, errTemplateLoad.OriginalError))
 			ctx.Redirect(ctx.Org.OrgLink + "/settings/labels")
 			return
 		}

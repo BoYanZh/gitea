@@ -7,8 +7,8 @@ import (
 	"os"
 	"testing"
 
-	"code.gitea.io/gitea/modules/generate"
-	"code.gitea.io/gitea/modules/test"
+	"gitea.dev/modules/generate"
+	"gitea.dev/modules/test"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,7 +31,7 @@ JWT_SECRET = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 	actual := GetGeneralTokenSigningSecret()
 	expected, _ := generate.DecodeJwtSecretBase64("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
 	assert.Len(t, actual, 32)
-	assert.EqualValues(t, expected, actual)
+	assert.Equal(t, expected, actual)
 }
 
 func TestGetGeneralSigningSecretSave(t *testing.T) {
@@ -62,7 +62,7 @@ func TestGetGeneralSigningSecretSave(t *testing.T) {
 func TestOauth2DefaultApplications(t *testing.T) {
 	cfg, _ := NewConfigProviderFromData(``)
 	loadOAuth2From(cfg)
-	assert.Equal(t, []string{"git-credential-oauth", "git-credential-manager", "tea"}, OAuth2.DefaultApplications)
+	assert.Equal(t, []string{"git-credential-oauth", "git-credential-manager", "tea", "gitea-app", "gitea-vscode"}, OAuth2.DefaultApplications)
 
 	cfg, _ = NewConfigProviderFromData(`[oauth2]
 DEFAULT_APPLICATIONS = tea
@@ -74,5 +74,5 @@ DEFAULT_APPLICATIONS = tea
 DEFAULT_APPLICATIONS =
 `)
 	loadOAuth2From(cfg)
-	assert.Nil(t, nil, OAuth2.DefaultApplications)
+	assert.Nil(t, OAuth2.DefaultApplications)
 }

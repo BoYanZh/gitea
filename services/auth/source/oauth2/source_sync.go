@@ -7,10 +7,10 @@ import (
 	"context"
 	"time"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
 
 	"github.com/markbates/goth"
 	"golang.org/x/oauth2"
@@ -18,30 +18,29 @@ import (
 
 // Sync causes this OAuth2 source to synchronize its users with the db.
 func (source *Source) Sync(ctx context.Context, updateExisting bool) error {
-	log.Trace("Doing: SyncExternalUsers[%s] %d", source.authSource.Name, source.authSource.ID)
+	log.Trace("Doing: SyncExternalUsers[%s] %d", source.AuthSource.Name, source.AuthSource.ID)
 
 	if !updateExisting {
-		log.Info("SyncExternalUsers[%s] not running since updateExisting is false", source.authSource.Name)
+		log.Info("SyncExternalUsers[%s] not running since updateExisting is false", source.AuthSource.Name)
 		return nil
 	}
 
-	provider, err := createProvider(source.authSource.Name, source)
+	provider, err := createProvider(source.AuthSource.Name, source)
 	if err != nil {
 		return err
 	}
 
 	if !provider.RefreshTokenAvailable() {
-		log.Trace("SyncExternalUsers[%s] provider doesn't support refresh tokens, can't synchronize", source.authSource.Name)
+		log.Trace("SyncExternalUsers[%s] provider doesn't support refresh tokens, can't synchronize", source.AuthSource.Name)
 		return nil
 	}
 
 	opts := user_model.FindExternalUserOptions{
 		HasRefreshToken: true,
 		Expired:         true,
-		LoginSourceID:   source.authSource.ID,
+		LoginSourceID:   source.AuthSource.ID,
 	}
-
-	return user_model.IterateExternalLogin(ctx, opts, func(ctx context.Context, u *user_model.ExternalLoginUser) error {
+	return db.IterateByColumn(ctx, "external_id", opts.ToConds(), func(ctx context.Context, u *user_model.ExternalLoginUser) error {
 		return source.refresh(ctx, provider, u)
 	})
 }
@@ -61,13 +60,7 @@ func (source *Source) refresh(ctx context.Context, provider goth.Provider, u *us
 		}
 	}
 
-	user := &user_model.User{
-		LoginName:   u.ExternalID,
-		LoginType:   auth.OAuth2,
-		LoginSource: u.LoginSourceID,
-	}
-
-	hasUser, err := user_model.GetUser(ctx, user)
+	user, hasUser, err := user_model.GetIndividualUserByLoginSource(ctx, auth.OAuth2, u.LoginSourceID, u.ExternalID)
 	if err != nil {
 		return err
 	}
@@ -77,19 +70,17 @@ func (source *Source) refresh(ctx context.Context, provider goth.Provider, u *us
 	// recognizes them as a valid user, they will be able to login
 	// via their provider and reactivate their account.
 	if shouldDisable {
-		log.Info("SyncExternalUsers[%s] disabling user %d", source.authSource.Name, user.ID)
-
 		return db.WithTx(ctx, func(ctx context.Context) error {
 			if hasUser {
+				log.Info("SyncExternalUsers[%s] disabling user %d", source.AuthSource.Name, user.ID)
 				user.IsActive = false
-				err := user_model.UpdateUserCols(ctx, user, "is_active")
-				if err != nil {
+				if err := user_model.UpdateUserCols(ctx, user, "is_active"); err != nil {
 					return err
 				}
 			}
 
-			// Delete stored tokens, since they are invalid. This
-			// also provents us from checking this in subsequent runs.
+			// HINT: OAUTH-AUTO-SYNC-USER-ACTIVATION
+			// Delete stored tokens, since they are invalid. This also prevents us from checking this in subsequent runs.
 			u.AccessToken = ""
 			u.RefreshToken = ""
 			u.ExpiresAt = time.Time{}

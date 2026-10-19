@@ -12,18 +12,18 @@ import (
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/services/mailer/incoming"
-	incoming_payload "code.gitea.io/gitea/services/mailer/incoming/payload"
-	token_service "code.gitea.io/gitea/services/mailer/token"
-	"code.gitea.io/gitea/tests"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/setting"
+	"gitea.dev/services/mailer/incoming"
+	incoming_payload "gitea.dev/services/mailer/incoming/payload"
+	sender_service "gitea.dev/services/mailer/sender"
+	token_service "gitea.dev/services/mailer/token"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/gomail.v2"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIncomingEmail(t *testing.T) {
@@ -44,18 +44,20 @@ func TestIncomingEmail(t *testing.T) {
 			commentPayload, err := incoming_payload.CreateReferencePayload(comment)
 			assert.NoError(t, err)
 
-			_, err = incoming_payload.GetReferenceFromPayload(db.DefaultContext, []byte{1, 2, 3})
+			_, err = incoming_payload.GetReferenceFromPayload(t.Context(), []byte{1, 2, 3})
 			assert.Error(t, err)
 
-			ref, err := incoming_payload.GetReferenceFromPayload(db.DefaultContext, issuePayload)
+			ref, err := incoming_payload.GetReferenceFromPayload(t.Context(), issuePayload)
 			assert.NoError(t, err)
-			assert.IsType(t, ref, new(issues_model.Issue))
-			assert.EqualValues(t, issue.ID, ref.(*issues_model.Issue).ID)
+			refIssue, ok := ref.(*issues_model.Issue)
+			require.True(t, ok)
+			assert.Equal(t, issue.ID, refIssue.ID)
 
-			ref, err = incoming_payload.GetReferenceFromPayload(db.DefaultContext, commentPayload)
+			ref, err = incoming_payload.GetReferenceFromPayload(t.Context(), commentPayload)
 			assert.NoError(t, err)
-			assert.IsType(t, ref, new(issues_model.Comment))
-			assert.EqualValues(t, comment.ID, ref.(*issues_model.Comment).ID)
+			refComment, ok := ref.(*issues_model.Comment)
+			require.True(t, ok)
+			assert.Equal(t, comment.ID, refComment.ID)
 		})
 
 		t.Run("Token", func(t *testing.T) {
@@ -67,7 +69,14 @@ func TestIncomingEmail(t *testing.T) {
 			assert.NoError(t, err)
 			assert.NotEmpty(t, token)
 
-			ht, u, p, err := token_service.ExtractToken(db.DefaultContext, token)
+			ht, u, p, err := token_service.DecodeToken(t.Context(), token)
+			assert.NoError(t, err)
+			assert.Equal(t, token_service.ReplyHandlerType, ht)
+			assert.Equal(t, user.ID, u.ID)
+			assert.Equal(t, payload, p)
+
+			// MTAs may lowercase the local-part of the reply-to address (RFC 5321 §2.4).
+			ht, u, p, err = token_service.DecodeToken(t.Context(), strings.ToLower(token))
 			assert.NoError(t, err)
 			assert.Equal(t, token_service.ReplyHandlerType, ht)
 			assert.Equal(t, user.ID, u.ID)
@@ -84,8 +93,8 @@ func TestIncomingEmail(t *testing.T) {
 					payload, err := incoming_payload.CreateReferencePayload(issue)
 					assert.NoError(t, err)
 
-					assert.Error(t, handler.Handle(db.DefaultContext, &incoming.MailContent{}, nil, payload))
-					assert.NoError(t, handler.Handle(db.DefaultContext, &incoming.MailContent{}, user, payload))
+					assert.Error(t, handler.Handle(t.Context(), &incoming.MailContent{}, nil, payload))
+					assert.NoError(t, handler.Handle(t.Context(), &incoming.MailContent{}, user, payload))
 
 					content := &incoming.MailContent{
 						Content: "reply by mail",
@@ -97,9 +106,9 @@ func TestIncomingEmail(t *testing.T) {
 						},
 					}
 
-					assert.NoError(t, handler.Handle(db.DefaultContext, content, user, payload))
+					assert.NoError(t, handler.Handle(t.Context(), content, user, payload))
 
-					comments, err := issues_model.FindComments(db.DefaultContext, &issues_model.FindCommentsOptions{
+					comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
 						IssueID: issue.ID,
 						Type:    issues_model.CommentTypeComment,
 					})
@@ -108,7 +117,7 @@ func TestIncomingEmail(t *testing.T) {
 					comment := comments[len(comments)-1]
 					assert.Equal(t, user.ID, comment.PosterID)
 					assert.Equal(t, content.Content, comment.Content)
-					assert.NoError(t, comment.LoadAttachments(db.DefaultContext))
+					assert.NoError(t, comment.LoadAttachments(t.Context()))
 					assert.Len(t, comment.Attachments, 1)
 					attachment := comment.Attachments[0]
 					assert.Equal(t, content.Attachments[0].Name, attachment.Name)
@@ -135,9 +144,9 @@ func TestIncomingEmail(t *testing.T) {
 					payload, err := incoming_payload.CreateReferencePayload(comment)
 					assert.NoError(t, err)
 
-					assert.NoError(t, handler.Handle(db.DefaultContext, content, user, payload))
+					assert.NoError(t, handler.Handle(t.Context(), content, user, payload))
 
-					comments, err := issues_model.FindComments(db.DefaultContext, &issues_model.FindCommentsOptions{
+					comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
 						IssueID: issue.ID,
 						Type:    issues_model.CommentTypeCode,
 					})
@@ -146,7 +155,7 @@ func TestIncomingEmail(t *testing.T) {
 					comment = comments[len(comments)-1]
 					assert.Equal(t, user.ID, comment.PosterID)
 					assert.Equal(t, content.Content, comment.Content)
-					assert.NoError(t, comment.LoadAttachments(db.DefaultContext))
+					assert.NoError(t, comment.LoadAttachments(t.Context()))
 					assert.Len(t, comment.Attachments, 1)
 					attachment := comment.Attachments[0]
 					assert.Equal(t, content.Attachments[0].Name, attachment.Name)
@@ -157,7 +166,7 @@ func TestIncomingEmail(t *testing.T) {
 			t.Run("Unsubscribe", func(t *testing.T) {
 				defer tests.PrintCurrentTest(t)()
 
-				watching, err := issues_model.CheckIssueWatch(db.DefaultContext, user, issue)
+				watching, err := issues_model.CheckIssueWatch(t.Context(), user, issue)
 				assert.NoError(t, err)
 				assert.True(t, watching)
 
@@ -170,9 +179,9 @@ func TestIncomingEmail(t *testing.T) {
 				payload, err := incoming_payload.CreateReferencePayload(issue)
 				assert.NoError(t, err)
 
-				assert.NoError(t, handler.Handle(db.DefaultContext, content, user, payload))
+				assert.NoError(t, handler.Handle(t.Context(), content, user, payload))
 
-				watching, err = issues_model.CheckIssueWatch(db.DefaultContext, user, issue)
+				watching, err = issues_model.CheckIssueWatch(t.Context(), user, issue)
 				assert.NoError(t, err)
 				assert.False(t, watching)
 			})
@@ -189,15 +198,19 @@ func TestIncomingEmail(t *testing.T) {
 				token, err := token_service.CreateToken(token_service.ReplyHandlerType, user, payload)
 				assert.NoError(t, err)
 
-				msg := gomail.NewMessage()
-				msg.SetHeader("To", strings.Replace(setting.IncomingEmail.ReplyToAddress, setting.IncomingEmail.TokenPlaceholder, token, 1))
-				msg.SetHeader("From", user.Email)
-				msg.SetBody("text/plain", token)
-				err = gomail.Send(&smtpTestSender{}, msg)
+				msg := sender_service.NewMessageFrom(
+					strings.Replace(setting.IncomingEmail.ReplyToAddress, setting.IncomingEmailTokenPlaceholder, token, 1),
+					"",
+					user.Email,
+					"",
+					token,
+				)
+
+				err = sender_service.Send(&smtpTestSender{}, msg)
 				assert.NoError(t, err)
 
 				assert.Eventually(t, func() bool {
-					comments, err := issues_model.FindComments(db.DefaultContext, &issues_model.FindCommentsOptions{
+					comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
 						IssueID: issue.ID,
 						Type:    issues_model.CommentTypeComment,
 					})

@@ -4,14 +4,17 @@
 package repository_test
 
 import (
+	"context"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/organization"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	repo_service "code.gitea.io/gitea/services/repository"
+	actions_model "gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	git_model "gitea.dev/models/git"
+	"gitea.dev/models/organization"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	repo_service "gitea.dev/services/repository"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -21,7 +24,7 @@ func TestTeam_HasRepository(t *testing.T) {
 
 	test := func(teamID, repoID int64, expected bool) {
 		team := unittest.AssertExistsAndLoadBean(t, &organization.Team{ID: teamID})
-		assert.Equal(t, expected, repo_service.HasRepository(db.DefaultContext, team, repoID))
+		assert.Equal(t, expected, repo_service.HasRepository(t.Context(), team, repoID))
 	}
 	test(1, 1, false)
 	test(1, 3, true)
@@ -37,7 +40,7 @@ func TestTeam_RemoveRepository(t *testing.T) {
 
 	testSuccess := func(teamID, repoID int64) {
 		team := unittest.AssertExistsAndLoadBean(t, &organization.Team{ID: teamID})
-		assert.NoError(t, repo_service.RemoveRepositoryFromTeam(db.DefaultContext, team, repoID))
+		assert.NoError(t, repo_service.RemoveRepositoryFromTeam(t.Context(), team, repoID))
 		unittest.AssertNotExistsBean(t, &organization.TeamRepo{TeamID: teamID, RepoID: repoID})
 		unittest.CheckConsistencyFor(t, &organization.Team{ID: teamID}, &repo_model.Repository{ID: repoID})
 	}
@@ -49,7 +52,39 @@ func TestTeam_RemoveRepository(t *testing.T) {
 func TestDeleteOwnerRepositoriesDirectly(t *testing.T) {
 	unittest.PrepareTestEnv(t)
 
-	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	t.Run("RejectedInTransaction", func(t *testing.T) {
+		err := db.WithTx(t.Context(), func(ctx context.Context) error {
+			return repo_service.DeleteRepositoryDirectly(ctx, 1)
+		})
+		assert.ErrorContains(t, err, "must not be called within a transaction")
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	})
 
-	assert.NoError(t, repo_service.DeleteOwnerRepositoriesDirectly(db.DefaultContext, user))
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	assert.NoError(t, repo_service.DeleteOwnerRepositoriesDirectly(t.Context(), user))
+}
+
+func TestDeleteRepositoryDirectlyPurgesRepoScopedRows(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+
+	// One row per table that repository deletion used to leave behind (#38494).
+	assert.NoError(t, db.Insert(t.Context(),
+		&actions_model.ActionVariable{RepoID: 1, Name: "to_purge", Data: "value"},
+		&actions_model.ActionRunAttempt{RepoID: 1, RunID: unittest.NonexistentID, Attempt: 1},
+		&actions_model.ActionTasksVersion{RepoID: 1, Version: 1},
+		&git_model.RenamedBranch{RepoID: 1, From: "old-name", To: "new-name"},
+		&git_model.CommitStatusSummary{RepoID: 1, SHA: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", State: "success"},
+		&repo_model.RepoTransfer{RepoID: 1, DoerID: 2, RecipientID: 3},
+	))
+	unittest.AssertExistsAndLoadBean(t, &git_model.CommitStatusIndex{RepoID: 1})
+
+	assert.NoError(t, repo_service.DeleteRepositoryDirectly(t.Context(), 1))
+
+	unittest.AssertNotExistsBean(t, &actions_model.ActionVariable{RepoID: 1})
+	unittest.AssertNotExistsBean(t, &actions_model.ActionRunAttempt{RepoID: 1})
+	unittest.AssertNotExistsBean(t, &actions_model.ActionTasksVersion{RepoID: 1})
+	unittest.AssertNotExistsBean(t, &git_model.RenamedBranch{RepoID: 1})
+	unittest.AssertNotExistsBean(t, &git_model.CommitStatusSummary{RepoID: 1})
+	unittest.AssertNotExistsBean(t, &git_model.CommitStatusIndex{RepoID: 1})
+	unittest.AssertNotExistsBean(t, &repo_model.RepoTransfer{RepoID: 1})
 }

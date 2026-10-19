@@ -7,29 +7,39 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/httplib"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/templates"
-	"code.gitea.io/gitea/modules/web/middleware"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/httplib"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/structs"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web/middleware"
 )
 
 // RedirectToUser redirect to a differently-named user
-func RedirectToUser(ctx *Base, userName string, redirectUserID int64) {
+func RedirectToUser(ctx *Base, doer *user_model.User, userName string, redirectUserID int64) {
 	user, err := user_model.GetUserByID(ctx, redirectUserID)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "unable to get user")
+		if user_model.IsErrUserNotExist(err) {
+			ctx.HTTPError(http.StatusNotFound, "user does not exist")
+		} else {
+			ctx.HTTPError(http.StatusInternalServerError, "unable to get user")
+		}
+		return
+	}
+
+	// Handle Visibility
+	if user.Visibility != structs.VisibleTypePublic && !user_model.DoerCanViewPrivate(doer) {
+		// We must be signed in to see limited or private organizations
+		ctx.HTTPError(http.StatusNotFound, "user does not exist")
 		return
 	}
 
@@ -63,10 +73,10 @@ func (ctx *Context) RedirectToCurrentSite(location ...string) {
 	ctx.Redirect(setting.AppSubURL + "/")
 }
 
-const tplStatus500 base.TplName = "status/500"
+const tplStatus500 templates.TplName = "status/500"
 
 // HTML calls Context.HTML and renders the template to HTTP response
-func (ctx *Context) HTML(status int, name base.TplName) {
+func (ctx *Context) HTML(status int, name templates.TplName) {
 	log.Debug("Template: %s", name)
 
 	tmplStartTime := time.Now()
@@ -77,8 +87,8 @@ func (ctx *Context) HTML(status int, name base.TplName) {
 		return strconv.FormatInt(time.Since(tmplStartTime).Nanoseconds()/1e6, 10) + "ms"
 	}
 
-	err := ctx.Render.HTML(ctx.Resp, status, string(name), ctx.Data, ctx.TemplateContext)
-	if err == nil || errors.Is(err, syscall.EPIPE) {
+	err := ctx.Render.HTML(ctx.Resp, status, name, ctx.Data, ctx.TemplateContext)
+	if err == nil || httplib.IsClientOrNetworkError(ctx, err) {
 		return
 	}
 
@@ -92,29 +102,19 @@ func (ctx *Context) HTML(status int, name base.TplName) {
 	}
 }
 
-// JSONTemplate renders the template as JSON response
-// keep in mind that the template is processed in HTML context, so JSON-things should be handled carefully, eg: by JSEscape
-func (ctx *Context) JSONTemplate(tmpl base.TplName) {
-	t, err := ctx.Render.TemplateLookup(string(tmpl), nil)
-	if err != nil {
-		ctx.ServerError("unable to find template", err)
-		return
-	}
-	ctx.Resp.Header().Set("Content-Type", "application/json")
-	if err = t.Execute(ctx.Resp, ctx.Data); err != nil {
-		ctx.ServerError("unable to execute template", err)
-	}
-}
-
 // RenderToHTML renders the template content to a HTML string
-func (ctx *Context) RenderToHTML(name base.TplName, data map[string]any) (template.HTML, error) {
+func (ctx *Context) RenderToHTML(name templates.TplName, data any) (template.HTML, error) {
 	var buf strings.Builder
-	err := ctx.Render.HTML(&buf, 0, string(name), data, ctx.TemplateContext)
+	err := ctx.Render.HTML(&buf, 0, name, data, ctx.TemplateContext)
 	return template.HTML(buf.String()), err
 }
 
-// RenderWithErr used for page has form validation but need to prompt error to users.
-func (ctx *Context) RenderWithErr(msg any, tpl base.TplName, form any) {
+// RenderWithErrDeprecated render the page with form validation when it needs to prompt error to users.
+// Deprecated: use "form-fetch-action" and JSON response instead.
+// WARNING: in many cases, this function is not able to render the page or recover the form fields correctly.
+// And it is very difficult to test the page rendered by this function.
+// DO NOT USE IT ANYMORE.
+func (ctx *Context) RenderWithErrDeprecated(msg any, tpl templates.TplName, form any) {
 	if form != nil {
 		middleware.AssignForm(form, ctx.Data)
 	}
@@ -123,16 +123,14 @@ func (ctx *Context) RenderWithErr(msg any, tpl base.TplName, form any) {
 }
 
 // NotFound displays a 404 (Not Found) page and prints the given error, if any.
-func (ctx *Context) NotFound(logMsg string, logErr error) {
-	ctx.notFoundInternal(logMsg, logErr)
+func (ctx *Context) NotFound(logErr error) {
+	ctx.notFoundInternal(1, "", logErr)
 }
 
-func (ctx *Context) notFoundInternal(logMsg string, logErr error) {
+func (ctx *Context) notFoundInternal(skip int, logMsg string, logErr error) {
+	// TODO: it's safe to show the error message to end users if the error is fully controlled by our error system
 	if logErr != nil {
-		log.Log(2, log.DEBUG, "%s: %v", logMsg, logErr)
-		if !setting.IsProd {
-			ctx.Data["ErrorMsg"] = logErr
-		}
+		log.Log(skip+1, log.DEBUG, "%s: %v", logMsg, logErr)
 	}
 
 	// response simple message if Accept isn't text/html
@@ -151,41 +149,44 @@ func (ctx *Context) notFoundInternal(logMsg string, logErr error) {
 
 	ctx.Data["IsRepo"] = ctx.Repo.Repository != nil
 	ctx.Data["Title"] = "Page Not Found"
-	ctx.HTML(http.StatusNotFound, base.TplName("status/404"))
+	ctx.Data["ErrorMsg"] = "" // FIXME: the template never renders this message, need to fix in the future (and show safe messages to end users)
+	ctx.HTML(http.StatusNotFound, "status/404")
+}
+
+func (ctx *Context) buildUserErrorMessage(msg string, err error) (userErrorMsg string) {
+	// it's safe to show internal error to admin users, and it helps
+	if !setting.IsProd || setting.IsInTesting || (ctx.Doer != nil && ctx.Doer.IsAdmin) {
+		userErrorMsg = msg
+		if err != nil {
+			userErrorMsg += ", error: " + err.Error()
+		}
+	}
+	return util.IfZero(userErrorMsg, ctx.Locale.TrString("error.occurred"))
 }
 
 // ServerError displays a 500 (Internal Server Error) page and prints the given error, if any.
+// If the error is controlled by our error system, a related 404 page can be displayed instead.
 func (ctx *Context) ServerError(logMsg string, logErr error) {
-	ctx.serverErrorInternal(logMsg, logErr)
+	if errors.Is(logErr, util.ErrNotExist) {
+		ctx.notFoundInternal(1, logMsg, logErr)
+		return
+	}
+	ctx.serverErrorInternal(1, logMsg, logErr)
 }
 
-func (ctx *Context) serverErrorInternal(logMsg string, logErr error) {
+func (ctx *Context) serverErrorInternal(skip int, logMsg string, logErr error) {
 	if logErr != nil {
-		log.ErrorWithSkip(2, "%s: %v", logMsg, logErr)
-		if _, ok := logErr.(*net.OpError); ok || errors.Is(logErr, &net.OpError{}) {
-			// This is an error within the underlying connection
-			// and further rendering will not work so just return
-			return
-		}
+		logLevel := util.Iif(httplib.IsClientOrNetworkError(ctx, logErr), log.DEBUG, log.ERROR)
+		log.Log(skip+1, logLevel, "%s: %v", logMsg, logErr)
+	}
 
-		// it's safe to show internal error to admin users, and it helps
-		if !setting.IsProd || (ctx.Doer != nil && ctx.Doer.IsAdmin) {
-			ctx.Data["ErrorMsg"] = fmt.Sprintf("%s, %s", logMsg, logErr)
-		}
+	userErrorMsg := ctx.buildUserErrorMessage(logMsg, logErr)
+	if httplib.IsGiteaFetchActionRequest(ctx.Req) {
+		ctx.JSON(http.StatusInternalServerError, buildJsonErrorMap(userErrorMsg))
+		return
 	}
 
 	ctx.Data["Title"] = "Internal Server Error"
+	ctx.Data["ErrorMsg"] = userErrorMsg
 	ctx.HTML(http.StatusInternalServerError, tplStatus500)
-}
-
-// NotFoundOrServerError use error check function to determine if the error
-// is about not found. It responds with 404 status code for not found error,
-// or error context description for logging purpose of 500 server error.
-// TODO: remove the "errCheck" and use util.ErrNotFound to check
-func (ctx *Context) NotFoundOrServerError(logMsg string, errCheck func(error) bool, logErr error) {
-	if errCheck(logErr) {
-		ctx.notFoundInternal(logMsg, logErr)
-		return
-	}
-	ctx.serverErrorInternal(logMsg, logErr)
 }

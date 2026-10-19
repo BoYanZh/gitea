@@ -5,21 +5,27 @@ package webhook
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
-	webhook_model "code.gitea.io/gitea/models/webhook"
-	"code.gitea.io/gitea/modules/git"
-	api "code.gitea.io/gitea/modules/structs"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
+	webhook_model "gitea.dev/models/webhook"
+	"gitea.dev/modules/git"
+	api "gitea.dev/modules/structs"
+	webhook_module "gitea.dev/modules/webhook"
 )
 
 type (
-	// FeishuPayload represents
+	// FeishuPayload represents the payload for Feishu webhook
 	FeishuPayload struct {
-		MsgType string `json:"msg_type"` // text / post / image / share_chat / interactive / file /audio / media
-		Content struct {
+		Timestamp int64  `json:"timestamp,omitempty"` // Unix timestamp for signature verification
+		Sign      string `json:"sign,omitempty"`      // Signature for verification
+		MsgType   string `json:"msg_type"`            // text / post / image / share_chat / interactive / file /audio / media
+		Content   struct {
 			Text string `json:"text"`
 		} `json:"content"`
 	}
@@ -70,22 +76,23 @@ func (fc feishuConvertor) Push(p *api.PushPayload) (FeishuPayload, error) {
 		commitDesc string
 	)
 
-	text := fmt.Sprintf("[%s:%s] %s\r\n", p.Repo.FullName, branchName, commitDesc)
+	var text strings.Builder
+	fmt.Fprintf(&text, "[%s:%s] %s\r\n", p.Repo.FullName, branchName, commitDesc)
 	// for each commit, generate attachment text
 	for i, commit := range p.Commits {
 		var authorName string
 		if commit.Author != nil {
 			authorName = " - " + commit.Author.Name
 		}
-		text += fmt.Sprintf("[%s](%s) %s", commit.ID[:7], commit.URL,
-			strings.TrimRight(commit.Message, "\r\n")) + authorName
+		text.WriteString(fmt.Sprintf("[%s](%s) %s", commit.ID[:7], commit.URL,
+			strings.TrimRight(commit.Message, "\r\n")) + authorName)
 		// add linebreak to each commit but the last
 		if i < len(p.Commits)-1 {
-			text += "\r\n"
+			text.WriteString("\r\n")
 		}
 	}
 
-	return newFeishuTextPayload(text), nil
+	return newFeishuTextPayload(text.String()), nil
 }
 
 // Issue implements PayloadConvertor Issue method
@@ -141,6 +148,9 @@ func (fc feishuConvertor) Repository(p *api.RepositoryPayload) (FeishuPayload, e
 	case api.HookRepoDeleted:
 		text = fmt.Sprintf("[%s] Repository deleted", p.Repository.FullName)
 		return newFeishuTextPayload(text), nil
+	case api.HookRepoRenamed:
+		text = fmt.Sprintf("[%s] Repository renamed from %s", p.Repository.FullName, getRepoRenamedFrom(p))
+		return newFeishuTextPayload(text), nil
 	}
 
 	return FeishuPayload{}, nil
@@ -166,7 +176,49 @@ func (fc feishuConvertor) Package(p *api.PackagePayload) (FeishuPayload, error) 
 	return newFeishuTextPayload(text), nil
 }
 
+func (fc feishuConvertor) Status(p *api.CommitStatusPayload) (FeishuPayload, error) {
+	text, _ := getStatusPayloadInfo(p, noneLinkFormatter, true)
+
+	return newFeishuTextPayload(text), nil
+}
+
+func (feishuConvertor) WorkflowRun(p *api.WorkflowRunPayload) (FeishuPayload, error) {
+	text, _ := getWorkflowRunPayloadInfo(p, noneLinkFormatter, true)
+
+	return newFeishuTextPayload(text), nil
+}
+
+func (feishuConvertor) WorkflowJob(p *api.WorkflowJobPayload) (FeishuPayload, error) {
+	text, _ := getWorkflowJobPayloadInfo(p, noneLinkFormatter, true)
+
+	return newFeishuTextPayload(text), nil
+}
+
+// feishuGenSign generates a signature for Feishu webhook
+// https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot
+func feishuGenSign(secret string, timestamp int64) string {
+	// key="{timestamp}\n{secret}", then hmac-sha256, then base64 encode
+	stringToSign := fmt.Sprintf("%d\n%s", timestamp, secret)
+	h := hmac.New(sha256.New, []byte(stringToSign))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
 func newFeishuRequest(_ context.Context, w *webhook_model.Webhook, t *webhook_model.HookTask) (*http.Request, []byte, error) {
-	var pc payloadConvertor[FeishuPayload] = feishuConvertor{}
-	return newJSONRequest(pc, w, t, true)
+	payload, err := newPayload(feishuConvertor{}, []byte(t.PayloadContent), t.EventType)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Add timestamp and signature if secret is provided
+	if w.Secret != "" {
+		timestamp := time.Now().Unix()
+		payload.Timestamp = timestamp
+		payload.Sign = feishuGenSign(w.Secret, timestamp)
+	}
+
+	return prepareJSONRequest(payload, w, t, false /* no default headers */)
+}
+
+func init() {
+	RegisterWebhookRequester(webhook_module.FEISHU, newFeishuRequest)
 }

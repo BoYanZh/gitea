@@ -7,16 +7,15 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 
-	webhook_model "code.gitea.io/gitea/models/webhook"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
+	webhook_model "gitea.dev/models/webhook"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/json"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	webhook_module "gitea.dev/modules/webhook"
 )
 
 // SlackMeta contains the slack metadata
@@ -84,9 +83,9 @@ func SlackLinkFormatter(url, text string) string {
 // SlackLinkToRef slack-formatter link to a repo ref
 func SlackLinkToRef(repoURL, ref string) string {
 	// FIXME: SHA1 hardcoded here
-	url := git.RefURL(repoURL, ref)
-	refName := git.RefName(ref).ShortName()
-	return SlackLinkFormatter(url, refName)
+	refName := git.RefName(ref)
+	url := repoURL + "/src/" + refName.RefWebLinkPath()
+	return SlackLinkFormatter(url, refName.ShortName())
 }
 
 // Create implements payloadConvertor Create method
@@ -167,6 +166,24 @@ func (s slackConvertor) Package(p *api.PackagePayload) (SlackPayload, error) {
 	return s.createPayload(text, nil), nil
 }
 
+func (s slackConvertor) Status(p *api.CommitStatusPayload) (SlackPayload, error) {
+	text, _ := getStatusPayloadInfo(p, SlackLinkFormatter, true)
+
+	return s.createPayload(text, nil), nil
+}
+
+func (s slackConvertor) WorkflowRun(p *api.WorkflowRunPayload) (SlackPayload, error) {
+	text, _ := getWorkflowRunPayloadInfo(p, SlackLinkFormatter, true)
+
+	return s.createPayload(text, nil), nil
+}
+
+func (s slackConvertor) WorkflowJob(p *api.WorkflowJobPayload) (SlackPayload, error) {
+	text, _ := getWorkflowJobPayloadInfo(p, SlackLinkFormatter, true)
+
+	return s.createPayload(text, nil), nil
+}
+
 // Push implements payloadConvertor Push method
 func (s slackConvertor) Push(p *api.PushPayload) (SlackPayload, error) {
 	// n new commits
@@ -190,13 +207,13 @@ func (s slackConvertor) Push(p *api.PushPayload) (SlackPayload, error) {
 	branchLink := SlackLinkToRef(p.Repo.HTMLURL, p.Ref)
 	text := fmt.Sprintf("[%s:%s] %s pushed by %s", repoLink, branchLink, commitString, p.Pusher.UserName)
 
-	var attachmentText string
+	var attachmentText strings.Builder
 	// for each commit, generate attachment text
 	for i, commit := range p.Commits {
-		attachmentText += fmt.Sprintf("%s: %s - %s", SlackLinkFormatter(commit.URL, commit.ID[:7]), SlackShortTextFormatter(commit.Message), SlackTextFormatter(commit.Author.Name))
+		fmt.Fprintf(&attachmentText, "%s: %s - %s", SlackLinkFormatter(commit.URL, commit.ID[:7]), SlackShortTextFormatter(commit.Message), SlackTextFormatter(commit.Author.Name))
 		// add linebreak to each commit but the last
 		if i < len(p.Commits)-1 {
-			attachmentText += "\n"
+			attachmentText.WriteString("\n")
 		}
 	}
 
@@ -204,7 +221,7 @@ func (s slackConvertor) Push(p *api.PushPayload) (SlackPayload, error) {
 		Color:     s.Color,
 		Title:     p.Repo.HTMLURL,
 		TitleLink: p.Repo.HTMLURL,
-		Text:      attachmentText,
+		Text:      attachmentText.String(),
 	}}), nil
 }
 
@@ -259,6 +276,8 @@ func (s slackConvertor) Repository(p *api.RepositoryPayload) (SlackPayload, erro
 		text = fmt.Sprintf("[%s] Repository created by %s", repoLink, senderLink)
 	case api.HookRepoDeleted:
 		text = fmt.Sprintf("[%s] Repository deleted by %s", repoLink, senderLink)
+	case api.HookRepoRenamed:
+		text = fmt.Sprintf("[%s] Repository renamed from %s by %s", repoLink, getRepoRenamedFrom(p), senderLink)
 	}
 
 	return s.createPayload(text, nil), nil
@@ -295,12 +314,14 @@ func newSlackRequest(_ context.Context, w *webhook_model.Webhook, t *webhook_mod
 	return newJSONRequest(pc, w, t, true)
 }
 
-var slackChannel = regexp.MustCompile(`^#?[a-z0-9_-]{1,80}$`)
+func init() {
+	RegisterWebhookRequester(webhook_module.SLACK, newSlackRequest)
+}
 
-// IsValidSlackChannel validates a channel name conforms to what slack expects:
-// https://api.slack.com/methods/conversations.rename#naming
-// Conversation names can only contain lowercase letters, numbers, hyphens, and underscores, and must be 80 characters or less.
-// Gitea accepts if it starts with a #.
 func IsValidSlackChannel(name string) bool {
-	return slackChannel.MatchString(name)
+	// Some documents: https://api.slack.com/methods/conversations.rename#naming
+	// 1. Internal channel name should "only contain lowercase letters, numbers, hyphens, and underscores, and must be 80 characters or less"
+	// 2. Slack would also "modify it to meet the above criteria"
+	// Since we know nothing about the details, don't do any validation here.
+	return name != ""
 }

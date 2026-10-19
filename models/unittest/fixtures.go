@@ -1,97 +1,38 @@
 // Copyright 2021 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-//nolint:forbidigo
 package unittest
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"time"
+	"strings"
+	"unicode"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/auth/password/hash"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/auth/password/hash"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 
-	"github.com/go-testfixtures/testfixtures/v3"
 	"xorm.io/xorm"
+	"xorm.io/xorm/contexts"
 	"xorm.io/xorm/schemas"
 )
 
-var fixturesLoader *testfixtures.Loader
+type FixturesLoader interface {
+	Load() error
+	MarkTableChanged(tableName string)
+}
+
+var fixturesLoader FixturesLoader
 
 // GetXORMEngine gets the XORM engine
-func GetXORMEngine(engine ...*xorm.Engine) (x *xorm.Engine) {
-	if len(engine) == 1 {
-		return engine[0]
-	}
-	return db.GetEngine(db.DefaultContext).(*xorm.Engine)
+func GetXORMEngine() (x *xorm.Engine) {
+	return db.GetXORMEngineForTesting()
 }
 
-// InitFixtures initialize test fixtures for a test database
-func InitFixtures(opts FixturesOptions, engine ...*xorm.Engine) (err error) {
-	e := GetXORMEngine(engine...)
-	var fixtureOptionFiles func(*testfixtures.Loader) error
-	if opts.Dir != "" {
-		fixtureOptionFiles = testfixtures.Directory(opts.Dir)
-	} else {
-		fixtureOptionFiles = testfixtures.Files(opts.Files...)
-	}
-	dialect := "unknown"
-	switch e.Dialect().URI().DBType {
-	case schemas.POSTGRES:
-		dialect = "postgres"
-	case schemas.MYSQL:
-		dialect = "mysql"
-	case schemas.MSSQL:
-		dialect = "mssql"
-	case schemas.SQLITE:
-		dialect = "sqlite3"
-	default:
-		fmt.Println("Unsupported RDBMS for integration tests")
-		os.Exit(1)
-	}
-	loaderOptions := []func(loader *testfixtures.Loader) error{
-		testfixtures.Database(e.DB().DB),
-		testfixtures.Dialect(dialect),
-		testfixtures.DangerousSkipTestDatabaseCheck(),
-		fixtureOptionFiles,
-	}
-
-	if e.Dialect().URI().DBType == schemas.POSTGRES {
-		loaderOptions = append(loaderOptions, testfixtures.SkipResetSequences())
-	}
-
-	fixturesLoader, err = testfixtures.New(loaderOptions...)
-	if err != nil {
-		return err
-	}
-
-	// register the dummy hash algorithm function used in the test fixtures
-	_ = hash.Register("dummy", hash.NewDummyHasher)
-
-	setting.PasswordHashAlgo, _ = hash.SetDefaultPasswordHashAlgorithm("dummy")
-
-	return err
-}
-
-// LoadFixtures load fixtures for a test database
-func LoadFixtures(engine ...*xorm.Engine) error {
-	e := GetXORMEngine(engine...)
-	var err error
-	// (doubt) database transaction conflicts could occur and result in ROLLBACK? just try for a few times.
-	for i := 0; i < 5; i++ {
-		if err = fixturesLoader.Load(); err == nil {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err != nil {
-		fmt.Printf("LoadFixtures failed after retries: %v\n", err)
-	}
-	// Now if we're running postgres we need to tell it to update the sequences
-	if e.Dialect().URI().DBType == schemas.POSTGRES {
-		results, err := e.QueryString(`SELECT 'SELECT SETVAL(' ||
+func loadFixtureResetSeqPgsql(e *xorm.Engine) error {
+	results, err := e.QueryString(`SELECT 'SELECT SETVAL(' ||
 		quote_literal(quote_ident(PGT.schemaname) || '.' || quote_ident(S.relname)) ||
 		', COALESCE(MAX(' ||quote_ident(C.attname)|| '), 1) ) FROM ' ||
 		quote_ident(PGT.schemaname)|| '.'||quote_ident(T.relname)|| ';'
@@ -107,22 +48,131 @@ func LoadFixtures(engine ...*xorm.Engine) error {
 	     AND D.refobjsubid = C.attnum
 	     AND T.relname = PGT.tablename
 	 ORDER BY S.relname;`)
-		if err != nil {
-			fmt.Printf("Failed to generate sequence update: %v\n", err)
-			return err
-		}
-		for _, r := range results {
-			for _, value := range r {
-				_, err = e.Exec(value)
-				if err != nil {
-					fmt.Printf("Failed to update sequence: %s Error: %v\n", value, err)
-					return err
-				}
-			}
+	if err != nil {
+		return fmt.Errorf("failed to generate sequence update: %w", err)
+	}
+	var statements []string
+	for _, result := range results {
+		for _, statement := range result {
+			statements = append(statements, statement)
 		}
 	}
+	if len(statements) > 0 {
+		if _, err := e.Exec(strings.Join(statements, "\n")); err != nil {
+			return fmt.Errorf("loadFixtureResetSeqPgsql: %w", err)
+		}
+	}
+	return nil
+}
+
+type fixturesHookStruct struct{}
+
+func cutSpaceForSQL(s string) (string, string, bool) {
+	s = strings.TrimSpace(s)
+	pos := strings.IndexFunc(s, unicode.IsSpace)
+	if pos == -1 {
+		return s, "", false
+	}
+	return s[:pos], strings.TrimSpace(s[pos+1:]), true
+}
+
+func trimTableNameQuotes(s string) string {
+	pos := strings.IndexByte(s, '.')
+	if pos != -1 {
+		s = s[pos+1:]
+	}
+	return strings.Trim(s, "\"`[]")
+}
+
+func (f fixturesHookStruct) BeforeProcess(c *contexts.ContextHook) (context.Context, error) {
+	if c.Ctx.Value(db.ContextKeyTestFixtures) != nil {
+		return c.Ctx, nil
+	}
+	ctx, sql := c.Ctx, c.SQL
+	cmdPart, cmdRemaining, ok := cutSpaceForSQL(sql)
+	if !ok {
+		return ctx, nil
+	}
+
+	// ignore the SQLs which don't change data
+	if util.AsciiEqualFold(cmdPart, "SELECT") ||
+		util.AsciiEqualFold(cmdPart, "SHOW") ||
+		util.AsciiEqualFold(cmdPart, "PRAGMA") ||
+		util.AsciiEqualFold(cmdPart, "ALTER") ||
+		util.AsciiEqualFold(cmdPart, "CREATE") ||
+		util.AsciiEqualFold(cmdPart, "DROP") ||
+		util.AsciiEqualFold(cmdPart, "IF") ||
+		util.AsciiEqualFold(cmdPart, "SET") ||
+		util.AsciiEqualFold(cmdPart, "sp_rename") ||
+		util.AsciiEqualFold(cmdPart, "BEGIN") ||
+		util.AsciiEqualFold(cmdPart, "ROLLBACK") ||
+		util.AsciiEqualFold(cmdPart, "COMMIT") {
+		return ctx, nil
+	}
+
+	switch {
+	case util.AsciiEqualFold(cmdPart, "INSERT"):
+		cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		if util.AsciiEqualFold(cmdPart, "INTO") {
+			cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		}
+		fixturesLoader.MarkTableChanged(trimTableNameQuotes(cmdPart))
+	case util.AsciiEqualFold(cmdPart, "MERGE"):
+		cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		if util.AsciiEqualFold(cmdPart, "INTO") {
+			cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		}
+		fixturesLoader.MarkTableChanged(trimTableNameQuotes(cmdPart))
+	case util.AsciiEqualFold(cmdPart, "UPDATE"):
+		cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		fixturesLoader.MarkTableChanged(trimTableNameQuotes(cmdPart))
+	case util.AsciiEqualFold(cmdPart, "DELETE"):
+		cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		if util.AsciiEqualFold(cmdPart, "FROM") {
+			cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		}
+		fixturesLoader.MarkTableChanged(trimTableNameQuotes(cmdPart))
+	case util.AsciiEqualFold(cmdPart, "TRUNCATE"):
+		cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		if util.AsciiEqualFold(cmdPart, "TABLE") {
+			cmdPart, cmdRemaining, _ = cutSpaceForSQL(cmdRemaining)
+		}
+		fixturesLoader.MarkTableChanged(trimTableNameQuotes(cmdPart))
+	default:
+		// should either parse the table name if it changes data, or ignore it
+		panic("unrecognized sql: " + sql)
+	}
+	_ = cmdRemaining
+	return ctx, nil
+}
+
+func (f fixturesHookStruct) AfterProcess(c *contexts.ContextHook) error {
+	return nil
+}
+
+// InitFixtures initialize test fixtures for a test database
+func InitFixtures(opts FixturesOptions) (err error) {
+	xormEngine := GetXORMEngine()
+	fixturesLoader, err = NewFixturesLoader(xormEngine, opts)
+	// fixturesLoader = NewFixturesLoaderVendor(xormEngine, opts)
+
+	// register the dummy hash algorithm function used in the test fixtures
 	_ = hash.Register("dummy", hash.NewDummyHasher)
 	setting.PasswordHashAlgo, _ = hash.SetDefaultPasswordHashAlgorithm("dummy")
-
+	xormEngine.AddHook(&fixturesHookStruct{})
 	return err
+}
+
+// LoadFixtures load fixtures for a test database
+func LoadFixtures() error {
+	if err := fixturesLoader.Load(); err != nil {
+		return err
+	}
+	// Now if we're running postgres we need to tell it to update the sequences
+	if GetXORMEngine().Dialect().URI().DBType == schemas.POSTGRES {
+		if err := loadFixtureResetSeqPgsql(GetXORMEngine()); err != nil {
+			return err
+		}
+	}
+	return nil
 }

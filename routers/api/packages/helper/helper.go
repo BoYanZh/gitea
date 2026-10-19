@@ -4,44 +4,52 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 
-	packages_model "code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/services/context"
+	packages_model "gitea.dev/models/packages"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	"gitea.dev/services/context"
 )
 
-// LogAndProcessError logs an error and calls a custom callback with the processed error message.
-// If the error is an InternalServerError the message is stripped if the user is not an admin.
-func LogAndProcessError(ctx *context.Context, status int, obj any, cb func(string)) {
-	var message string
-	if err, ok := obj.(error); ok {
-		message = err.Error()
-	} else if obj != nil {
-		message = fmt.Sprintf("%s", obj)
+// PackageErrorStatus returns the status to report for a package lookup error
+func PackageErrorStatus(err error) int {
+	if errors.Is(err, util.ErrNotExist) {
+		return http.StatusNotFound
 	}
-	if status == http.StatusInternalServerError {
-		log.ErrorWithSkip(1, message)
-
-		if setting.IsProd && (ctx.Doer == nil || !ctx.Doer.IsAdmin) {
-			message = ""
-		}
-	} else {
-		log.Debug(message)
-	}
-
-	if cb != nil {
-		cb(message)
-	}
+	return http.StatusInternalServerError
 }
 
-// Serves the content of the package file
+// ProcessErrorForUser logs the error and returns a user-error message for the end user.
+// If the status is http.StatusInternalServerError, the message is stripped for non-admin users in production.
+func ProcessErrorForUser(ctx *context.Context, status int, errObj any) string {
+	var message string
+	if err, ok := errObj.(error); ok {
+		message = err.Error()
+	} else if errObj != nil {
+		message = fmt.Sprint(errObj)
+	}
+
+	if status == http.StatusInternalServerError {
+		log.Log(2, log.ERROR, "Package registry API internal error: %d %s", status, message)
+		if setting.IsProd && (ctx.Doer == nil || !ctx.Doer.IsAdmin) {
+			message = "internal server error"
+		}
+		return message
+	}
+
+	log.Log(2, log.DEBUG, "Package registry API user error: %d %s", status, message)
+	return message
+}
+
+// ServePackageFile the content of the package file
 // If the url is set it will redirect the request, otherwise the content is copied to the response.
-func ServePackageFile(ctx *context.Context, s io.ReadSeekCloser, u *url.URL, pf *packages_model.PackageFile, forceOpts ...*context.ServeHeaderOptions) {
+func ServePackageFile(ctx *context.Context, s io.ReadSeekCloser, u *url.URL, pf *packages_model.PackageFile, forceOpts ...context.ServeHeaderOptions) {
 	if u != nil {
 		ctx.Redirect(u.String())
 		return
@@ -49,11 +57,11 @@ func ServePackageFile(ctx *context.Context, s io.ReadSeekCloser, u *url.URL, pf 
 
 	defer s.Close()
 
-	var opts *context.ServeHeaderOptions
+	var opts context.ServeHeaderOptions
 	if len(forceOpts) > 0 {
 		opts = forceOpts[0]
 	} else {
-		opts = &context.ServeHeaderOptions{
+		opts = context.ServeHeaderOptions{
 			Filename:     pf.Name,
 			LastModified: pf.CreatedUnix.AsLocalTime(),
 		}

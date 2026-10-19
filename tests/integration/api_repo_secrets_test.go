@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/tests"
+	auth_model "gitea.dev/models/auth"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 )
 
 func TestAPIRepoSecrets(t *testing.T) {
@@ -73,6 +73,33 @@ func TestAPIRepoSecrets(t *testing.T) {
 		}
 	})
 
+	t.Run("CreateWithDescription", func(t *testing.T) {
+		cases := []struct {
+			Name           string
+			Description    string
+			ExpectedStatus int
+		}{
+			{
+				Name:           "no_description",
+				Description:    "",
+				ExpectedStatus: http.StatusCreated,
+			},
+			{
+				Name:           "description",
+				Description:    "some description",
+				ExpectedStatus: http.StatusCreated,
+			},
+		}
+
+		for _, c := range cases {
+			req := NewRequestWithJSON(t, "PUT", fmt.Sprintf("/api/v1/repos/%s/actions/secrets/%s", repo.FullName(), c.Name), api.CreateOrUpdateSecretOption{
+				Data:        "data",
+				Description: c.Description,
+			}).AddTokenAuth(token)
+			MakeRequest(t, req, c.ExpectedStatus)
+		}
+	})
+
 	t.Run("Update", func(t *testing.T) {
 		name := "update_secret"
 		url := fmt.Sprintf("/api/v1/repos/%s/actions/secrets/%s", repo.FullName(), name)
@@ -104,9 +131,5 @@ func TestAPIRepoSecrets(t *testing.T) {
 		req = NewRequest(t, "DELETE", url).
 			AddTokenAuth(token)
 		MakeRequest(t, req, http.StatusNotFound)
-
-		req = NewRequest(t, "DELETE", fmt.Sprintf("/api/v1/repos/%s/actions/secrets/000", repo.FullName())).
-			AddTokenAuth(token)
-		MakeRequest(t, req, http.StatusBadRequest)
 	})
 }

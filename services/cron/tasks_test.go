@@ -12,8 +12,12 @@ import (
 )
 
 func TestAddTaskToScheduler(t *testing.T) {
-	assert.Len(t, scheduler.Jobs(), 0)
-	defer scheduler.Clear()
+	assert.Empty(t, scheduler.Jobs())
+	defer func() {
+		for _, j := range scheduler.Jobs() {
+			_ = scheduler.RemoveJob(j.ID())
+		}
+	}()
 
 	// no seconds
 	err := addTaskToScheduler(&Task{

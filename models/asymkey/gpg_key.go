@@ -5,16 +5,17 @@ package asymkey
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/timeutil"
+	"gitea.dev/models/db"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/timeutil"
 
-	"github.com/keybase/go-crypto/openpgp"
-	"github.com/keybase/go-crypto/openpgp/packet"
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"xorm.io/builder"
 )
 
@@ -74,6 +75,10 @@ type FindGPGKeyOptions struct {
 	IncludeSubKeys bool
 }
 
+func (opts FindGPGKeyOptions) ToOrders() string {
+	return "id"
+}
+
 func (opts FindGPGKeyOptions) ToConds() builder.Cond {
 	cond := builder.NewCond()
 	if !opts.IncludeSubKeys {
@@ -106,7 +111,7 @@ func GPGKeyToEntity(ctx context.Context, k *GPGKey) (*openpgp.Entity, error) {
 	if err != nil {
 		return nil, err
 	}
-	keys, err := checkArmoredGPGKeyString(impKey.Content)
+	keys, err := CheckArmoredGPGKeyString(impKey.Content)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +120,7 @@ func GPGKeyToEntity(ctx context.Context, k *GPGKey) (*openpgp.Entity, error) {
 
 // parseSubGPGKey parse a sub Key
 func parseSubGPGKey(ownerID int64, primaryID string, pubkey *packet.PublicKey, expiry time.Time) (*GPGKey, error) {
-	content, err := base64EncPubKey(pubkey)
+	content, err := Base64EncPubKey(pubkey)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +146,11 @@ func parseGPGKey(ctx context.Context, ownerID int64, e *openpgp.Entity, verified
 	// Parse Subkeys
 	subkeys := make([]*GPGKey, len(e.Subkeys))
 	for i, k := range e.Subkeys {
-		subs, err := parseSubGPGKey(ownerID, pubkey.KeyIdString(), k.PublicKey, expiry)
+		subkeyExpiry := expiry
+		if k.Sig.KeyLifetimeSecs != nil {
+			subkeyExpiry = k.PublicKey.CreationTime.Add(time.Duration(*k.Sig.KeyLifetimeSecs) * time.Second)
+		}
+		subs, err := parseSubGPGKey(ownerID, pubkey.KeyIdString(), k.PublicKey, subkeyExpiry)
 		if err != nil {
 			return nil, ErrGPGKeyParsing{ParseError: err}
 		}
@@ -156,7 +165,7 @@ func parseGPGKey(ctx context.Context, ownerID int64, e *openpgp.Entity, verified
 
 	emails := make([]*user_model.EmailAddress, 0, len(e.Identities))
 	for _, ident := range e.Identities {
-		if ident.Revocation != nil {
+		if ident.Revoked(time.Now()) {
 			continue
 		}
 		email := strings.ToLower(strings.TrimSpace(ident.UserId.Email))
@@ -179,7 +188,7 @@ func parseGPGKey(ctx context.Context, ownerID int64, e *openpgp.Entity, verified
 		}
 	}
 
-	content, err := base64EncPubKey(pubkey)
+	content, err := Base64EncPubKey(pubkey)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +212,7 @@ func parseGPGKey(ctx context.Context, ownerID int64, e *openpgp.Entity, verified
 // deleteGPGKey does the actual key deletion
 func deleteGPGKey(ctx context.Context, keyID string) (int64, error) {
 	if keyID == "" {
-		return 0, fmt.Errorf("empty KeyId forbidden") // Should never happen but just to be sure
+		return 0, errors.New("empty KeyId forbidden") // Should never happen but just to be sure
 	}
 	// Delete imported key
 	n, err := db.GetEngine(ctx).Where("key_id=?", keyID).Delete(new(GPGKeyImport))
@@ -223,45 +232,15 @@ func DeleteGPGKey(ctx context.Context, doer *user_model.User, id int64) (err err
 		return fmt.Errorf("GetPublicKeyByID: %w", err)
 	}
 
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		_, err = deleteGPGKey(ctx, key.KeyID)
 		return err
-	}
-	defer committer.Close()
-
-	if _, err = deleteGPGKey(ctx, key.KeyID); err != nil {
-		return err
-	}
-
-	return committer.Commit()
+	})
 }
 
-func checkKeyEmails(ctx context.Context, email string, keys ...*GPGKey) (bool, string) {
-	uid := int64(0)
-	var userEmails []*user_model.EmailAddress
-	var user *user_model.User
-	for _, key := range keys {
-		for _, e := range key.Emails {
-			if e.IsActivated && (email == "" || strings.EqualFold(e.Email, email)) {
-				return true, e.Email
-			}
-		}
-		if key.Verified && key.OwnerID != 0 {
-			if uid != key.OwnerID {
-				userEmails, _ = user_model.GetEmailAddresses(ctx, key.OwnerID)
-				uid = key.OwnerID
-				user = &user_model.User{ID: uid}
-				_, _ = user_model.GetUser(ctx, user)
-			}
-			for _, e := range userEmails {
-				if e.IsActivated && (email == "" || strings.EqualFold(e.Email, email)) {
-					return true, e.Email
-				}
-			}
-			if user.KeepEmailPrivate && strings.EqualFold(email, user.GetEmail()) {
-				return true, user.GetEmail()
-			}
-		}
-	}
-	return false, email
+func FindGPGKeyWithSubKeys(ctx context.Context, keyID string) ([]*GPGKey, error) {
+	return db.Find[GPGKey](ctx, FindGPGKeyOptions{
+		KeyID:          keyID,
+		IncludeSubKeys: true,
+	})
 }

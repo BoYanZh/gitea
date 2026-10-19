@@ -5,14 +5,13 @@ package bleve
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
-	"code.gitea.io/gitea/modules/indexer/internal"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/indexer/internal"
+	"gitea.dev/modules/log"
 
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/mapping"
-	"github.com/ethantkoenig/rupture"
 )
 
 var _ internal.Indexer = &Indexer{}
@@ -39,11 +38,11 @@ func NewIndexer(indexDir string, version int, mappingGetter func() (mapping.Inde
 // Init initializes the indexer
 func (i *Indexer) Init(_ context.Context) (bool, error) {
 	if i == nil {
-		return false, fmt.Errorf("cannot init nil indexer")
+		return false, errors.New("cannot init nil indexer")
 	}
 
 	if i.Indexer != nil {
-		return false, fmt.Errorf("indexer is already initialized")
+		return false, errors.New("indexer is already initialized")
 	}
 
 	indexer, version, err := openIndexer(i.indexDir, i.version)
@@ -69,9 +68,7 @@ func (i *Indexer) Init(_ context.Context) (bool, error) {
 		return false, err
 	}
 
-	if err = rupture.WriteIndexMetadata(i.indexDir, &rupture.IndexMetadata{
-		Version: i.version,
-	}); err != nil {
+	if err = writeIndexMetadataVersion(i.indexDir, i.version); err != nil {
 		return false, err
 	}
 
@@ -83,10 +80,10 @@ func (i *Indexer) Init(_ context.Context) (bool, error) {
 // Ping checks if the indexer is available
 func (i *Indexer) Ping(_ context.Context) error {
 	if i == nil {
-		return fmt.Errorf("cannot ping nil indexer")
+		return errors.New("cannot ping nil indexer")
 	}
 	if i.Indexer == nil {
-		return fmt.Errorf("indexer is not initialized")
+		return errors.New("indexer is not initialized")
 	}
 	return nil
 }

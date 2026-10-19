@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"code.gitea.io/gitea/modules/generate"
+	"gitea.dev/modules/generate"
 )
 
 // LFS represents the server-side configuration for Git LFS.
@@ -28,7 +28,8 @@ var LFS = struct {
 
 // LFSClient represents configuration for Gitea's LFS clients, for example: mirroring upstream Git LFS
 var LFSClient = struct {
-	BatchSize int `ini:"BATCH_SIZE"`
+	BatchSize                 int `ini:"BATCH_SIZE"`
+	BatchOperationConcurrency int `ini:"BATCH_OPERATION_CONCURRENCY"`
 }{}
 
 func loadLFSFrom(rootCfg ConfigProvider) error {
@@ -38,18 +39,6 @@ func loadLFSFrom(rootCfg ConfigProvider) error {
 	sec := rootCfg.Section("server")
 
 	lfsSec, _ := rootCfg.GetSection("lfs")
-
-	// Specifically default PATH to LFS_CONTENT_PATH
-	// DEPRECATED should not be removed because users maybe upgrade from lower version to the latest version
-	// if these are removed, the warning will not be shown
-	deprecatedSetting(rootCfg, "server", "LFS_CONTENT_PATH", "lfs", "PATH", "v1.19.0")
-
-	if val := sec.Key("LFS_CONTENT_PATH").String(); val != "" {
-		if lfsSec == nil {
-			lfsSec = rootCfg.Section("lfs")
-		}
-		lfsSec.Key("PATH").MustString(val)
-	}
 
 	var err error
 	LFS.Storage, err = getStorage(rootCfg, "lfs", "", lfsSec)
@@ -66,6 +55,11 @@ func loadLFSFrom(rootCfg ConfigProvider) error {
 		LFSClient.BatchSize = 20
 	}
 
+	if LFSClient.BatchOperationConcurrency < 1 {
+		// match the default git-lfs's `lfs.concurrenttransfers` https://github.com/git-lfs/git-lfs/blob/main/docs/man/git-lfs-config.adoc#upload-and-download-transfer-settings
+		LFSClient.BatchOperationConcurrency = 8
+	}
+
 	LFS.HTTPAuthExpiry = sec.Key("LFS_HTTP_AUTH_EXPIRY").MustDuration(24 * time.Hour)
 
 	if !LFS.StartServer || !InstallLock {
@@ -75,10 +69,7 @@ func loadLFSFrom(rootCfg ConfigProvider) error {
 	jwtSecretBase64 := loadSecret(rootCfg.Section("server"), "LFS_JWT_SECRET_URI", "LFS_JWT_SECRET")
 	LFS.JWTSecretBytes, err = generate.DecodeJwtSecretBase64(jwtSecretBase64)
 	if err != nil {
-		LFS.JWTSecretBytes, jwtSecretBase64, err = generate.NewJwtSecretWithBase64()
-		if err != nil {
-			return fmt.Errorf("error generating JWT Secret for custom config: %v", err)
-		}
+		LFS.JWTSecretBytes, jwtSecretBase64 = generate.NewJwtSecretWithBase64()
 
 		// Save secret
 		saveCfg, err := rootCfg.PrepareSaving()

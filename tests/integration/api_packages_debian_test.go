@@ -14,14 +14,13 @@ import (
 	"strings"
 	"testing"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/packages"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	debian_module "code.gitea.io/gitea/modules/packages/debian"
-	packages_cleanup_service "code.gitea.io/gitea/services/packages/cleanup"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/packages"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	debian_module "gitea.dev/modules/packages/debian"
+	packages_cleanup_service "gitea.dev/services/packages/cleanup"
+	"gitea.dev/tests"
 
 	"github.com/blakesmith/ar"
 	"github.com/stretchr/testify/assert"
@@ -59,6 +58,10 @@ func TestPackageDebian(t *testing.T) {
 		}
 		aw.WriteHeader(hdr)
 		aw.Write(cbuf.Bytes())
+
+		// if you'd like to do some tests manually, uncomment the WriteFile line, then you will get some "deb" package files:
+		// OWNER= PASS= DIST= COMP= ; curl -X PUT "http://$OWNER:$PASS@localhost:3000/api/packages/$OWNER/debian/pool/$DIST/$COMP/upload" -T /tmp/gitea_test_debian_gitea_1.0.3_amd64.deb
+		// _ = os.WriteFile("/tmp/gitea_test_debian_"+name+"_"+version+"_"+architecture+".deb", buf.Bytes(), 0o644)
 		return &buf
 	}
 
@@ -103,17 +106,17 @@ func TestPackageDebian(t *testing.T) {
 								AddBasicAuth(user.Name)
 							MakeRequest(t, req, http.StatusCreated)
 
-							pv, err := packages.GetVersionByNameAndVersion(db.DefaultContext, user.ID, packages.TypeDebian, packageName, packageVersion)
+							pv, err := packages.GetVersionByNameAndVersion(t.Context(), user.ID, packages.TypeDebian, packageName, packageVersion)
 							assert.NoError(t, err)
 
-							pd, err := packages.GetPackageDescriptor(db.DefaultContext, pv)
+							pd, err := packages.GetPackageDescriptor(t.Context(), pv)
 							assert.NoError(t, err)
 							assert.Nil(t, pd.SemVer)
 							assert.IsType(t, &debian_module.Metadata{}, pd.Metadata)
 							assert.Equal(t, packageName, pd.Package.Name)
 							assert.Equal(t, packageVersion, pd.Version.Version)
 
-							pfs, err := packages.GetFilesByVersionID(db.DefaultContext, pv.ID)
+							pfs, err := packages.GetFilesByVersionID(t.Context(), pv.ID)
 							assert.NoError(t, err)
 							assert.NotEmpty(t, pfs)
 							assert.Condition(t, func() bool {
@@ -129,7 +132,7 @@ func TestPackageDebian(t *testing.T) {
 
 										assert.True(t, pf.IsLead)
 
-										pfps, err := packages.GetProperties(db.DefaultContext, packages.PropertyTypeFile, pf.ID)
+										pfps, err := packages.GetProperties(t.Context(), packages.PropertyTypeFile, pf.ID)
 										assert.NoError(t, err)
 
 										for _, pfp := range pfps {
@@ -277,14 +280,14 @@ func TestPackageDebian(t *testing.T) {
 			Type:          packages.TypeDebian,
 		}
 
-		_, err := packages.InsertCleanupRule(db.DefaultContext, rule)
+		_, err := packages.InsertCleanupRule(t.Context(), rule)
 		assert.NoError(t, err)
 
 		// When there were a lot of packages (> 50 or 100) and the code used "Iterate" to get all packages, it ever caused bugs,
 		// because "Iterate" keeps a dangling SQL session but the callback function still uses the same session to execute statements.
 		// The "Iterate" problem has been checked by TestContextSafety now, so here we only need to check the cleanup logic with a small number
 		packagesCount := 2
-		for i := 0; i < packagesCount; i++ {
+		for i := range packagesCount {
 			uploadURL := fmt.Sprintf("%s/pool/%s/%s/upload", rootURL, "test", "main")
 			req := NewRequestWithBody(t, "PUT", uploadURL, createArchive(packageName, "1.0."+strconv.Itoa(i), "all")).AddBasicAuth(user.Name)
 			MakeRequest(t, req, http.StatusCreated)
@@ -292,7 +295,7 @@ func TestPackageDebian(t *testing.T) {
 		req := NewRequest(t, "GET", fmt.Sprintf("%s/dists/%s/Release", rootURL, "test"))
 		MakeRequest(t, req, http.StatusOK)
 
-		err = packages_cleanup_service.CleanupTask(db.DefaultContext, 0)
+		err = packages_cleanup_service.CleanupTask(t.Context(), 0)
 		assert.NoError(t, err)
 
 		req = NewRequest(t, "GET", fmt.Sprintf("%s/dists/%s/Release", rootURL, "test"))

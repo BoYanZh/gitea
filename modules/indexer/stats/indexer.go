@@ -6,10 +6,10 @@ package stats
 import (
 	"context"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
 )
 
 // Indexer defines an interface to index repository stats
@@ -30,7 +30,7 @@ func Init() error {
 		return err
 	}
 
-	go populateRepoIndexer(db.DefaultContext)
+	go populateRepoIndexer(graceful.GetManager().ShutdownContext())
 
 	return nil
 }

@@ -1,0 +1,64 @@
+// Copyright 2023 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package templates
+
+import (
+	"testing"
+	"time"
+
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/timeutil"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestDateTime(t *testing.T) {
+	testTz, _ := time.LoadLocation("America/New_York")
+	defer test.MockVariableValue(&setting.DefaultUILocation, testTz)()
+	defer test.MockVariableValue(&setting.IsProd, true)()
+	defer test.MockVariableValue(&setting.IsInTesting, false)()
+
+	du := NewDateUtils()
+
+	refTimeStr := "2018-01-01T00:00:00Z"
+	refTime, _ := time.Parse(time.RFC3339, refTimeStr)
+	refTimeStamp := timeutil.TimeStamp(refTime.Unix())
+
+	assert.EqualValues(t, "-", du.AbsoluteShort(nil))
+	assert.EqualValues(t, "-", du.AbsoluteShort(0))
+	assert.EqualValues(t, "-", du.AbsoluteShort(time.Time{}))
+	assert.EqualValues(t, "-", du.AbsoluteShort(timeutil.TimeStamp(0)))
+
+	actual := du.AbsoluteShort(refTime)
+	assert.EqualValues(t, `<relative-time weekday="" year="numeric" threshold="P0Y" month="short" day="numeric" prefix="" datetime="2018-01-01T00:00:00Z">2018-01-01</relative-time>`, actual)
+
+	actual = du.AbsoluteShort(refTimeStamp)
+	assert.EqualValues(t, `<relative-time weekday="" year="numeric" threshold="P0Y" month="short" day="numeric" prefix="" datetime="2017-12-31T19:00:00-05:00">2017-12-31</relative-time>`, actual)
+
+	actual = du.FullTime(refTimeStamp)
+	assert.EqualValues(t, `<relative-time weekday="" year="numeric" format="datetime" month="short" day="numeric" hour="numeric" minute="numeric" second="numeric" data-tooltip-content data-tooltip-interactive="true" datetime="2017-12-31T19:00:00-05:00">2017-12-31 19:00:00 -05:00</relative-time>`, actual)
+}
+
+func TestTimeSince(t *testing.T) {
+	testTz, _ := time.LoadLocation("America/New_York")
+	defer test.MockVariableValue(&setting.DefaultUILocation, testTz)()
+	defer test.MockVariableValue(&setting.IsProd, true)()
+	defer test.MockVariableValue(&setting.IsInTesting, false)()
+
+	du := NewDateUtils()
+	assert.EqualValues(t, "-", du.TimeSince(nil))
+
+	refTimeStr := "2018-01-01T00:00:00Z"
+	refTime, _ := time.Parse(time.RFC3339, refTimeStr)
+
+	actual := du.TimeSince(refTime)
+	assert.EqualValues(t, `<relative-time prefix="" tense="past" datetime="2018-01-01T00:00:00Z" data-tooltip-content data-tooltip-interactive="true">2018-01-01 00:00:00 +00:00</relative-time>`, actual)
+
+	actual = timeSinceTo(&refTime, time.Time{})
+	assert.EqualValues(t, `<relative-time prefix="" tense="future" datetime="2018-01-01T00:00:00Z" data-tooltip-content data-tooltip-interactive="true">2018-01-01 00:00:00 +00:00</relative-time>`, actual)
+
+	actual = du.TimeSince(timeutil.TimeStampNano(refTime.UnixNano()))
+	assert.EqualValues(t, `<relative-time prefix="" tense="past" datetime="2017-12-31T19:00:00-05:00" data-tooltip-content data-tooltip-interactive="true">2017-12-31 19:00:00 -05:00</relative-time>`, actual)
+}

@@ -1,0 +1,75 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package sender
+
+import (
+	"fmt"
+	"io"
+	"strings"
+
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/setting"
+)
+
+// SendmailSender Sender sendmail mail sender
+type SendmailSender struct{}
+
+var _ Sender = &SendmailSender{}
+
+// Send send email
+func (s *SendmailSender) Send(from string, to []string, msg io.WriterTo) error {
+	var err error
+	var closeError error
+	var waitError error
+
+	envelopeFrom := from
+	if setting.MailService.OverrideEnvelopeFrom {
+		envelopeFrom = setting.MailService.EnvelopeFrom
+	}
+
+	// Use "-t" to extract recipients from message headers, don't add email addresses to the command line.
+	// Because email address can start with "-" which can lead to injected command line argument (RCE)
+	args := []string{"-f", envelopeFrom, "-i", "-t"}
+	args = append(args, setting.MailService.SendmailArgs...)
+	log.Trace("Sending with: %s %v", setting.MailService.SendmailPath, args)
+
+	desc := fmt.Sprintf("SendMail: %s %v", setting.MailService.SendmailPath, args)
+
+	ctx, _, finished := process.GetManager().AddContextTimeout(graceful.GetManager().HammerContext(), setting.MailService.SendmailTimeout, desc)
+	defer finished()
+
+	cmd := process.CommandContext(ctx, setting.MailService.SendmailPath, args...)
+	pipe, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	if err = cmd.Start(); err != nil {
+		_ = pipe.Close()
+		return err
+	}
+
+	if setting.MailService.SendmailConvertCRLF {
+		buf := &strings.Builder{}
+		_, err = msg.WriteTo(buf)
+		if err == nil {
+			_, err = strings.NewReplacer("\r\n", "\n").WriteString(pipe, buf.String())
+		}
+	} else {
+		_, err = msg.WriteTo(pipe)
+	}
+
+	// we MUST close the pipe or sendmail will hang waiting for more of the message
+	// Also we should wait on our sendmail command even if something fails
+	closeError = pipe.Close()
+	waitError = cmd.Wait()
+	if err != nil {
+		return err
+	} else if closeError != nil {
+		return closeError
+	}
+	return waitError
+}

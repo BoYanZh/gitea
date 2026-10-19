@@ -1,57 +1,54 @@
 import {imageInfo} from '../../utils/image.ts';
-import {replaceTextareaSelection} from '../../utils/dom.ts';
-import {isUrl} from '../../utils/url.ts';
-import {triggerEditorContentChanged} from './EditorMarkdown.ts';
+import {replaceTextareaSelection, triggerEditorContentChanged} from './EditorMarkdown.ts';
 import {
   DropzoneCustomEventRemovedFile,
   DropzoneCustomEventUploadDone,
   generateMarkdownLinkForAttachment,
 } from '../dropzone.ts';
+import {subscribe} from '@github/paste-markdown';
 import type CodeMirror from 'codemirror';
+import type EasyMDE from 'easymde';
+import type Dropzone from '@deltablot/dropzone';
 
 let uploadIdCounter = 0;
 
+type UploadFile = File & {_giteaUploadId?: number, uuid?: string};
+
 export const EventUploadStateChanged = 'ce-upload-state-changed';
 
-export function triggerUploadStateChanged(target) {
+export function triggerUploadStateChanged(target: HTMLElement) {
   target.dispatchEvent(new CustomEvent(EventUploadStateChanged, {bubbles: true}));
 }
 
-function uploadFile(dropzoneEl, file) {
-  return new Promise((resolve) => {
+function uploadFile(dropzoneEl: HTMLElement, file: UploadFile) {
+  return new Promise<UploadFile>((resolve) => {
     const curUploadId = uploadIdCounter++;
     file._giteaUploadId = curUploadId;
     const dropzoneInst = dropzoneEl.dropzone;
-    const onUploadDone = ({file}) => {
+    const onUploadDone = ({file}: {file: UploadFile}) => {
       if (file._giteaUploadId === curUploadId) {
         dropzoneInst.off(DropzoneCustomEventUploadDone, onUploadDone);
         resolve(file);
       }
     };
     dropzoneInst.on(DropzoneCustomEventUploadDone, onUploadDone);
-    dropzoneInst.handleFiles([file]);
+    // FIXME: this is not entirely correct because `file` does not satisfy DropzoneFile (we have abused the Dropzone for long time)
+    dropzoneInst.addFile(file as Dropzone.DropzoneFile);
   });
 }
 
 class TextareaEditor {
-  editor : HTMLTextAreaElement;
+  editor: HTMLTextAreaElement;
 
-  constructor(editor) {
+  constructor(editor: HTMLTextAreaElement) {
     this.editor = editor;
   }
 
-  insertPlaceholder(value) {
-    const editor = this.editor;
-    const startPos = editor.selectionStart;
-    const endPos = editor.selectionEnd;
-    editor.value = editor.value.substring(0, startPos) + value + editor.value.substring(endPos);
-    editor.selectionStart = startPos;
-    editor.selectionEnd = startPos + value.length;
-    editor.focus();
-    triggerEditorContentChanged(editor);
+  insertPlaceholder(value: string) {
+    replaceTextareaSelection(this.editor, value);
   }
 
-  replacePlaceholder(oldVal, newVal) {
+  replacePlaceholder(oldVal: string, newVal: string) {
     const editor = this.editor;
     const startPos = editor.selectionStart;
     const endPos = editor.selectionEnd;
@@ -59,7 +56,7 @@ class TextareaEditor {
       editor.value = editor.value.substring(0, startPos) + newVal + editor.value.substring(endPos);
       editor.selectionEnd = startPos + newVal.length;
     } else {
-      editor.value = editor.value.replace(oldVal, newVal);
+      editor.value = editor.value.replace(oldVal, () => newVal);
       editor.selectionEnd -= oldVal.length;
       editor.selectionEnd += newVal.length;
     }
@@ -72,11 +69,11 @@ class TextareaEditor {
 class CodeMirrorEditor {
   editor: CodeMirror.EditorFromTextArea;
 
-  constructor(editor) {
+  constructor(editor: CodeMirror.EditorFromTextArea) {
     this.editor = editor;
   }
 
-  insertPlaceholder(value) {
+  insertPlaceholder(value: string) {
     const editor = this.editor;
     const startPoint = editor.getCursor('start');
     const endPoint = editor.getCursor('end');
@@ -87,13 +84,13 @@ class CodeMirrorEditor {
     triggerEditorContentChanged(editor.getTextArea());
   }
 
-  replacePlaceholder(oldVal, newVal) {
+  replacePlaceholder(oldVal: string, newVal: string) {
     const editor = this.editor;
     const endPoint = editor.getCursor('end');
     if (editor.getSelection() === oldVal) {
       editor.replaceSelection(newVal);
     } else {
-      editor.setValue(editor.getValue().replace(oldVal, newVal));
+      editor.setValue(editor.getValue().replace(oldVal, () => newVal));
     }
     endPoint.ch -= oldVal.length;
     endPoint.ch += newVal.length;
@@ -103,7 +100,7 @@ class CodeMirrorEditor {
   }
 }
 
-async function handleUploadFiles(editor, dropzoneEl, files, e) {
+async function handleUploadFiles(editor: CodeMirrorEditor | TextareaEditor, dropzoneEl: HTMLElement, files: Array<File> | FileList, e: Event) {
   e.preventDefault();
   for (const file of files) {
     const name = file.name.slice(0, file.name.lastIndexOf('.'));
@@ -112,52 +109,39 @@ async function handleUploadFiles(editor, dropzoneEl, files, e) {
 
     editor.insertPlaceholder(placeholder);
     await uploadFile(dropzoneEl, file); // the "file" will get its "uuid" during the upload
-    editor.replacePlaceholder(placeholder, generateMarkdownLinkForAttachment(file, {width, dppx}));
+    const fileWithUuid = {name: file.name, uuid: (file as unknown as {uuid: string}).uuid};
+    editor.replacePlaceholder(placeholder, generateMarkdownLinkForAttachment(fileWithUuid, {width, dppx}));
   }
 }
 
-export function removeAttachmentLinksFromMarkdown(text, fileUuid) {
+export function removeAttachmentLinksFromMarkdown(text: string, fileUuid: string) {
   text = text.replace(new RegExp(`!?\\[([^\\]]+)\\]\\(/?attachments/${fileUuid}\\)`, 'g'), '');
-  text = text.replace(new RegExp(`<img[^>]+src="/?attachments/${fileUuid}"[^>]*>`, 'g'), '');
+  text = text.replace(new RegExp(`[<]img[^>]+src="/?attachments/${fileUuid}"[^>]*>`, 'g'), '');
   return text;
 }
 
-function handleClipboardText(textarea, e, {text, isShiftDown}) {
-  // pasting with "shift" means "paste as original content" in most applications
-  if (isShiftDown) return; // let the browser handle it
-
-  // when pasting links over selected text, turn it into [text](link)
-  const {value, selectionStart, selectionEnd} = textarea;
-  const selectedText = value.substring(selectionStart, selectionEnd);
-  const trimmedText = text.trim();
-  if (selectedText && isUrl(trimmedText) && !isUrl(selectedText)) {
-    e.preventDefault();
-    replaceTextareaSelection(textarea, `[${selectedText}](${trimmedText})`);
-  }
-  // else, let the browser handle it
-}
-
-// extract text and images from "paste" event
-function getPastedContent(e) {
-  const images = [];
+function getPastedImages(e: ClipboardEvent) {
+  const images: Array<File> = [];
   for (const item of e.clipboardData?.items ?? []) {
     if (item.type?.startsWith('image/')) {
-      images.push(item.getAsFile());
+      const file = item.getAsFile();
+      if (file) {
+        images.push(file);
+      }
     }
   }
-  const text = e.clipboardData?.getData?.('text') ?? '';
-  return {text, images};
+  return images;
 }
 
-export function initEasyMDEPaste(easyMDE, dropzoneEl) {
-  const editor = new CodeMirrorEditor(easyMDE.codemirror);
+export function initEasyMDEPaste(easyMDE: EasyMDE, dropzoneEl: HTMLElement) {
+  const editor = new CodeMirrorEditor(easyMDE.codemirror as CodeMirror.EditorFromTextArea);
   easyMDE.codemirror.on('paste', (_, e) => {
-    const {images} = getPastedContent(e);
+    const images = getPastedImages(e);
     if (!images.length) return;
     handleUploadFiles(editor, dropzoneEl, images, e);
   });
   easyMDE.codemirror.on('drop', (_, e) => {
-    if (!e.dataTransfer.files.length) return;
+    if (!e.dataTransfer?.files.length) return;
     handleUploadFiles(editor, dropzoneEl, e.dataTransfer.files, e);
   });
   dropzoneEl.dropzone.on(DropzoneCustomEventRemovedFile, ({fileUuid}) => {
@@ -167,27 +151,20 @@ export function initEasyMDEPaste(easyMDE, dropzoneEl) {
   });
 }
 
-export function initTextareaEvents(textarea, dropzoneEl) {
-  let isShiftDown = false;
-  textarea.addEventListener('keydown', (e) => {
-    if (e.shiftKey) isShiftDown = true;
-  });
-  textarea.addEventListener('keyup', (e) => {
-    if (!e.shiftKey) isShiftDown = false;
-  });
-  textarea.addEventListener('paste', (e) => {
-    const {images, text} = getPastedContent(e);
+export function initTextareaEvents(textarea: HTMLTextAreaElement, dropzoneEl: HTMLElement | null) {
+  subscribe(textarea); // enable paste features
+  textarea.addEventListener('paste', (e: ClipboardEvent) => {
+    const images = getPastedImages(e);
     if (images.length && dropzoneEl) {
       handleUploadFiles(new TextareaEditor(textarea), dropzoneEl, images, e);
-    } else if (text) {
-      handleClipboardText(textarea, e, {text, isShiftDown});
     }
   });
-  textarea.addEventListener('drop', (e) => {
-    if (!e.dataTransfer.files.length) return;
+  textarea.addEventListener('drop', (e: DragEvent) => {
+    if (!e.dataTransfer?.files.length) return;
+    if (!dropzoneEl) return;
     handleUploadFiles(new TextareaEditor(textarea), dropzoneEl, e.dataTransfer.files, e);
   });
-  dropzoneEl?.dropzone.on(DropzoneCustomEventRemovedFile, ({fileUuid}) => {
+  dropzoneEl?.dropzone.on(DropzoneCustomEventRemovedFile, ({fileUuid}: {fileUuid: string}) => {
     const newText = removeAttachmentLinksFromMarkdown(textarea.value, fileUuid);
     if (textarea.value !== newText) textarea.value = newText;
   });

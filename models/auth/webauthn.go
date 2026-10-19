@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 )
 
@@ -89,14 +90,33 @@ func (cred *WebAuthnCredential) AfterLoad() {
 // WebAuthnCredentialList is a list of *WebAuthnCredential
 type WebAuthnCredentialList []*WebAuthnCredential
 
+// newCredentialFlagsFromAuthenticatorFlags is copied from https://github.com/go-webauthn/webauthn/pull/337
+// to convert protocol.AuthenticatorFlags to webauthn.CredentialFlags
+func newCredentialFlagsFromAuthenticatorFlags(flags protocol.AuthenticatorFlags) webauthn.CredentialFlags {
+	return webauthn.CredentialFlags{
+		UserPresent:    flags.HasUserPresent(),
+		UserVerified:   flags.HasUserVerified(),
+		BackupEligible: flags.HasBackupEligible(),
+		BackupState:    flags.HasBackupState(),
+	}
+}
+
 // ToCredentials will convert all WebAuthnCredentials to webauthn.Credentials
-func (list WebAuthnCredentialList) ToCredentials() []webauthn.Credential {
+func (list WebAuthnCredentialList) ToCredentials(defaultAuthFlags ...protocol.AuthenticatorFlags) []webauthn.Credential {
+	// TODO: at the moment, Gitea doesn't store or check the flags
+	// so we need to use the default flags from the authenticator to make the login validation pass
+	// In the future, we should:
+	// 1. store the flags when registering the credential
+	// 2. provide the stored flags when converting the credentials (for login)
+	// 3. for old users, still use this fallback to the default flags
+	defAuthFlags := util.OptionalArg(defaultAuthFlags)
 	creds := make([]webauthn.Credential, 0, len(list))
 	for _, cred := range list {
 		creds = append(creds, webauthn.Credential{
 			ID:              cred.CredentialID,
 			PublicKey:       cred.PublicKey,
 			AttestationType: cred.AttestationType,
+			Flags:           newCredentialFlagsFromAuthenticatorFlags(defAuthFlags),
 			Authenticator: webauthn.Authenticator{
 				AAGUID:       cred.AAGUID,
 				SignCount:    cred.SignCount,
@@ -130,9 +150,9 @@ func GetWebAuthnCredentialByName(ctx context.Context, uid int64, name string) (*
 }
 
 // GetWebAuthnCredentialByID returns WebAuthn credential by id
-func GetWebAuthnCredentialByID(ctx context.Context, id int64) (*WebAuthnCredential, error) {
+func GetWebAuthnCredentialByID(ctx context.Context, uid, id int64) (*WebAuthnCredential, error) {
 	cred := new(WebAuthnCredential)
-	if found, err := db.GetEngine(ctx).ID(id).Get(cred); err != nil {
+	if found, err := db.GetEngine(ctx).Where("user_id = ?", uid).ID(id).Get(cred); err != nil {
 		return nil, err
 	} else if !found {
 		return nil, ErrWebAuthnCredentialNotExist{ID: id}
@@ -175,18 +195,26 @@ func CreateCredential(ctx context.Context, userID int64, name string, cred *weba
 	return c, nil
 }
 
-// DeleteCredential will delete WebAuthnCredential
-func DeleteCredential(ctx context.Context, id, userID int64) (bool, error) {
-	had, err := db.GetEngine(ctx).ID(id).Where("user_id = ?", userID).Delete(&WebAuthnCredential{})
-	return had > 0, err
+// RenameCredential renames the user's WebAuthnCredential, names are unique per user regardless of letter case
+func RenameCredential(ctx context.Context, uid, id int64, name string) (bool, error) {
+	used, err := db.GetEngine(ctx).Where("user_id = ? AND lower_name = ? AND id != ?", uid, strings.ToLower(name), id).Exist(&WebAuthnCredential{})
+	if err != nil {
+		return false, err
+	} else if used {
+		return false, util.ErrorWrapTranslatable(
+			util.NewAlreadyExistErrorf("WebAuthn credential name already exists [uid: %d, name: %s]", uid, name),
+			"settings.webauthn_nickname_been_used",
+		)
+	}
+	updated, err := db.GetEngine(ctx).ID(id).Where("user_id=? AND `name`<>?", uid, name).Cols("name", "lower_name").Update(&WebAuthnCredential{
+		Name:      name,
+		LowerName: strings.ToLower(name),
+	})
+	return updated > 0, err
 }
 
-// WebAuthnCredentials implements the webauthn.User interface
-func WebAuthnCredentials(ctx context.Context, userID int64) ([]webauthn.Credential, error) {
-	dbCreds, err := GetWebAuthnCredentialsByUID(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	return dbCreds.ToCredentials(), nil
+// DeleteCredential will delete WebAuthnCredential
+func DeleteCredential(ctx context.Context, uid, id int64) (bool, error) {
+	had, err := db.GetEngine(ctx).ID(id).Where("user_id = ?", uid).Delete(&WebAuthnCredential{})
+	return had > 0, err
 }

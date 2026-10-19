@@ -1,0 +1,160 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package reqctx
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"maps"
+	"reflect"
+	"sync"
+
+	"gitea.dev/modules/process"
+)
+
+// MustContextValue returns the value stored under key. A missing or mistyped value can only
+// be a programming error, and callers can't do anything useful with a zero value, so it panics.
+func MustContextValue[T any](ctx context.Context, key any) T {
+	value, ok := ctx.Value(key).(T)
+	if !ok {
+		panic(fmt.Sprintf("context value %v is %T, expected %s", key, ctx.Value(key), reflect.TypeFor[T]()))
+	}
+	return value
+}
+
+type ContextDataProvider interface {
+	GetData() ContextData
+}
+
+type ContextData map[string]any
+
+func (ds ContextData) GetData() ContextData {
+	return ds
+}
+
+func (ds ContextData) MergeFrom(other ContextData) ContextData {
+	maps.Copy(ds, other)
+	return ds
+}
+
+// RequestDataStore is a short-lived context-related object that is used to store request-specific data.
+type RequestDataStore interface {
+	GetData() ContextData
+	SetContextValue(k, v any)
+	GetContextValue(key any) any
+	AddCleanUp(f func())
+	AddCloser(c io.Closer)
+}
+
+type requestDataStoreKeyType struct{}
+
+var RequestDataStoreKey requestDataStoreKeyType
+
+type requestDataStore struct {
+	data ContextData
+
+	mu           sync.RWMutex
+	values       map[any]any
+	cleanUpFuncs []func()
+}
+
+func (r *requestDataStore) GetContextValue(key any) any {
+	if key == RequestDataStoreKey {
+		return r
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.values[key]
+}
+
+func (r *requestDataStore) SetContextValue(k, v any) {
+	r.mu.Lock()
+	r.values[k] = v
+	r.mu.Unlock()
+}
+
+// GetData and the underlying ContextData are not thread-safe, callers should ensure thread-safety.
+func (r *requestDataStore) GetData() ContextData {
+	if r.data == nil {
+		r.data = make(ContextData)
+	}
+	return r.data
+}
+
+func (r *requestDataStore) AddCleanUp(f func()) {
+	r.mu.Lock()
+	r.cleanUpFuncs = append(r.cleanUpFuncs, f)
+	r.mu.Unlock()
+}
+
+func (r *requestDataStore) AddCloser(c io.Closer) {
+	r.AddCleanUp(func() { _ = c.Close() })
+}
+
+func (r *requestDataStore) cleanUp() {
+	for _, f := range r.cleanUpFuncs {
+		f()
+	}
+}
+
+type RequestContext interface {
+	context.Context
+	RequestDataStore
+}
+
+func FromContext(ctx context.Context) RequestContext {
+	if rc, ok := ctx.(RequestContext); ok {
+		return rc
+	}
+	// here we must use the current ctx and the underlying store
+	// the current ctx guarantees that the ctx deadline/cancellation/values are respected
+	// the underlying store guarantees that the request-specific data is available
+	if store := GetRequestDataStore(ctx); store != nil {
+		return &requestContext{Context: ctx, RequestDataStore: store}
+	}
+	return nil
+}
+
+func GetRequestDataStore(ctx context.Context) RequestDataStore {
+	if req, ok := ctx.Value(RequestDataStoreKey).(*requestDataStore); ok {
+		return req
+	}
+	return nil
+}
+
+type requestContext struct {
+	context.Context
+	RequestDataStore
+}
+
+func (c *requestContext) Value(key any) any {
+	if v := c.GetContextValue(key); v != nil {
+		return v
+	}
+	return c.Context.Value(key)
+}
+
+func NewRequestContext(parentCtx context.Context, profDesc string) (_ context.Context, finished func()) {
+	ctx, _, processFinished := process.GetManager().AddTypedContext(parentCtx, profDesc, process.RequestProcessType, true)
+	store := &requestDataStore{values: make(map[any]any)}
+	reqCtx := &requestContext{Context: ctx, RequestDataStore: store}
+	return reqCtx, func() {
+		store.cleanUp()
+		processFinished()
+	}
+}
+
+type TestingT interface {
+	Cleanup(func())
+	Context() context.Context
+}
+
+// NewRequestContextForTest creates a new RequestContext for testing purposes
+func NewRequestContextForTest(t TestingT) RequestContext {
+	store := &requestDataStore{values: make(map[any]any)}
+	ret := &requestContext{Context: t.Context(), RequestDataStore: store}
+	t.Cleanup(store.cleanUp)
+	return ret
+}

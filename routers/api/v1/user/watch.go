@@ -7,29 +7,32 @@ import (
 	"errors"
 	"net/http"
 
-	access_model "code.gitea.io/gitea/models/perm/access"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // getWatchedRepos returns the repos that the user with the specified userID is watching
 func getWatchedRepos(ctx *context.APIContext, user *user_model.User, private bool) ([]*api.Repository, int64, error) {
-	watchedRepos, total, err := repo_model.GetWatchedRepos(ctx, &repo_model.WatchedReposOptions{
+	opts := &repo_model.WatchedReposOptions{
 		ListOptions:    utils.GetListOptions(ctx),
 		WatcherID:      user.ID,
 		IncludePrivate: private,
-	})
+		Actor:          ctx.Doer,
+	}
+
+	watchedRepos, total, err := repo_model.GetWatchedRepos(ctx, opts)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	repos := make([]*api.Repository, len(watchedRepos))
 	for i, watched := range watchedRepos {
-		permission, err := access_model.GetUserRepoPermission(ctx, watched, user)
+		permission, err := access_model.GetIndividualUserRepoPermission(ctx, watched, user)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -49,7 +52,7 @@ func GetWatchedRepos(ctx *context.APIContext) {
 	// - name: username
 	//   type: string
 	//   in: path
-	//   description: username of the user
+	//   description: username of the user whose watched repos are to be listed
 	//   required: true
 	// - name: page
 	//   in: query
@@ -68,9 +71,10 @@ func GetWatchedRepos(ctx *context.APIContext) {
 	private := ctx.ContextUser.ID == ctx.Doer.ID
 	repos, total, err := getWatchedRepos(ctx, ctx.ContextUser, private)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "getWatchedRepos", err)
+		ctx.APIErrorInternal(err)
 	}
 
+	ctx.SetLinkHeader(total, utils.GetListOptions(ctx).PageSize)
 	ctx.SetTotalCountHeader(total)
 	ctx.JSON(http.StatusOK, &repos)
 }
@@ -97,9 +101,9 @@ func GetMyWatchedRepos(ctx *context.APIContext) {
 
 	repos, total, err := getWatchedRepos(ctx, ctx.Doer, true)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "getWatchedRepos", err)
+		ctx.APIErrorInternal(err)
 	}
-
+	ctx.SetLinkHeader(total, utils.GetListOptions(ctx).PageSize)
 	ctx.SetTotalCountHeader(total)
 	ctx.JSON(http.StatusOK, &repos)
 }
@@ -127,7 +131,7 @@ func IsWatching(ctx *context.APIContext) {
 	//   "404":
 	//     description: User is not watching this repo or repo do not exist
 
-	if repo_model.IsWatching(ctx, ctx.Doer.ID, ctx.Repo.Repository.ID) {
+	if repo_model.IsWatchingRepo(ctx, ctx.Doer.ID, ctx.Repo.Repository.ID) {
 		ctx.JSON(http.StatusOK, api.WatchInfo{
 			Subscribed:    true,
 			Ignored:       false,
@@ -137,7 +141,7 @@ func IsWatching(ctx *context.APIContext) {
 			RepositoryURL: ctx.Repo.Repository.APIURL(),
 		})
 	} else {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 	}
 }
 
@@ -165,12 +169,12 @@ func Watch(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	err := repo_model.WatchRepo(ctx, ctx.Doer, ctx.Repo.Repository, true)
+	err := repo_model.WatchRepoAuto(ctx, ctx.Doer, ctx.Repo.Repository, true)
 	if err != nil {
 		if errors.Is(err, user_model.ErrBlockedUser) {
-			ctx.Error(http.StatusForbidden, "BlockedUser", err)
+			ctx.APIError(http.StatusForbidden, err.Error())
 		} else {
-			ctx.Error(http.StatusInternalServerError, "WatchRepo", err)
+			ctx.APIErrorInternal(err)
 		}
 		return
 	}
@@ -206,9 +210,9 @@ func Unwatch(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	err := repo_model.WatchRepo(ctx, ctx.Doer, ctx.Repo.Repository, false)
+	err := repo_model.WatchRepoAuto(ctx, ctx.Doer, ctx.Repo.Repository, false)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "UnwatchRepo", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.Status(http.StatusNoContent)

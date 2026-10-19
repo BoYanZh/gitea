@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+	{{template "mail/base/head" .Subject}}
+	<style>
+		.job-row td {border-top: 1px solid #d0d7de}
+		a.status-success {color: #2da44e !important}
+		a.status-failure {color: #e5534b !important}
+		a.status-neutral, .job-duration {color: #697077 !important}
+		img.status-neutral {filter: brightness(75%)}
+		@media (prefers-color-scheme: dark) {
+			.job-row td {border-top-color: #3f4248}
+			a.status-neutral, .job-duration {color: #afbac7 !important}
+			img.status-neutral {filter: brightness(125%)}
+		}
+	</style>
+</head>
+<body>
+
+	<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width: 100%; border-collapse: collapse;"><tr><td style="padding: 0 8px;">
+	{{if .Jobs}}
+	<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="width: 100%; border-collapse: collapse;">
+	{{range $index, $job := .Jobs}}
+		<tr{{if $index}} class="job-row"{{end}}>
+			<td width="26" style="width: 26px; padding: 6px 8px 6px 0; vertical-align: middle;"><img class="{{$job.StatusClass}}" src="cid:{{$job.StatusIconCID}}" width="18" height="18" alt="{{$job.StatusIconAlt}}" style="display: block;"></td>
+			<td align="left" style="padding: 6px 0; text-align: left; vertical-align: middle; word-break: break-word;">
+				<a class="{{$job.StatusClass}}" href="{{$job.HTMLURL}}" style="font-weight: bold;"><span style="display: none;">{{$job.StatusIconAlt}}: </span>{{$job.Name}}</a>
+				{{if gt $job.Attempt 1}}({{$.locale.Tr "actions.runs.attempt"}} #{{$job.Attempt}}){{end}}
+			</td>
+			<td class="job-duration" width="1%" align="right" style="width: 1%; padding: 6px 0 6px 8px; text-align: right; vertical-align: middle; white-space: nowrap;">{{$job.Duration}}<span style="display: none;"><br></span></td>
+		</tr>
+	{{end}}
+	</table>
+	{{else}}
+	<p><a href="{{.Run.HTMLURL}}">{{.Run.WorkflowID}}</a></p>
+	{{end}}
+	</td></tr></table>
+
+	{{template "mail/base/footer"}}
+
+</body>
+</html>

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+	{{template "mail/base/head" .Subject}}
+</head>
+
+{{$release_url := HTMLFormat "<a href='%s'>%s</a>" .Release.HTMLURL .Release.TagName}}
+{{$repo_url := HTMLFormat "<a href='%s'>%s</a>" .Release.Repo.HTMLURL .Release.Repo.FullName}}
+<body>
+	<p>
+		{{.locale.Tr "mail.release.new.text" .Release.Publisher.Name $release_url $repo_url}}
+	</p>
+	<h4>{{.locale.Tr "mail.release.title" .Release.Title}}</h4>
+	<p>{{.locale.Tr "mail.release.note"}}</p>
+	{{if ne .Release.RenderedNote ""}}<div>{{.Release.RenderedNote}}</div>{{end}}
+	<p>{{.locale.Tr "mail.release.downloads"}}</p>
+	<ul>
+		{{if not .DisableDownloadSourceArchives}}
+		<li>
+			<a href="{{.Release.Repo.HTMLURL}}/archive/{{.Release.TagName | PathEscapeSegments}}.zip" rel="nofollow"><strong>{{.locale.Tr "mail.release.download.zip"}}</strong></a>
+		</li>
+		<li>
+			<a href="{{.Release.Repo.HTMLURL}}/archive/{{.Release.TagName | PathEscapeSegments}}.tar.gz" rel="nofollow"><strong>{{.locale.Tr "mail.release.download.targz"}}</strong></a>
+		</li>
+		{{end}}
+		{{range .Release.Attachments}}
+			<li>
+				<a target="_blank" href="{{.DownloadURL}}"><strong>{{.Name}} ({{.Size | FormatByteSize}})</strong></a>
+			</li>
+		{{end}}
+	</ul>
+	{{template "mail/base/footer"}}
+</body>
+</html>

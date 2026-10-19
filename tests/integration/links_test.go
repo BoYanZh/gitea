@@ -9,64 +9,119 @@ import (
 	"path"
 	"testing"
 
-	"code.gitea.io/gitea/modules/setting"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/test"
-	"code.gitea.io/gitea/tests"
+	"gitea.dev/models/actions"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/test"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestLinksNoLogin(t *testing.T) {
+func assertLinkPageComplete(t *testing.T, session *TestSession, link string, containStrings ...string) {
+	req := NewRequest(t, "GET", link)
+	resp := session.MakeRequest(t, req, http.StatusOK)
+	assert.True(t, test.IsNormalPageCompleted(resp.Body.String()), "Page did not complete: "+link)
+	for _, s := range containStrings {
+		assert.Contains(t, resp.Body.String(), s, "Page does not contain expected string: "+s)
+	}
+}
+
+func TestLinks(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
+	t.Run("NoLogin", testLinksNoLogin)
+	t.Run("RedirectsNoLogin", testLinksRedirectsNoLogin)
+	t.Run("NoLoginNotExist", testLinksNoLoginNotExist)
+	t.Run("AsUser", testLinksAsUser)
+	t.Run("RepoCommon", testLinksRepoCommon)
+	t.Run("ApiJson", testLinksApiJson)
+}
+
+func testLinksApiJson(t *testing.T) {
+	defer test.MockVariableValue(&setting.AppVer, "1.2.3")()
+	defer test.MockVariableValue(&setting.AppSubURL)()
+	t.Run("Swagger", func(t *testing.T) {
+		for _, subURL := range []string{"", "/sub"} {
+			setting.AppSubURL = subURL
+			resp := MakeRequest(t, NewRequest(t, "GET", "/swagger.v1.json"), http.StatusOK)
+			decoded := DecodeJSON(t, resp, &struct {
+				BasePath string `json:"basePath"`
+				Info     struct {
+					Version string `json:"version"`
+				}
+			}{})
+			assert.Equal(t, subURL+"/api/v1", decoded.BasePath)
+			assert.Equal(t, "1.2.3", decoded.Info.Version)
+		}
+	})
+	t.Run("OpenAPI3", func(t *testing.T) {
+		for _, subURL := range []string{"", "/sub"} {
+			setting.AppSubURL = subURL
+			resp := MakeRequest(t, NewRequest(t, "GET", "/openapi3.v1.json"), http.StatusOK)
+			decoded := DecodeJSON(t, resp, &struct {
+				Servers []struct {
+					URL string `json:"url"`
+				} `json:"servers"`
+				Info struct {
+					Version string `json:"version"`
+				}
+			}{})
+			assert.Equal(t, subURL+"/api/v1", decoded.Servers[0].URL)
+			assert.Equal(t, "1.2.3", decoded.Info.Version)
+		}
+	})
+}
+
+func testLinksNoLogin(t *testing.T) {
 	links := []string{
+		"/",
 		"/explore/repos",
 		"/explore/repos?q=test",
 		"/explore/users",
 		"/explore/users?q=test",
 		"/explore/organizations",
 		"/explore/organizations?q=test",
-		"/",
 		"/user/sign_up",
 		"/user/login",
 		"/user/forgot_password",
-		"/api/swagger",
 		"/user2/repo1",
 		"/user2/repo1/",
 		"/user2/repo1/projects",
 		"/user2/repo1/projects/1",
 		"/user2/repo1/releases/tag/delete-tag", // It's the only one existing record on release.yml which has is_tag: true
-		"/.well-known/security.txt",
+		"/api/swagger",
 	}
-
 	for _, link := range links {
-		req := NewRequest(t, "GET", link)
-		MakeRequest(t, req, http.StatusOK)
+		assertLinkPageComplete(t, nil, link)
 	}
+	MakeRequest(t, NewRequest(t, "GET", "/.well-known/security.txt"), http.StatusOK)
+	MakeRequest(t, NewRequest(t, "GET", "/ssh_info"), http.StatusOK)
 }
 
-func TestRedirectsNoLogin(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-
-	redirects := map[string]string{
-		"/user2/repo1/commits/master":                "/user2/repo1/commits/branch/master",
-		"/user2/repo1/src/master":                    "/user2/repo1/src/branch/master",
-		"/user2/repo1/src/master/file.txt":           "/user2/repo1/src/branch/master/file.txt",
-		"/user2/repo1/src/master/directory/file.txt": "/user2/repo1/src/branch/master/directory/file.txt",
-		"/user/avatar/Ghost/-1":                      "/assets/img/avatar_default.png",
-		"/api/v1/swagger":                            "/api/swagger",
+func testLinksRedirectsNoLogin(t *testing.T) {
+	redirects := []struct{ from, to string }{
+		{"/user2/repo1/commits/master", "/user2/repo1/commits/branch/master"},
+		{"/user2/repo1/src/master", "/user2/repo1/src/branch/master"},
+		{"/user2/repo1/src/master/a%2fb.txt", "/user2/repo1/src/branch/master/a%2fb.txt"},
+		{"/user2/repo1/src/master/directory/file.txt?a=1", "/user2/repo1/src/branch/master/directory/file.txt?a=1"},
+		{"/user2/repo1/src/branch/master/directory/file.txt?raw=1&other=2", "/user2/repo1/raw/branch/master/directory/file.txt"},
+		{"/user2/repo1/tree/a%2fb?a=1", "/user2/repo1/src/a%2fb?a=1"},
+		{"/user2/repo1/blob/123456/%20?a=1", "/user2/repo1/src/commit/123456/%20?a=1"},
+		{"/user/avatar/GhosT/-1", "/assets/img/avatar_default.png"},
+		{"/user/avatar/Gitea-ActionS/0", "/assets/img/avatar_default.png"},
+		{"/api/v1/swagger", "/api/swagger"},
 	}
-	for link, redirectLink := range redirects {
-		req := NewRequest(t, "GET", link)
+	for _, c := range redirects {
+		req := NewRequest(t, "GET", c.from)
 		resp := MakeRequest(t, req, http.StatusSeeOther)
-		assert.EqualValues(t, path.Join(setting.AppSubURL, redirectLink), test.RedirectURL(resp))
+		assert.Equal(t, path.Join(setting.AppSubURL, c.to), test.RedirectURL(resp))
 	}
 }
 
-func TestNoLoginNotExist(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-
+func testLinksNoLoginNotExist(t *testing.T) {
 	links := []string{
 		"/user5/repo4/projects",
 		"/user5/repo4/projects/3",
@@ -78,7 +133,8 @@ func TestNoLoginNotExist(t *testing.T) {
 	}
 }
 
-func testLinksAsUser(userName string, t *testing.T) {
+func testLinksAsUser(t *testing.T) {
+	session := loginUser(t, "user2")
 	links := []string{
 		"/explore/repos",
 		"/explore/repos?q=test",
@@ -117,6 +173,7 @@ func testLinksAsUser(userName string, t *testing.T) {
 		"/user2",
 		"/user2?tab=stars",
 		"/user2?tab=activity",
+		"/user2?tab=organizations",
 		"/user/settings",
 		"/user/settings/account",
 		"/user/settings/security",
@@ -126,18 +183,13 @@ func testLinksAsUser(userName string, t *testing.T) {
 		"/user/settings/repos",
 	}
 
-	session := loginUser(t, userName)
 	for _, link := range links {
-		req := NewRequest(t, "GET", link)
-		session.MakeRequest(t, req, http.StatusOK)
+		assertLinkPageComplete(t, session, link)
 	}
 
-	reqAPI := NewRequestf(t, "GET", "/api/v1/users/%s/repos", userName)
+	reqAPI := NewRequestf(t, "GET", "/api/v1/users/user2/repos")
 	respAPI := MakeRequest(t, reqAPI, http.StatusOK)
-
-	var apiRepos []*api.Repository
-	DecodeJSON(t, respAPI, &apiRepos)
-
+	apiRepos := DecodeJSON(t, respAPI, []*api.Repository{})
 	repoLinks := []string{
 		"",
 		"/issues",
@@ -160,49 +212,41 @@ func testLinksAsUser(userName string, t *testing.T) {
 		"/wiki/?action=_new",
 		"/activity",
 	}
-
 	for _, repo := range apiRepos {
 		for _, link := range repoLinks {
-			req := NewRequest(t, "GET", fmt.Sprintf("/%s/%s%s", userName, repo.Name, link))
-			session.MakeRequest(t, req, http.StatusOK)
+			link = fmt.Sprintf("/user2/%s%s", repo.Name, link)
+			assertLinkPageComplete(t, session, link)
 		}
 	}
 }
 
-func TestLinksLogin(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-
-	testLinksAsUser("user2", t)
-}
-
-func TestRepoLinks(t *testing.T) {
-	defer tests.PrepareTestEnv(t)()
-
+func testLinksRepoCommon(t *testing.T) {
 	// repo1 has enabled almost features, so we can test most links
 	repoLink := "/user2/repo1"
-	links := []string{
-		"/actions",
-		"/packages",
-		"/projects",
+
+	err := db.Insert(t.Context(), &actions.ActionRun{Title: "", RepoID: 1})
+	require.NoError(t, err)
+
+	links := map[string][]string{
+		"/actions":  {"(empty commit message)"},
+		"/packages": {},
+		"/projects": {},
 	}
 
 	// anonymous user
-	for _, link := range links {
-		req := NewRequest(t, "GET", repoLink+link)
-		MakeRequest(t, req, http.StatusOK)
+	for link, strs := range links {
+		assertLinkPageComplete(t, nil, repoLink+link, strs...)
 	}
 
 	// admin/owner user
 	session := loginUser(t, "user1")
-	for _, link := range links {
-		req := NewRequest(t, "GET", repoLink+link)
-		session.MakeRequest(t, req, http.StatusOK)
+	for link, strs := range links {
+		assertLinkPageComplete(t, session, repoLink+link, strs...)
 	}
 
 	// non-admin non-owner user
 	session = loginUser(t, "user2")
-	for _, link := range links {
-		req := NewRequest(t, "GET", repoLink+link)
-		session.MakeRequest(t, req, http.StatusOK)
+	for link, strs := range links {
+		assertLinkPageComplete(t, session, repoLink+link, strs...)
 	}
 }

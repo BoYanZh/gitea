@@ -1,0 +1,176 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package integration
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	pingv1 "gitea.dev/actionslib/ping/v1"
+	"gitea.dev/actionslib/ping/v1/pingv1connect"
+	runnerv1 "gitea.dev/actionslib/runner/v1"
+	"gitea.dev/actionslib/runner/v1/runnerv1connect"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/modules/setting"
+
+	"connectrpc.com/connect"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type mockRunner struct {
+	client *mockRunnerClient
+}
+
+type mockRunnerClient struct {
+	pingServiceClient   pingv1connect.PingServiceClient
+	runnerServiceClient runnerv1connect.RunnerServiceClient
+}
+
+func newMockRunner() *mockRunner {
+	client := newMockRunnerClient("", "")
+	return &mockRunner{client: client}
+}
+
+func newMockRunnerClient(uuid, token string) *mockRunnerClient {
+	baseURL := setting.AppURL + "api/actions"
+
+	opt := connect.WithInterceptors(connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			if uuid != "" {
+				req.Header().Set("x-runner-uuid", uuid)
+			}
+			if token != "" {
+				req.Header().Set("x-runner-token", token)
+			}
+			return next(ctx, req)
+		}
+	}))
+
+	client := &mockRunnerClient{
+		pingServiceClient:   pingv1connect.NewPingServiceClient(http.DefaultClient, baseURL, opt),
+		runnerServiceClient: runnerv1connect.NewRunnerServiceClient(http.DefaultClient, baseURL, opt),
+	}
+
+	return client
+}
+
+func (r *mockRunner) doPing(t *testing.T) {
+	resp, err := r.client.pingServiceClient.Ping(t.Context(), connect.NewRequest(&pingv1.PingRequest{
+		Data: "mock-runner",
+	}))
+	assert.NoError(t, err)
+	assert.Equal(t, "Hello, mock-runner!", resp.Msg.Data)
+}
+
+func (r *mockRunner) doRegister(t *testing.T, name, token string, labels []string, ephemeral bool) {
+	r.doPing(t)
+	resp, err := r.client.runnerServiceClient.Register(t.Context(), connect.NewRequest(&runnerv1.RegisterRequest{
+		Name:      name,
+		Token:     token,
+		Version:   "mock-runner-version",
+		Labels:    labels,
+		Ephemeral: ephemeral,
+	}))
+	assert.NoError(t, err)
+	r.client = newMockRunnerClient(resp.Msg.Runner.Uuid, resp.Msg.Runner.Token)
+}
+
+func (r *mockRunner) registerAsRepoRunner(t *testing.T, ownerName, repoName, runnerName string, labels []string, ephemeral bool) {
+	session := loginUser(t, ownerName)
+	token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+	req := NewRequest(t, http.MethodPost, fmt.Sprintf("/api/v1/repos/%s/%s/actions/runners/registration-token", ownerName, repoName)).AddTokenAuth(token)
+	resp := MakeRequest(t, req, http.StatusOK)
+	registrationToken := DecodeJSON(t, resp, &struct {
+		Token string `json:"token"`
+	}{})
+	r.doRegister(t, runnerName, registrationToken.Token, labels, ephemeral)
+}
+
+func (r *mockRunner) fetchTask(t *testing.T, timeout ...time.Duration) *runnerv1.Task {
+	task := r.tryFetchTask(t, timeout...)
+	require.NotNil(t, task, "failed to fetch a task")
+	return task
+}
+
+func (r *mockRunner) fetchNoTask(t *testing.T) {
+	task, _ := r.fetchTaskOnce(t, 0)
+	require.Nil(t, task, "a task is fetched")
+}
+
+const defaultFetchTaskTimeout = 1 * time.Second
+
+func (r *mockRunner) tryFetchTask(t *testing.T, timeout ...time.Duration) *runnerv1.Task {
+	fetchTimeout := defaultFetchTaskTimeout
+	if len(timeout) > 0 {
+		fetchTimeout = timeout[0]
+	}
+	ddl := time.Now().Add(fetchTimeout)
+	var task *runnerv1.Task
+	for time.Now().Before(ddl) {
+		task, _ = r.fetchTaskOnce(t, 0)
+		if task != nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	return task
+}
+
+// fetchTaskOnce performs a single FetchTask request with the given TasksVersion
+// and returns the task (if any) and the TasksVersion from the response.
+// Used to verify the production path where the runner sends the current version.
+func (r *mockRunner) fetchTaskOnce(t *testing.T, tasksVersion int64) (*runnerv1.Task, int64) {
+	resp, err := r.client.runnerServiceClient.FetchTask(t.Context(), connect.NewRequest(&runnerv1.FetchTaskRequest{
+		TasksVersion: tasksVersion,
+	}))
+	require.NoError(t, err)
+	return resp.Msg.Task, resp.Msg.TasksVersion
+}
+
+type mockTaskOutcome struct {
+	result  runnerv1.Result
+	outputs map[string]string
+	logRows []*runnerv1.LogRow
+}
+
+func (r *mockRunner) execTask(t *testing.T, task *runnerv1.Task, outcome *mockTaskOutcome) {
+	for idx, lr := range outcome.logRows {
+		resp, err := r.client.runnerServiceClient.UpdateLog(t.Context(), connect.NewRequest(&runnerv1.UpdateLogRequest{
+			TaskId: task.Id,
+			Index:  int64(idx),
+			Rows:   []*runnerv1.LogRow{lr},
+			NoMore: idx == len(outcome.logRows)-1,
+		}))
+		assert.NoError(t, err)
+		assert.EqualValues(t, idx+1, resp.Msg.AckIndex)
+	}
+	sentOutputKeys := make([]string, 0, len(outcome.outputs))
+	for outputKey, outputValue := range outcome.outputs {
+		resp, err := r.client.runnerServiceClient.UpdateTask(t.Context(), connect.NewRequest(&runnerv1.UpdateTaskRequest{
+			State: &runnerv1.TaskState{
+				Id:     task.Id,
+				Result: runnerv1.Result_RESULT_UNSPECIFIED,
+			},
+			Outputs: map[string]string{outputKey: outputValue},
+		}))
+		assert.NoError(t, err)
+		sentOutputKeys = append(sentOutputKeys, outputKey)
+		assert.ElementsMatch(t, sentOutputKeys, resp.Msg.SentOutputs)
+	}
+	resp, err := r.client.runnerServiceClient.UpdateTask(t.Context(), connect.NewRequest(&runnerv1.UpdateTaskRequest{
+		State: &runnerv1.TaskState{
+			Id:        task.Id,
+			Result:    outcome.result,
+			StoppedAt: timestamppb.Now(),
+		},
+	}))
+	assert.NoError(t, err)
+	assert.Equal(t, outcome.result, resp.Msg.State.Result)
+}

@@ -12,12 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/modules/assetfs"
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/httpcache"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/modules/assetfs"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/httpcache"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+
+	"github.com/go-chi/cors"
 )
 
 func CustomAssets() *assetfs.Layer {
@@ -28,15 +30,24 @@ func AssetFS() *assetfs.LayeredFS {
 	return assetfs.Layered(CustomAssets(), BuiltinAssets())
 }
 
+func AssetsCors() func(next http.Handler) http.Handler {
+	// static assets need to be served for external renders (sandboxed)
+	return cors.Handler(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"HEAD", "GET"},
+		MaxAge:         3600 * 24,
+	})
+}
+
 // FileHandlerFunc implements the static handler for serving files in "public" assets
 func FileHandlerFunc() http.HandlerFunc {
 	assetFS := AssetFS()
 	return func(resp http.ResponseWriter, req *http.Request) {
-		if req.Method != "GET" && req.Method != "HEAD" {
+		if req.Method != http.MethodGet && req.Method != http.MethodHead {
 			resp.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handleRequest(resp, req, assetFS, req.URL.Path)
+		handleRequest(resp, req, http.FS(assetFS), req.URL.Path)
 	}
 }
 
@@ -44,16 +55,16 @@ func FileHandlerFunc() http.HandlerFunc {
 func parseAcceptEncoding(val string) container.Set[string] {
 	parts := strings.Split(val, ";")
 	types := make(container.Set[string])
-	for _, v := range strings.Split(parts[0], ",") {
+	for v := range strings.SplitSeq(parts[0], ",") {
 		types.Add(strings.TrimSpace(v))
 	}
 	return types
 }
 
 // setWellKnownContentType will set the Content-Type if the file is a well-known type.
-// See the comments of detectWellKnownMimeType
+// See the comments of DetectWellKnownMimeType
 func setWellKnownContentType(w http.ResponseWriter, file string) {
-	mimeType := detectWellKnownMimeType(path.Ext(file))
+	mimeType := DetectWellKnownMimeType(path.Ext(file))
 	if mimeType != "" {
 		w.Header().Set("Content-Type", mimeType)
 	}
@@ -86,33 +97,28 @@ func handleRequest(w http.ResponseWriter, req *http.Request, fs http.FileSystem,
 		return
 	}
 
-	serveContent(w, req, fi, fi.ModTime(), f)
+	servePublicAsset(w, req, fi, fi.ModTime(), f)
 }
 
-type GzipBytesProvider interface {
-	GzipBytes() []byte
-}
-
-// serveContent serve http content
-func serveContent(w http.ResponseWriter, req *http.Request, fi os.FileInfo, modtime time.Time, content io.ReadSeeker) {
+// servePublicAsset serve http content
+func servePublicAsset(w http.ResponseWriter, req *http.Request, fi os.FileInfo, modtime time.Time, content io.ReadSeeker) {
 	setWellKnownContentType(w, fi.Name())
-
+	httpcache.SetCacheControlInHeader(w.Header(), httpcache.CacheControlForPublicStatic())
 	encodings := parseAcceptEncoding(req.Header.Get("Accept-Encoding"))
-	if encodings.Contains("gzip") {
-		// try to provide gzip content directly from bindata (provided by vfsgen۰CompressedFileInfo)
-		if compressed, ok := fi.(GzipBytesProvider); ok {
-			rdGzip := bytes.NewReader(compressed.GzipBytes())
+	fiEmbedded, _ := fi.(assetfs.EmbeddedFileInfo)
+	if encodings.Contains("gzip") && fiEmbedded != nil {
+		// try to provide gzip content directly from bindata
+		if gzipBytes, ok := fiEmbedded.GetGzipContent(); ok {
+			rdGzip := bytes.NewReader(gzipBytes)
 			// all gzipped static files (from bindata) are managed by Gitea, so we can make sure every file has the correct ext name
 			// then we can get the correct Content-Type, we do not need to do http.DetectContentType on the decompressed data
 			if w.Header().Get("Content-Type") == "" {
 				w.Header().Set("Content-Type", "application/octet-stream")
 			}
 			w.Header().Set("Content-Encoding", "gzip")
-			httpcache.ServeContentWithCacheControl(w, req, fi.Name(), modtime, rdGzip)
+			http.ServeContent(w, req, fi.Name(), modtime, rdGzip)
 			return
 		}
 	}
-
-	httpcache.ServeContentWithCacheControl(w, req, fi.Name(), modtime, content)
-	return
+	http.ServeContent(w, req, fi.Name(), modtime, content)
 }

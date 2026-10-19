@@ -6,15 +6,15 @@ package globallock
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"code.gitea.io/gitea/modules/nosql"
+	"gitea.dev/modules/nosql"
 
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/redis/go-redis/v9"
 )
 
 const redisLockKeyPrefix = "gitea:globallock:"
@@ -24,7 +24,8 @@ const redisLockKeyPrefix = "gitea:globallock:"
 var redisLockExpiry = 30 * time.Second
 
 type redisLocker struct {
-	rs *redsync.Redsync
+	conn redis.UniversalClient
+	rs   *redsync.Redsync
 
 	mutexM   sync.Map
 	closed   atomic.Bool
@@ -34,17 +35,13 @@ type redisLocker struct {
 var _ Locker = &redisLocker{}
 
 func NewRedisLocker(connection string) Locker {
+	conn := nosql.GetManager().GetRedisClient(connection)
 	l := &redisLocker{
-		rs: redsync.New(
-			goredis.NewPool(
-				nosql.GetManager().GetRedisClient(connection),
-			),
-		),
+		conn: conn,
+		rs:   redsync.New(goredis.NewPool(conn)),
 	}
-
 	l.extendWg.Add(1)
 	l.startExtend()
-
 	return l
 }
 
@@ -55,11 +52,10 @@ func (l *redisLocker) Lock(ctx context.Context, key string) (ReleaseFunc, error)
 func (l *redisLocker) TryLock(ctx context.Context, key string) (bool, ReleaseFunc, error) {
 	f, err := l.lock(ctx, key, 1)
 
-	var (
-		errTaken     *redsync.ErrTaken
-		errNodeTaken *redsync.ErrNodeTaken
-	)
-	if errors.As(err, &errTaken) || errors.As(err, &errNodeTaken) {
+	if _, taken := errors.AsType[*redsync.ErrTaken](err); taken {
+		return false, f, nil
+	}
+	if _, nodeTaken := errors.AsType[*redsync.ErrNodeTaken](err); nodeTaken {
 		return false, f, nil
 	}
 	return err == nil, f, err
@@ -78,7 +74,7 @@ func (l *redisLocker) Close() error {
 
 func (l *redisLocker) lock(ctx context.Context, key string, tries int) (ReleaseFunc, error) {
 	if l.closed.Load() {
-		return func() {}, fmt.Errorf("locker is closed")
+		return func() {}, errors.New("locker is closed")
 	}
 
 	options := []redsync.Option{
@@ -115,7 +111,7 @@ func (l *redisLocker) startExtend() {
 
 	toExtend := make([]*redsync.Mutex, 0)
 	l.mutexM.Range(func(_, value any) bool {
-		m := value.(*redsync.Mutex)
+		m := value.(*redsync.Mutex) //nolint:forcetypeassert // mutexM only ever holds *redsync.Mutex
 
 		// Extend the lock if it is not expired.
 		// Although the mutex will be removed from the map before it is released,

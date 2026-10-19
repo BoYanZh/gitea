@@ -1,57 +1,59 @@
 import {emojiKeys, emojiHTML, emojiString} from './emoji.ts';
-import {htmlEscape} from 'escape-goat';
+import {html, htmlRaw} from '../utils/html.ts';
+import {fetchMentions} from '../utils/match.ts';
+import Tribute, {type TributeCollection} from 'tributejs';
+import type {Mention} from '../types.ts';
 
-function makeCollections({mentions, emoji}) {
-  const collections = [];
+export function attachTribute(element: HTMLElement) {
+  const mentionsUrl = element.closest('[data-mentions-url]')?.getAttribute('data-mentions-url');
 
-  if (emoji) {
-    collections.push({
-      trigger: ':',
-      requireLeadingSpace: true,
-      values: (query, cb) => {
-        const matches = [];
-        for (const name of emojiKeys) {
-          if (name.includes(query)) {
-            matches.push(name);
-            if (matches.length > 5) break;
-          }
+  const emojiCollection: TributeCollection<string> = { // emojis
+    trigger: ':',
+    requireLeadingSpace: true,
+    values: (query: string, cb: (matches: Array<string>) => void) => {
+      const matches = [];
+      for (const name of emojiKeys) {
+        if (name.includes(query)) {
+          matches.push(name);
+          if (matches.length > 5) break;
         }
-        cb(matches);
-      },
-      lookup: (item) => item,
-      selectTemplate: (item) => {
-        if (item === undefined) return null;
-        return emojiString(item.original);
-      },
-      menuItemTemplate: (item) => {
-        return `<div class="tribute-item">${emojiHTML(item.original)}<span>${htmlEscape(item.original)}</span></div>`;
-      },
-    });
-  }
+      }
+      cb(matches);
+    },
+    lookup: (item) => item,
+    selectTemplate: (item) => {
+      if (item === undefined) return '';
+      return emojiString(item.original) ?? '';
+    },
+    menuItemTemplate: (item) => {
+      return html`<div class="tribute-item">${htmlRaw(emojiHTML(item.original))}<span>${item.original}</span></div>`;
+    },
+  };
 
-  if (mentions) {
-    collections.push({
-      values: window.config.mentionValues ?? [],
-      requireLeadingSpace: true,
-      menuItemTemplate: (item) => {
-        return `
-          <div class="tribute-item">
-            <img src="${htmlEscape(item.original.avatar)}" width="21" height="21"/>
-            <span class="name">${htmlEscape(item.original.name)}</span>
-            ${item.original.fullname && item.original.fullname !== '' ? `<span class="fullname">${htmlEscape(item.original.fullname)}</span>` : ''}
-          </div>
-        `;
-      },
-    });
-  }
+  const mentionCollection: TributeCollection<Mention> = {
+    values: async (_query: string, cb: (matches: Mention[]) => void) => { // eslint-disable-line @typescript-eslint/no-misused-promises -- tributejs ignores the returned promise, results arrive via the callback
+      cb(mentionsUrl ? await fetchMentions(mentionsUrl) : []);
+    },
+    requireLeadingSpace: true,
+    menuItemTemplate: (item) => {
+      const fullNameHtml = item.original.fullname && item.original.fullname !== '' ? html`<span class="fullname">${item.original.fullname}</span>` : '';
+      return html`
+        <div class="tribute-item">
+          <img alt src="${item.original.avatar}" width="21" height="21"/>
+          <span class="name">${item.original.name}</span>
+          ${htmlRaw(fullNameHtml)}
+        </div>
+      `;
+    },
+  };
 
-  return collections;
-}
-
-export async function attachTribute(element, {mentions, emoji} = {}) {
-  const {default: Tribute} = await import(/* webpackChunkName: "tribute" */'tributejs');
-  const collections = makeCollections({mentions, emoji});
-  const tribute = new Tribute({collection: collections, noMatchTemplate: ''});
+  const tribute = new Tribute({
+    collection: [
+      emojiCollection,
+      mentionCollection,
+    ] as TributeCollection<any>[],
+    noMatchTemplate: () => '',
+  });
   tribute.attach(element);
   return tribute;
 }

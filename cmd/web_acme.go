@@ -6,16 +6,19 @@ package cmd
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 
-	"code.gitea.io/gitea/modules/graceful"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/process"
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/process"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 
 	"github.com/caddyserver/certmagic"
 )
@@ -54,8 +57,6 @@ func runACME(listenAddr string, m http.Handler) error {
 		altTLSALPNPort = p
 	}
 
-	magic := certmagic.NewDefault()
-	magic.Storage = &certmagic.FileStorage{Path: setting.AcmeLiveDirectory}
 	// Try to use private CA root if provided, otherwise defaults to system's trust
 	var certPool *x509.CertPool
 	if setting.AcmeCARoot != "" {
@@ -65,45 +66,54 @@ func runACME(listenAddr string, m http.Handler) error {
 			log.Warn("Failed to parse CA Root certificate, using default CA trust: %v", err)
 		}
 	}
-	myACME := certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
-		CA:                      setting.AcmeURL,
+	// FIXME: this path is not right, it uses "AppWorkPath" incorrectly, and writes the data into "AppWorkPath/https"
+	// Ideally it should migrate to AppDataPath write to "AppDataPath/https"
+	// And one more thing, no idea why we should set the global default variables here
+	// But it seems that the current ACME code needs these global variables to make renew work.
+	// Otherwise, "renew" will use incorrect storage path
+	oldDefaultACME := certmagic.DefaultACME
+	certmagic.Default.Storage = &certmagic.FileStorage{Path: setting.AcmeLiveDirectory}
+	certmagic.DefaultACME = certmagic.ACMEIssuer{
+		// try to use the default values provided by DefaultACME
+		CA:        util.IfZero(setting.AcmeURL, oldDefaultACME.CA),
+		TestCA:    oldDefaultACME.TestCA,
+		Logger:    oldDefaultACME.Logger,
+		HTTPProxy: oldDefaultACME.HTTPProxy,
+
 		TrustedRoots:            certPool,
 		Email:                   setting.AcmeEmail,
 		Agreed:                  setting.AcmeTOS,
+		Profile:                 setting.AcmeProfile,
 		DisableHTTPChallenge:    !enableHTTPChallenge,
 		DisableTLSALPNChallenge: !enableTLSALPNChallenge,
 		ListenHost:              setting.HTTPAddr,
 		AltTLSALPNPort:          altTLSALPNPort,
 		AltHTTPPort:             altHTTPPort,
-	})
+	}
 
+	magic := certmagic.NewDefault()
+	myACME := certmagic.NewACMEIssuer(magic, certmagic.DefaultACME)
 	magic.Issuers = []certmagic.Issuer{myACME}
 
-	// this obtains certificates or renews them if necessary
-	err := magic.ManageSync(graceful.GetManager().HammerContext(), []string{setting.Domain})
+	// Obtain certificates or renew them if necessary. ManageSync fails closed on
+	// renewal errors even when a still-valid certificate is already on disk, which
+	// takes HTTPS down on restart (https://github.com/go-gitea/gitea/issues/38519).
+	// Prefer keeping the existing cert and retrying renewals asynchronously.
+	ctx := graceful.GetManager().ShutdownContext()
+	err := magic.ManageSync(ctx, []string{setting.AppDomain})
 	if err != nil {
-		return err
+		cert, cacheErr := magic.CacheManagedCertificate(ctx, setting.AppDomain)
+		if cacheErr != nil || cert.Expired() {
+			return errors.Join(err, cacheErr)
+		}
+		log.Error("ACME certificate manage failed; continuing with existing certificate: %v", err)
+		if err := magic.ManageAsync(ctx, []string{setting.AppDomain}); err != nil {
+			log.Error("Failed to start async ACME management: %v", err)
+		}
 	}
 
-	tlsConfig := magic.TLSConfig()
-	tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
-
-	if version := toTLSVersion(setting.SSLMinimumVersion); version != 0 {
-		tlsConfig.MinVersion = version
-	}
-	if version := toTLSVersion(setting.SSLMaximumVersion); version != 0 {
-		tlsConfig.MaxVersion = version
-	}
-
-	// Set curve preferences
-	if curves := toCurvePreferences(setting.SSLCurvePreferences); len(curves) > 0 {
-		tlsConfig.CurvePreferences = curves
-	}
-
-	// Set cipher suites
-	if ciphers := toTLSCiphers(setting.SSLCipherSuites); len(ciphers) > 0 {
-		tlsConfig.CipherSuites = ciphers
-	}
+	// certmagic only advertises its own ACME challenge protocol, applyTLSSettings appends ours
+	tlsConfig := applyTLSSettings(magic.TLSConfig())
 
 	if enableHTTPChallenge {
 		go func() {
@@ -111,8 +121,8 @@ func runACME(listenAddr string, m http.Handler) error {
 			defer finished()
 
 			log.Info("Running Let's Encrypt handler on %s", setting.HTTPAddr+":"+setting.PortToRedirect)
-			// all traffic coming into HTTP will be redirect to HTTPS automatically (LE HTTP-01 validation happens here)
-			err := runHTTP("tcp", setting.HTTPAddr+":"+setting.PortToRedirect, "Let's Encrypt HTTP Challenge", myACME.HTTPChallengeHandler(http.HandlerFunc(runLetsEncryptFallbackHandler)), setting.RedirectorUseProxyProtocol)
+			// all traffic coming into HTTP will be redirected to HTTPS automatically (LE HTTP-01 validation happens here)
+			err := runHTTP("tcp", net.JoinHostPort(setting.HTTPAddr, setting.PortToRedirect), "Let's Encrypt HTTP Challenge", myACME.HTTPChallengeHandler(http.HandlerFunc(runLetsEncryptFallbackHandler)), setting.RedirectorUseProxyProtocol)
 			if err != nil {
 				log.Fatal("Failed to start the Let's Encrypt handler on port %s: %v", setting.PortToRedirect, err)
 			}
@@ -123,7 +133,7 @@ func runACME(listenAddr string, m http.Handler) error {
 }
 
 func runLetsEncryptFallbackHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" && r.Method != "HEAD" {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "Use HTTPS", http.StatusBadRequest)
 		return
 	}

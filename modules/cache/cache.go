@@ -4,13 +4,15 @@
 package cache
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
-	"code.gitea.io/gitea/modules/setting"
-
-	_ "gitea.com/go-chi/cache/memcache" //nolint:depguard // memcache plugin for cache, it is required for config "ADAPTER=memcache"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
 var defaultCache StringCache
@@ -22,7 +24,7 @@ func Init() error {
 		if err != nil {
 			return err
 		}
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			if err = c.Ping(); err == nil {
 				break
 			}
@@ -37,16 +39,21 @@ func Init() error {
 }
 
 const (
-	testCacheKey       = "DefaultCache.TestKey"
-	SlowCacheThreshold = 100 * time.Microsecond
+	testCacheKey = "DefaultCache.TestKey"
+	// SlowCacheThreshold marks cache tests as slow
+	// set to 30ms per discussion: https://github.com/go-gitea/gitea/issues/33190
+	// TODO: Replace with metrics histogram
+	SlowCacheThreshold = 30 * time.Millisecond
 )
 
+// Test performs delete, put and get operations on a predefined key
+// returns
 func Test() (time.Duration, error) {
 	if defaultCache == nil {
-		return 0, fmt.Errorf("default cache not initialized")
+		return 0, errors.New("default cache not initialized")
 	}
 
-	testData := fmt.Sprintf("%x", make([]byte, 500))
+	testData := hex.EncodeToString(make([]byte, 500))
 
 	start := time.Now()
 
@@ -58,10 +65,10 @@ func Test() (time.Duration, error) {
 	}
 	testVal, hit := defaultCache.Get(testCacheKey)
 	if !hit {
-		return 0, fmt.Errorf("expect cache hit but got none")
+		return 0, errors.New("expect cache hit but got none")
 	}
 	if testVal != testData {
-		return 0, fmt.Errorf("expect cache to return same value as stored but got other")
+		return 0, errors.New("expect cache to return same value as stored but got other")
 	}
 
 	return time.Since(start), nil
@@ -74,7 +81,7 @@ func GetCache() StringCache {
 
 // GetString returns the key value from cache with callback when no key exists in cache
 func GetString(key string, getFunc func() (string, error)) (string, error) {
-	if defaultCache == nil || setting.CacheService.TTL == 0 {
+	if defaultCache == nil || setting.CacheService.TTL <= 0 {
 		return getFunc()
 	}
 	cached, exist := defaultCache.Get(key)
@@ -109,4 +116,31 @@ func Remove(key string) {
 		return
 	}
 	_ = defaultCache.Delete(key)
+}
+
+// SafeCacheKey returns a cache-safe key for the input string
+// Some caches like memcached have char & length limits.
+// Caller must make sure the prefix is valid and well-designed.
+// If prefix is already too long, the returned key will still exceed the limit, then just let the cache report an error.
+func SafeCacheKey(prefix, input string) string {
+	// memcached has a limit 250 for key length, so we use 230 to leave some room for other prefixes and separators
+	return safeCacheKey(prefix, input, 230)
+}
+
+func safeCacheKey(prefix, input string, limit int) string {
+	safeAsKey := len(prefix)+len(input)+3 <= limit
+	if safeAsKey {
+		for i := 0; i < len(input); i++ {
+			if c := input[i]; c <= ' ' || c >= 127 {
+				safeAsKey = false
+				break
+			}
+		}
+	}
+	sep, key := ":s-", input
+	if !safeAsKey {
+		hashBytes := sha256.Sum256(util.UnsafeStringToBytes(input))
+		sep, key = ":h-", hex.EncodeToString(hashBytes[:])
+	}
+	return prefix + sep + key
 }

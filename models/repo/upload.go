@@ -10,14 +10,13 @@ import (
 	"io"
 	"mime/multipart"
 	"os"
-	"path"
+	"path/filepath"
+	"uuid"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-
-	gouuid "github.com/google/uuid"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
 // ErrUploadNotExist represents a "UploadNotExist" kind of error.
@@ -51,25 +50,21 @@ func init() {
 	db.RegisterModel(new(Upload))
 }
 
-// UploadLocalPath returns where uploads is stored in local file system based on given UUID.
-func UploadLocalPath(uuid string) string {
-	return path.Join(setting.Repository.Upload.TempPath, uuid[0:1], uuid[1:2], uuid)
-}
-
-// LocalPath returns where uploads are temporarily stored in local file system.
+// LocalPath returns where uploads are temporarily stored in local file system based on given UUID.
 func (upload *Upload) LocalPath() string {
-	return UploadLocalPath(upload.UUID)
+	uuid := upload.UUID
+	return setting.AppDataTempDir("repo-uploads").JoinPath(uuid[0:1], uuid[1:2], uuid)
 }
 
 // NewUpload creates a new upload object.
 func NewUpload(ctx context.Context, name string, buf []byte, file multipart.File) (_ *Upload, err error) {
 	upload := &Upload{
-		UUID: gouuid.New().String(),
+		UUID: uuid.New().String(),
 		Name: name,
 	}
 
 	localPath := upload.LocalPath()
-	if err = os.MkdirAll(path.Dir(localPath), os.ModePerm); err != nil {
+	if err = os.MkdirAll(filepath.Dir(localPath), os.ModePerm); err != nil {
 		return nil, fmt.Errorf("MkdirAll: %w", err)
 	}
 
@@ -121,36 +116,19 @@ func DeleteUploads(ctx context.Context, uploads ...*Upload) (err error) {
 		return nil
 	}
 
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-
 	ids := make([]int64, len(uploads))
-	for i := 0; i < len(uploads); i++ {
+	for i := range uploads {
 		ids[i] = uploads[i].ID
 	}
 	if err = db.DeleteByIDs[Upload](ctx, ids...); err != nil {
 		return fmt.Errorf("delete uploads: %w", err)
 	}
 
-	if err = committer.Commit(); err != nil {
-		return err
-	}
-
 	for _, upload := range uploads {
 		localPath := upload.LocalPath()
-		isFile, err := util.IsFile(localPath)
-		if err != nil {
-			log.Error("Unable to check if %s is a file. Error: %v", localPath, err)
-		}
-		if !isFile {
-			continue
-		}
-
-		if err := util.Remove(localPath); err != nil {
-			return fmt.Errorf("remove upload: %w", err)
+		if err := util.RemoveWithRetry(localPath); err != nil {
+			// just continue, don't fail the whole operation if a file is missing (removed by others)
+			log.Error("unable to remove upload file %s: %v", localPath, err)
 		}
 	}
 

@@ -7,10 +7,10 @@ import (
 	"encoding/base64"
 	"net/http"
 
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/context"
-	user_service "code.gitea.io/gitea/services/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	user_service "gitea.dev/services/user"
 )
 
 // UpdateAvatarupdates the Avatar of an Organisation
@@ -35,17 +35,17 @@ func UpdateAvatar(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
-	form := web.GetForm(ctx).(*api.UpdateUserAvatarOption)
+	form := web.GetForm[*api.UpdateUserAvatarOption](ctx)
 
 	content, err := base64.StdEncoding.DecodeString(form.Image)
 	if err != nil {
-		ctx.Error(http.StatusBadRequest, "DecodeImage", err)
+		ctx.APIError(http.StatusBadRequest, err.Error())
 		return
 	}
 
 	err = user_service.UploadAvatar(ctx, ctx.Org.Organization.AsUser(), content)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "UploadAvatar", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -72,7 +72,7 @@ func DeleteAvatar(ctx *context.APIContext) {
 	//     "$ref": "#/responses/notFound"
 	err := user_service.DeleteAvatar(ctx, ctx.Org.Organization.AsUser())
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteAvatar", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 

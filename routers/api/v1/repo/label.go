@@ -8,13 +8,13 @@ import (
 	"net/http"
 	"strconv"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/modules/label"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/modules/label"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // ListLabels list all the labels of a repository
@@ -51,13 +51,13 @@ func ListLabels(ctx *context.APIContext) {
 
 	labels, err := issues_model.GetLabelsByRepoID(ctx, ctx.Repo.Repository.ID, ctx.FormString("sort"), utils.GetListOptions(ctx))
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetLabelsByRepoID", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
 	count, err := issues_model.CountLabelsByRepoID(ctx, ctx.Repo.Repository.ID)
 	if err != nil {
-		ctx.InternalServerError(err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -99,18 +99,14 @@ func GetLabel(ctx *context.APIContext) {
 		l   *issues_model.Label
 		err error
 	)
-	strID := ctx.PathParam(":id")
+	strID := ctx.PathParam("id")
 	if intID, err2 := strconv.ParseInt(strID, 10, 64); err2 != nil {
 		l, err = issues_model.GetLabelInRepoByName(ctx, ctx.Repo.Repository.ID, strID)
 	} else {
 		l, err = issues_model.GetLabelInRepoByID(ctx, ctx.Repo.Repository.ID, intID)
 	}
 	if err != nil {
-		if issues_model.IsErrRepoLabelNotExist(err) {
-			ctx.NotFound()
-		} else {
-			ctx.Error(http.StatusInternalServerError, "GetLabelByRepoID", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
 
@@ -149,11 +145,11 @@ func CreateLabel(ctx *context.APIContext) {
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
-	form := web.GetForm(ctx).(*api.CreateLabelOption)
+	form := web.GetForm[*api.CreateLabelOption](ctx)
 
 	color, err := label.NormalizeColor(form.Color)
 	if err != nil {
-		ctx.Error(http.StatusUnprocessableEntity, "StringToColor", err)
+		ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 	form.Color = color
@@ -166,7 +162,7 @@ func CreateLabel(ctx *context.APIContext) {
 	}
 	l.SetArchived(form.IsArchived)
 	if err := issues_model.NewLabel(ctx, l); err != nil {
-		ctx.Error(http.StatusInternalServerError, "NewLabel", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -211,14 +207,10 @@ func EditLabel(ctx *context.APIContext) {
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
-	form := web.GetForm(ctx).(*api.EditLabelOption)
-	l, err := issues_model.GetLabelInRepoByID(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":id"))
+	form := web.GetForm[*api.EditLabelOption](ctx)
+	l, err := issues_model.GetLabelInRepoByID(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("id"))
 	if err != nil {
-		if issues_model.IsErrRepoLabelNotExist(err) {
-			ctx.NotFound()
-		} else {
-			ctx.Error(http.StatusInternalServerError, "GetLabelByRepoID", err)
-		}
+		ctx.APIErrorAuto(err)
 		return
 	}
 
@@ -231,7 +223,7 @@ func EditLabel(ctx *context.APIContext) {
 	if form.Color != nil {
 		color, err := label.NormalizeColor(*form.Color)
 		if err != nil {
-			ctx.Error(http.StatusUnprocessableEntity, "StringToColor", err)
+			ctx.APIError(http.StatusUnprocessableEntity, err.Error())
 			return
 		}
 		l.Color = color
@@ -241,7 +233,7 @@ func EditLabel(ctx *context.APIContext) {
 	}
 	l.SetArchived(form.IsArchived != nil && *form.IsArchived)
 	if err := issues_model.UpdateLabel(ctx, l); err != nil {
-		ctx.Error(http.StatusInternalServerError, "UpdateLabel", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -276,8 +268,8 @@ func DeleteLabel(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	if err := issues_model.DeleteLabel(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":id")); err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteLabel", err)
+	if err := issues_model.DeleteRepoLabel(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64("id")); err != nil {
+		ctx.APIErrorInternal(err)
 		return
 	}
 

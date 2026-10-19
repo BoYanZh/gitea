@@ -4,29 +4,30 @@
 package integration
 
 import (
-	"net/url"
 	"strings"
 	"testing"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/organization"
-	"code.gitea.io/gitea/models/unittest"
-	user_model "code.gitea.io/gitea/models/user"
-	api "code.gitea.io/gitea/modules/structs"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/unittest"
+	user_model "gitea.dev/models/user"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/tests"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestOrgCounts(t *testing.T) {
-	onGiteaRun(t, testOrgCounts)
+	defer tests.PrepareTestEnv(t)()
+	testOrgCounts(t)
 }
 
-func testOrgCounts(t *testing.T, u *url.URL) {
+func testOrgCounts(t *testing.T) {
 	orgOwner := "user2"
 	orgName := "testOrg"
 	orgCollaborator := "user4"
-	ctx := NewAPITestContext(t, orgOwner, "repo1", auth_model.AccessTokenScopeWriteOrganization)
+	ctx := NewAPITestContext(t, orgOwner, "repo1", auth_model.AccessTokenScopeWriteOrganization, auth_model.AccessTokenScopeWriteRepository)
 
 	var ownerCountRepos map[string]int
 	var collabCountRepos map[string]int
@@ -118,9 +119,9 @@ func doCheckOrgCounts(username string, orgCounts map[string]int, strict bool, ca
 			Name: username,
 		})
 
-		orgs, err := db.Find[organization.Organization](db.DefaultContext, organization.FindOrgOptions{
-			UserID:         user.ID,
-			IncludePrivate: true,
+		orgs, err := db.Find[organization.Organization](t.Context(), organization.FindOrgOptions{
+			UserID:            user.ID,
+			IncludeVisibility: api.VisibleTypePrivate,
 		})
 		assert.NoError(t, err)
 
@@ -130,7 +131,7 @@ func doCheckOrgCounts(username string, orgCounts map[string]int, strict bool, ca
 			calcOrgCounts[org.LowerName] = org.NumRepos
 			count, ok := canonicalCounts[org.LowerName]
 			if ok {
-				assert.True(t, count == org.NumRepos, "Number of Repos in %s is %d when we expected %d", org.Name, org.NumRepos, count)
+				assert.Equal(t, count, org.NumRepos, "Number of Repos in %s is %d when we expected %d", org.Name, org.NumRepos, count)
 			} else {
 				assert.False(t, strict, "Did not expect to see %s with count %d", org.Name, org.NumRepos)
 			}

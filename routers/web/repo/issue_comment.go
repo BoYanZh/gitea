@@ -1,0 +1,345 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"errors"
+	"fmt"
+	"html/template"
+	"net/http"
+	"strconv"
+
+	git_model "gitea.dev/models/git"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/renderhelper"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/setting"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	"gitea.dev/services/forms"
+	issue_service "gitea.dev/services/issue"
+	pull_service "gitea.dev/services/pull"
+)
+
+// NewComment create a comment for issue
+func NewComment(ctx *context.Context) {
+	issue := GetActionIssue(ctx)
+	if issue == nil {
+		return
+	}
+
+	if ctx.HasError() {
+		ctx.JSONError(ctx.GetErrMsg())
+		return
+	}
+
+	form := web.GetForm[*forms.CreateCommentForm](ctx)
+	issueType := util.Iif(issue.IsPull, "pulls", "issues")
+
+	if !ctx.IsSigned || (ctx.Doer.ID != issue.PosterID && !ctx.Repo.Permission.CanReadIssuesOrPulls(issue.IsPull)) {
+		log.Trace("Permission Denied: User %-v not the Poster (ID: %d) and cannot read %s in Repo %-v.\n"+
+			"User in Repo has Permissions: %-+v", ctx.Doer, issue.PosterID, issueType, ctx.Repo.Repository, ctx.Repo.Permission)
+		ctx.HTTPError(http.StatusForbidden)
+		return
+	}
+
+	if issue.IsLocked && !ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull) && !ctx.Doer.IsAdmin {
+		ctx.JSONError(ctx.Tr("repo.issues.comment_on_locked"))
+		return
+	}
+
+	redirect := fmt.Sprintf("%s/%s/%d", ctx.Repo.RepoLink, issueType, issue.Index)
+	attachments := util.Iif(setting.Attachment.Enabled, form.Files, nil)
+
+	// allow empty content if there are attachments
+	if form.Content != "" || len(attachments) > 0 {
+		comment, err := issue_service.CreateIssueComment(ctx, ctx.Doer, ctx.Repo.Repository, issue, form.Content, attachments)
+		if err != nil {
+			if errors.Is(err, user_model.ErrBlockedUser) {
+				ctx.JSONError(ctx.Tr("repo.issues.comment.blocked_user"))
+			} else {
+				ctx.ServerError("CreateIssueComment", err)
+			}
+			return
+		}
+		// redirect to the comment's hashtag
+		redirect += "#" + comment.HashTag()
+	} else if form.Status == "" {
+		// if no status change (close, reopen), it is a plain comment, and content is required
+		// "approve/reject" are handled differently in SubmitReview
+		ctx.JSONError(ctx.Tr("repo.issues.comment_no_content"))
+		return
+	}
+
+	// ATTENTION: From now on, do not use ctx.JSONError, don't return on user error, because the comment has been created.
+	// Always use ctx.Flash.Xxx and then redirect, then the message will be displayed
+	// TODO: need further refactoring to the code below
+
+	// Check if doer can change the status of issue (close, reopen).
+	if (ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull) || (ctx.IsSigned && issue.IsPoster(ctx.Doer.ID))) &&
+		(form.Status == "reopen" || form.Status == "close") &&
+		!(issue.IsPull && issue.PullRequest.HasMerged) {
+		// TODO: move the code to services package, don't make route handler logic so complex
+		// Duplication and conflict check should apply to reopen pull request.
+		var branchOtherUnmergedPR *issues_model.PullRequest
+		var err error
+		if form.Status == "reopen" && issue.IsPull {
+			pull := issue.PullRequest
+			branchOtherUnmergedPR, err = issues_model.GetUnmergedPullRequest(ctx, pull.HeadRepoID, pull.BaseRepoID, pull.HeadBranch, pull.BaseBranch, pull.Flow)
+			if err != nil {
+				if !issues_model.IsErrPullRequestNotExist(err) {
+					ctx.Flash.Error(ctx.Tr("repo.issues.dependency.pr_close_blocked"))
+				}
+			}
+
+			if branchOtherUnmergedPR != nil {
+				ctx.Flash.Error(ctx.Tr("repo.pulls.open_unmerged_pull_exists", branchOtherUnmergedPR.Index))
+			} else {
+				// sync ref of PR <refs/pulls/pr_index/head> in base repo for a reopened PR
+				if pull.Flow == issues_model.PullRequestFlowGithub {
+					if exist, _ := git_model.IsBranchExist(ctx, pull.HeadRepoID, pull.HeadBranch); !exist {
+						ctx.Flash.Error("The origin branch is delete, cannot reopen.")
+						return
+					}
+					if err := pull_service.PushToBaseRepo(ctx, pull); err != nil {
+						ctx.ServerError("PushToBaseRepo", err)
+						return
+					}
+				}
+				// Regenerate patch and test conflict.
+				issue.PullRequest.HeadCommitID = ""
+				pull_service.StartPullRequestCheckImmediately(ctx, issue.PullRequest)
+			}
+		}
+
+		if form.Status == "close" && !issue.IsClosed {
+			if err := issue_service.CloseIssue(ctx, issue, ctx.Doer, ""); err != nil {
+				log.Error("CloseIssue: %v", err)
+				if issues_model.IsErrDependenciesLeft(err) {
+					if issue.IsPull {
+						ctx.Flash.Error(ctx.Tr("repo.issues.dependency.pr_close_blocked"))
+					} else {
+						ctx.Flash.Error(ctx.Tr("repo.issues.dependency.issue_close_blocked"))
+					}
+				}
+			} else {
+				if err := stopTimerIfAvailable(ctx, ctx.Doer, issue); err != nil {
+					ctx.ServerError("stopTimerIfAvailable", err)
+					return
+				}
+				log.Trace("Issue [%d] status changed to closed: %v", issue.ID, issue.IsClosed)
+			}
+		} else if form.Status == "reopen" && issue.IsClosed && branchOtherUnmergedPR == nil {
+			if err := issue_service.ReopenIssue(ctx, issue, ctx.Doer, ""); err != nil {
+				log.Error("ReopenIssue: %v", err)
+				ctx.Flash.Error("Unable to reopen.")
+			}
+		}
+	} // end if: handle close or reopen
+
+	ctx.JSONRedirect(redirect)
+}
+
+func getRepoIssueComment(ctx *context.Context, commentID int64) *issues_model.Comment {
+	comment, err := issues_model.GetCommentWithRepoID(ctx, ctx.Repo.Repository.ID, commentID)
+	if err != nil {
+		ctx.ServerError("GetCommentWithRepoID", err)
+		return nil
+	}
+	if !ctx.Repo.Permission.CanReadIssuesOrPulls(comment.Issue.IsPull) {
+		ctx.NotFound(nil)
+		return nil
+	}
+	return comment
+}
+
+func getRepoIssueCommentForSelfWriteOrAccess(ctx *context.Context, commentID int64, accessMode perm.AccessMode) *issues_model.Comment {
+	comment := getRepoIssueComment(ctx, commentID)
+	if comment == nil {
+		return nil
+	}
+	if !canSelfChangeOrAccessContent(ctx, comment.Issue, comment.PosterID, accessMode) {
+		return nil
+	}
+	if !comment.Type.HasContentSupport() {
+		ctx.HTTPError(http.StatusBadRequest)
+		return nil
+	}
+	return comment
+}
+
+// UpdateCommentContent change comment of issue's content
+func UpdateCommentContent(ctx *context.Context) {
+	comment := getRepoIssueCommentForSelfWriteOrAccess(ctx, ctx.PathParamInt64("id"), perm.AccessModeWrite)
+	if comment == nil {
+		return
+	}
+
+	newContent := ctx.FormString("content")
+	contentVersion := ctx.FormInt("content_version")
+	if contentVersion != comment.ContentVersion {
+		ctx.JSONError(ctx.Tr("repo.comments.edit.already_changed"))
+		return
+	}
+
+	if newContent != comment.Content {
+		// allow to save empty content
+		oldContent := comment.Content
+		comment.Content = newContent
+
+		if err := issue_service.UpdateComment(ctx, comment, contentVersion, ctx.Doer, oldContent); err != nil {
+			if errors.Is(err, user_model.ErrBlockedUser) {
+				ctx.JSONError(ctx.Tr("repo.issues.comment.blocked_user"))
+			} else if errors.Is(err, issues_model.ErrCommentAlreadyChanged) {
+				ctx.JSONError(ctx.Tr("repo.comments.edit.already_changed"))
+			} else {
+				ctx.ServerError("UpdateComment", err)
+			}
+			return
+		}
+	}
+
+	if err := comment.LoadAttachments(ctx); err != nil {
+		ctx.ServerError("LoadAttachments", err)
+		return
+	}
+
+	// when the update request doesn't intend to update attachments (eg: change checkbox state), ignore attachment updates
+	if !ctx.FormBool("ignore_attachments") {
+		if err := updateAttachments(ctx, comment, ctx.FormStrings("files[]")); err != nil {
+			ctx.ServerError("UpdateAttachments", err)
+			return
+		}
+	}
+
+	var renderedContent template.HTML
+	if comment.Content != "" {
+		rctx := renderhelper.NewRenderContextRepoComment(ctx, ctx.Repo.Repository, renderhelper.RepoCommentOptions{
+			FootnoteContextID: strconv.FormatInt(comment.ID, 10),
+		})
+		var err error
+		renderedContent, err = markdown.RenderString(rctx, comment.Content)
+		if err != nil {
+			ctx.ServerError("RenderString", err)
+			return
+		}
+	}
+
+	ctx.JSON(http.StatusOK, map[string]any{
+		"content":        commentContentHTML(ctx, renderedContent),
+		"contentVersion": comment.ContentVersion,
+		"attachments":    attachmentsHTML(ctx, comment.Attachments, comment.Content),
+	})
+}
+
+// DeleteComment delete comment of issue
+func DeleteComment(ctx *context.Context) {
+	comment := getRepoIssueCommentForSelfWriteOrAccess(ctx, ctx.PathParamInt64("id"), perm.AccessModeWrite)
+	if comment == nil {
+		return
+	}
+
+	if err := issue_service.DeleteComment(ctx, ctx.Doer, comment); err != nil {
+		ctx.ServerError("DeleteComment", err)
+		return
+	}
+
+	ctx.Status(http.StatusOK)
+}
+
+// ChangeCommentReaction create a reaction for comment
+func ChangeCommentReaction(ctx *context.Context) {
+	comment := getRepoIssueCommentForSelfWriteOrAccess(ctx, ctx.PathParamInt64("id"), perm.AccessModeRead)
+	if comment == nil {
+		return
+	}
+
+	form := web.GetForm[*forms.ReactionForm](ctx)
+	switch ctx.PathParam("action") {
+	case "react":
+		reaction, err := issue_service.CreateCommentReaction(ctx, ctx.Doer, comment, form.Content)
+		if err != nil {
+			if issues_model.IsErrForbiddenIssueReaction(err) || errors.Is(err, user_model.ErrBlockedUser) {
+				ctx.ServerError("ChangeIssueReaction", err)
+				return
+			}
+			log.Info("CreateCommentReaction: %s", err)
+			break
+		}
+		// Reload new reactions
+		comment.Reactions = nil
+		if err = comment.LoadReactions(ctx, ctx.Repo.Repository); err != nil {
+			log.Info("comment.LoadReactions: %s", err)
+			break
+		}
+
+		log.Trace("Reaction for comment created: %d/%d/%d/%d", ctx.Repo.Repository.ID, comment.Issue.ID, comment.ID, reaction.ID)
+	case "unreact":
+		if err := issues_model.DeleteCommentReaction(ctx, ctx.Doer.ID, comment.Issue.ID, comment.ID, form.Content); err != nil {
+			ctx.ServerError("DeleteCommentReaction", err)
+			return
+		}
+
+		// Reload new reactions
+		comment.Reactions = nil
+		if err := comment.LoadReactions(ctx, ctx.Repo.Repository); err != nil {
+			log.Info("comment.LoadReactions: %s", err)
+			break
+		}
+
+		log.Trace("Reaction for comment removed: %d/%d/%d", ctx.Repo.Repository.ID, comment.Issue.ID, comment.ID)
+	default:
+		ctx.NotFound(nil)
+		return
+	}
+
+	if len(comment.Reactions) == 0 {
+		ctx.JSON(http.StatusOK, map[string]any{
+			"empty": true,
+			"html":  "",
+		})
+		return
+	}
+
+	html, err := ctx.RenderToHTML(tplReactions, map[string]any{
+		"ActionURL": fmt.Sprintf("%s/comments/%d/reactions", ctx.Repo.RepoLink, comment.ID),
+		"Reactions": comment.Reactions.GroupByType(),
+	})
+	if err != nil {
+		ctx.ServerError("ChangeCommentReaction.HTMLString", err)
+		return
+	}
+	ctx.JSON(http.StatusOK, map[string]any{
+		"html": html,
+	})
+}
+
+// GetCommentAttachments returns attachments for the comment
+func GetCommentAttachments(ctx *context.Context) {
+	comment := getRepoIssueComment(ctx, ctx.PathParamInt64("id"))
+	if comment == nil {
+		return
+	}
+
+	if !comment.Type.HasAttachmentSupport() {
+		ctx.ServerError("GetCommentAttachments", fmt.Errorf("comment type %v does not support attachments", comment.Type))
+		return
+	}
+
+	attachments := make([]*api.Attachment, 0)
+	if err := comment.LoadAttachments(ctx); err != nil {
+		ctx.ServerError("LoadAttachments", err)
+		return
+	}
+	for i := 0; i < len(comment.Attachments); i++ {
+		attachments = append(attachments, convert.ToAttachment(ctx, ctx.Repo.Repository, comment.Attachments[i]))
+	}
+	ctx.JSON(http.StatusOK, attachments)
+}

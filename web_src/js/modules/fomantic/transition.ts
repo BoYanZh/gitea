@@ -1,5 +1,3 @@
-import $ from 'jquery';
-
 export function initFomanticTransition() {
   const transitionNopBehaviors = new Set([
     'clear queue', 'stop', 'stop all', 'destroy',
@@ -8,13 +6,13 @@ export function initFomanticTransition() {
     'set duration', 'save conditions', 'restore conditions',
   ]);
   // stand-in for removed transition module
-  $.fn.transition = function (arg0, arg1, arg2) {
+  $.fn.transition = function (arg0: any, arg1?: number, arg2?: (this: HTMLElement) => void) {
     if (arg0 === 'is supported') return true;
     if (arg0 === 'is animating') return false;
     if (arg0 === 'is inward') return false;
     if (arg0 === 'is outward') return false;
 
-    let argObj;
+    let argObj: Record<string, any>;
     if (typeof arg0 === 'string') {
       // many behaviors are no-op now. https://fomantic-ui.com/modules/transition.html#/usage
       if (transitionNopBehaviors.has(arg0)) return this;

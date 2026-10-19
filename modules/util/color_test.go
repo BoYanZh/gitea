@@ -27,9 +27,9 @@ func Test_HexToRBGColor(t *testing.T) {
 	}
 	for n, c := range cases {
 		r, g, b := HexToRBGColor(c.colorString)
-		assert.Equal(t, c.expectedR, r, "case %d: error R should match: expected %f, but get %f", n, c.expectedR, r)
-		assert.Equal(t, c.expectedG, g, "case %d: error G should match: expected %f, but get %f", n, c.expectedG, g)
-		assert.Equal(t, c.expectedB, b, "case %d: error B should match: expected %f, but get %f", n, c.expectedB, b)
+		assert.InDelta(t, c.expectedR, r, 0, "case %d: error R should match: expected %f, but get %f", n, c.expectedR, r)
+		assert.InDelta(t, c.expectedG, g, 0, "case %d: error G should match: expected %f, but get %f", n, c.expectedG, g)
+		assert.InDelta(t, c.expectedB, b, 0, "case %d: error B should match: expected %f, but get %f", n, c.expectedB, b)
 	}
 }
 
@@ -45,11 +45,13 @@ func Test_UseLightText(t *testing.T) {
 		{"#7057ff", "#fff"},
 		{"#008672", "#fff"},
 		{"#e4e669", "#000"},
-		{"#d876e3", "#000"},
+		{"#d876e3", "#fff"},
 		{"#ffffff", "#000"},
 		{"#2b8684", "#fff"},
 		{"#2b8786", "#fff"},
-		{"#2c8786", "#000"},
+		{"#2c8786", "#fff"},
+		{"#2bb3b2", "#fff"},
+		{"#2bb4b3", "#000"},
 		{"#3bb6b3", "#000"},
 		{"#7c7268", "#fff"},
 		{"#7e716c", "#fff"},

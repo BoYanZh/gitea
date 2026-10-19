@@ -8,21 +8,24 @@ import (
 	"os"
 	"slices"
 	"testing"
+	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/indexer/code/bleve"
-	"code.gitea.io/gitea/modules/indexer/code/elasticsearch"
-	"code.gitea.io/gitea/modules/indexer/code/internal"
+	"gitea.dev/models/db"
+	"gitea.dev/models/unittest"
+	indexer_module "gitea.dev/modules/indexer"
+	"gitea.dev/modules/indexer/code/bleve"
+	"gitea.dev/modules/indexer/code/elasticsearch"
+	"gitea.dev/modules/indexer/code/internal"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
+	"gitea.dev/modules/util"
 
-	_ "code.gitea.io/gitea/models"
-	_ "code.gitea.io/gitea/models/actions"
-	_ "code.gitea.io/gitea/models/activities"
+	_ "gitea.dev/models"
+	_ "gitea.dev/models/actions"
+	_ "gitea.dev/models/activities"
 
 	"github.com/stretchr/testify/assert"
-
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/require"
 )
 
 type codeSearchResult struct {
@@ -36,13 +39,24 @@ func TestMain(m *testing.M) {
 
 func testIndexer(name string, t *testing.T, indexer internal.Indexer) {
 	t.Run(name, func(t *testing.T) {
-		assert.NoError(t, setupRepositoryIndexes(git.DefaultContext, indexer))
+		assert.NoError(t, setupRepositoryIndexes(t.Context(), indexer))
+		// Wait for the index to catch up: ES/OpenSearch make writes visible
+		// only after a refresh (default interval: 1s). Bleve is synchronous
+		// and passes on the first iteration.
+		require.Eventually(t, func() bool {
+			total, _, _, err := indexer.Search(t.Context(), &internal.SearchOptions{
+				Keyword:   "Description",
+				Paginator: &db.ListOptions{Page: 1, PageSize: 1},
+			})
+			return err == nil && total > 0
+		}, 10*time.Second, 100*time.Millisecond, "index did not become searchable")
 
 		keywords := []struct {
-			RepoIDs []int64
-			Keyword string
-			Langs   int
-			Results []codeSearchResult
+			RepoIDs    []int64
+			Keyword    string
+			Langs      int
+			SearchMode indexer_module.SearchModeType
+			Results    []codeSearchResult
 		}{
 			// Search for an exact match on the contents of a file
 			// This scenario yields a single result (the file README.md on the repo '1')
@@ -131,7 +145,7 @@ func testIndexer(name string, t *testing.T, indexer internal.Indexer) {
 				},
 			},
 			// Search for matches on both the contents and the filenames within the repo '62'.
-			// This scenario yields two results: the first result is baed on the file (cucumber.md) while the second is based on the contents
+			// This scenario yields two results: the first result is based on the file (cucumber.md) while the second is based on the contents
 			{
 				RepoIDs: []int64{62},
 				Keyword: "cucumber",
@@ -164,6 +178,18 @@ func testIndexer(name string, t *testing.T, indexer internal.Indexer) {
 					},
 				},
 			},
+			// Search for a match on the full path of a file within the repo '62'.
+			{
+				RepoIDs: []int64{62},
+				Keyword: "potato/ham",
+				Langs:   1,
+				Results: []codeSearchResult{
+					{
+						Filename: "potato/ham.md",
+						Content:  "This is not cheese",
+					},
+				},
+			},
 			// Search for matches on the contents of files within the repo '62'.
 			// This scenario yields two results (both are based on contents, the first one is an exact match where as the second is a 'fuzzy' one)
 			{
@@ -181,21 +207,71 @@ func testIndexer(name string, t *testing.T, indexer internal.Indexer) {
 					},
 				},
 			},
+			// Search for matches on the contents of files regardless of case.
+			{
+				RepoIDs:    nil,
+				Keyword:    "dESCRIPTION",
+				Langs:      1,
+				SearchMode: indexer_module.SearchModeFuzzy,
+				Results: []codeSearchResult{
+					{
+						Filename: "README.md",
+						Content:  "# repo1\n\nDescription for repo1",
+					},
+				},
+			},
+			// Search for an exact match on the filename within the repo '62' (case-insensitive).
+			// This scenario yields a single result (the file avocado.md on the repo '62')
+			{
+				RepoIDs: []int64{62},
+				Keyword: "AVOCADO.MD",
+				Langs:   1,
+				Results: []codeSearchResult{
+					{
+						Filename: "avocado.md",
+						Content:  "# repo1\n\npineaple pie of cucumber juice",
+					},
+				},
+			},
+			// Search for matches on the contents of files when the criteria are an expression.
+			{
+				RepoIDs: []int64{62},
+				Keyword: "console.log",
+				Langs:   1,
+				Results: []codeSearchResult{
+					{
+						Filename: "example-file.js",
+						Content:  "console.log(\"Hello, World!\")",
+					},
+				},
+			},
+			// Search for matches on the contents of files when the criteria are parts of an expression.
+			{
+				RepoIDs: []int64{62},
+				Keyword: "log",
+				Langs:   1,
+				Results: []codeSearchResult{
+					{
+						Filename: "example-file.js",
+						Content:  "console.log(\"Hello, World!\")",
+					},
+				},
+			},
 		}
 
 		for _, kw := range keywords {
 			t.Run(kw.Keyword, func(t *testing.T) {
-				total, res, langs, err := indexer.Search(context.TODO(), &internal.SearchOptions{
-					RepoIDs: kw.RepoIDs,
-					Keyword: kw.Keyword,
+				total, res, langs, err := indexer.Search(t.Context(), &internal.SearchOptions{
+					RepoIDs:    kw.RepoIDs,
+					Keyword:    kw.Keyword,
+					SearchMode: util.IfZero(kw.SearchMode, indexer_module.SearchModeWords),
 					Paginator: &db.ListOptions{
 						Page:     1,
 						PageSize: 10,
 					},
-					IsKeywordFuzzy: true,
 				})
-				assert.NoError(t, err)
-				assert.Len(t, langs, kw.Langs)
+				require.NoError(t, err)
+				require.Len(t, langs, kw.Langs)
 
 				hits := make([]codeSearchResult, 0, len(res))
 
@@ -225,26 +301,22 @@ func testIndexer(name string, t *testing.T, indexer internal.Indexer) {
 			})
 		}
 
-		assert.NoError(t, tearDownRepositoryIndexes(indexer))
+		assert.NoError(t, tearDownRepositoryIndexes(t.Context(), indexer))
 	})
 }
 
 func TestBleveIndexAndSearch(t *testing.T) {
 	unittest.PrepareTestEnv(t)
-
+	defer test.MockVariableValue(&setting.Indexer.TypeBleveMaxFuzzniess, 2)()
 	dir := t.TempDir()
 
 	idx := bleve.NewIndexer(dir)
-	_, err := idx.Init(context.Background())
-	if err != nil {
-		if idx != nil {
-			idx.Close()
-		}
-		assert.FailNow(t, "Unable to create bleve indexer Error: %v", err)
-	}
 	defer idx.Close()
 
-	testIndexer("beleve", t, idx)
+	_, err := idx.Init(t.Context())
+	require.NoError(t, err)
+
+	testIndexer("bleve", t, idx)
 }
 
 func TestESIndexAndSearch(t *testing.T) {
@@ -257,11 +329,11 @@ func TestESIndexAndSearch(t *testing.T) {
 	}
 
 	indexer := elasticsearch.NewIndexer(u, "gitea_codes")
-	if _, err := indexer.Init(context.Background()); err != nil {
+	if _, err := indexer.Init(t.Context()); err != nil {
 		if indexer != nil {
 			indexer.Close()
 		}
-		assert.FailNow(t, "Unable to init ES indexer Error: %v", err)
+		require.NoError(t, err, "Unable to init ES indexer")
 	}
 
 	defer indexer.Close()
@@ -278,9 +350,9 @@ func setupRepositoryIndexes(ctx context.Context, indexer internal.Indexer) error
 	return nil
 }
 
-func tearDownRepositoryIndexes(indexer internal.Indexer) error {
+func tearDownRepositoryIndexes(ctx context.Context, indexer internal.Indexer) error {
 	for _, repoID := range repositoriesToSearch() {
-		if err := indexer.Delete(context.Background(), repoID); err != nil {
+		if err := indexer.Delete(ctx, repoID); err != nil {
 			return err
 		}
 	}

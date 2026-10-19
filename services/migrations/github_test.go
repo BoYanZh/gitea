@@ -5,65 +5,77 @@
 package migrations
 
 import (
-	"context"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
-	base "code.gitea.io/gitea/modules/migration"
+	"gitea.dev/models/unittest"
+	base "gitea.dev/modules/migration"
 
+	"github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGitHubDownloadRepo(t *testing.T) {
-	GithubLimitRateRemaining = 3 // Wait at 3 remaining since we could have 3 CI in //
 	token := os.Getenv("GITHUB_READ_TOKEN")
-	if token == "" {
-		t.Skip("Skipping GitHub migration test because GITHUB_READ_TOKEN is empty")
-	}
-	downloader := NewGithubDownloaderV3(context.Background(), "https://github.com", "", "", token, "go-gitea", "test_repo")
-	err := downloader.RefreshRate()
-	assert.NoError(t, err)
+	liveMode := token != ""
 
-	repo, err := downloader.GetRepoInfo()
+	_, callerFile, _, _ := runtime.Caller(0)
+	fixtureDir := filepath.Join(filepath.Dir(callerFile), "_mock_data/TestGitHubDownloadRepo")
+	mockServer := unittest.NewMockWebServer(t, "https://api.github.com", fixtureDir, liveMode, unittest.MockServerOptions{
+		StripPrefix: "/api/v3",
+	})
+
+	GithubLimitRateRemaining = 3 // Wait at 3 remaining since we could have 3 CI in //
+	ctx := t.Context()
+	downloader, err := NewGithubDownloaderV3(ctx, mockServer.URL, "", "", token, "go-gitea", "test_repo")
+	require.NoError(t, err)
+	err = downloader.RefreshRate(ctx)
+	require.NoError(t, err)
+
+	repo, err := downloader.GetRepoInfo(ctx)
 	assert.NoError(t, err)
 	assertRepositoryEqual(t, &base.Repository{
 		Name:          "test_repo",
 		Owner:         "go-gitea",
 		Description:   "Test repository for testing migration from github to gitea",
+		Website:       "https://gitea.com/test-repo",
 		CloneURL:      "https://github.com/go-gitea/test_repo.git",
 		OriginalURL:   "https://github.com/go-gitea/test_repo",
 		DefaultBranch: "master",
 	}, repo)
 
-	topics, err := downloader.GetTopics()
+	topics, err := downloader.GetTopics(ctx)
 	assert.NoError(t, err)
 	assert.Contains(t, topics, "gitea")
 
-	milestones, err := downloader.GetMilestones()
+	milestones, err := downloader.GetMilestones(ctx)
 	assert.NoError(t, err)
 	assertMilestonesEqual(t, []*base.Milestone{
 		{
 			Title:       "1.0.0",
 			Description: "Milestone 1.0.0",
-			Deadline:    timePtr(time.Date(2019, 11, 11, 8, 0, 0, 0, time.UTC)),
+			Deadline:    new(time.Date(2019, 11, 11, 0, 0, 0, 0, time.UTC)),
 			Created:     time.Date(2019, 11, 12, 19, 37, 8, 0, time.UTC),
-			Updated:     timePtr(time.Date(2019, 11, 12, 21, 56, 17, 0, time.UTC)),
-			Closed:      timePtr(time.Date(2019, 11, 12, 19, 45, 49, 0, time.UTC)),
+			Updated:     new(time.Date(2019, 11, 12, 21, 56, 17, 0, time.UTC)),
+			Closed:      new(time.Date(2019, 11, 12, 19, 45, 49, 0, time.UTC)),
 			State:       "closed",
 		},
 		{
 			Title:       "1.1.0",
 			Description: "Milestone 1.1.0",
-			Deadline:    timePtr(time.Date(2019, 11, 12, 8, 0, 0, 0, time.UTC)),
+			Deadline:    new(time.Date(2019, 11, 12, 0, 0, 0, 0, time.UTC)),
 			Created:     time.Date(2019, 11, 12, 19, 37, 25, 0, time.UTC),
-			Updated:     timePtr(time.Date(2019, 11, 12, 21, 39, 27, 0, time.UTC)),
-			Closed:      timePtr(time.Date(2019, 11, 12, 19, 45, 46, 0, time.UTC)),
+			Updated:     new(time.Date(2019, 11, 12, 21, 39, 27, 0, time.UTC)),
+			Closed:      new(time.Date(2019, 11, 12, 19, 45, 46, 0, time.UTC)),
 			State:       "closed",
 		},
 	}, milestones)
 
-	labels, err := downloader.GetLabels()
+	labels, err := downloader.GetLabels(ctx)
 	assert.NoError(t, err)
 	assertLabelsEqual(t, []*base.Label{
 		{
@@ -113,7 +125,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 		},
 	}, labels)
 
-	releases, err := downloader.GetReleases()
+	releases, err := downloader.GetReleases(ctx)
 	assert.NoError(t, err)
 	assertReleasesEqual(t, []*base.Release{
 		{
@@ -129,7 +141,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 	}, releases)
 
 	// downloader.GetIssues()
-	issues, isEnd, err := downloader.GetIssues(1, 2)
+	issues, isEnd, err := downloader.GetIssues(ctx, 1, 2)
 	assert.NoError(t, err)
 	assert.False(t, isEnd)
 	assertIssuesEqual(t, []*base.Issue{
@@ -162,7 +174,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 					Content:  "+1",
 				},
 			},
-			Closed: timePtr(time.Date(2019, 11, 12, 20, 22, 22, 0, time.UTC)),
+			Closed: new(time.Date(2019, 11, 12, 20, 22, 22, 0, time.UTC)),
 		},
 		{
 			Number:     2,
@@ -213,12 +225,12 @@ func TestGitHubDownloadRepo(t *testing.T) {
 					Content:  "+1",
 				},
 			},
-			Closed: timePtr(time.Date(2019, 11, 12, 21, 1, 31, 0, time.UTC)),
+			Closed: new(time.Date(2019, 11, 12, 21, 1, 31, 0, time.UTC)),
 		},
 	}, issues)
 
 	// downloader.GetComments()
-	comments, _, err := downloader.GetComments(&base.Issue{Number: 2, ForeignIndex: 2})
+	comments, _, err := downloader.GetComments(ctx, &base.Issue{Number: 2, ForeignIndex: 2})
 	assert.NoError(t, err)
 	assertCommentsEqual(t, []*base.Comment{
 		{
@@ -248,7 +260,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 	}, comments)
 
 	// downloader.GetPullRequests()
-	prs, _, err := downloader.GetPullRequests(1, 2)
+	prs, _, err := downloader.GetPullRequests(ctx, 1, 2)
 	assert.NoError(t, err)
 	assertPullRequestsEqual(t, []*base.PullRequest{
 		{
@@ -268,10 +280,10 @@ func TestGitHubDownloadRepo(t *testing.T) {
 					Description: "Improvements or additions to documentation",
 				},
 			},
-			PatchURL: "https://github.com/go-gitea/test_repo/pull/3.patch",
+			PatchURL: "",
 			Head: base.PullRequestBranch{
 				Ref:      "master",
-				CloneURL: "https://github.com/mrsdizzie/test_repo.git",
+				CloneURL: "",
 				SHA:      "076160cf0b039f13e5eff19619932d181269414b",
 				RepoName: "test_repo",
 
@@ -283,9 +295,9 @@ func TestGitHubDownloadRepo(t *testing.T) {
 				OwnerName: "go-gitea",
 				RepoName:  "test_repo",
 			},
-			Closed:         timePtr(time.Date(2019, 11, 12, 21, 39, 27, 0, time.UTC)),
+			Closed:         new(time.Date(2019, 11, 12, 21, 39, 27, 0, time.UTC)),
 			Merged:         true,
-			MergedTime:     timePtr(time.Date(2019, 11, 12, 21, 39, 27, 0, time.UTC)),
+			MergedTime:     new(time.Date(2019, 11, 12, 21, 39, 27, 0, time.UTC)),
 			MergeCommitSHA: "f32b0a9dfd09a60f616f29158f772cedd89942d2",
 			ForeignIndex:   3,
 		},
@@ -298,7 +310,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 			PosterName: "mrsdizzie",
 			State:      "open",
 			Created:    time.Date(2019, 11, 12, 21, 54, 18, 0, time.UTC),
-			Updated:    time.Date(2020, 1, 4, 11, 30, 1, 0, time.UTC),
+			Updated:    time.Date(2025, 3, 16, 15, 46, 20, 0, time.UTC),
 			Labels: []*base.Label{
 				{
 					Name:        "bug",
@@ -306,13 +318,13 @@ func TestGitHubDownloadRepo(t *testing.T) {
 					Description: "Something isn't working",
 				},
 			},
-			PatchURL: "https://github.com/go-gitea/test_repo/pull/4.patch",
+			PatchURL: "",
 			Head: base.PullRequestBranch{
 				Ref:       "test-branch",
 				SHA:       "2be9101c543658591222acbee3eb799edfc3853d",
 				RepoName:  "test_repo",
 				OwnerName: "mrsdizzie",
-				CloneURL:  "https://github.com/mrsdizzie/test_repo.git",
+				CloneURL:  "",
 			},
 			Base: base.PullRequestBranch{
 				Ref:       "master",
@@ -338,7 +350,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 		},
 	}, prs)
 
-	reviews, err := downloader.GetReviews(&base.PullRequest{Number: 3, ForeignIndex: 3})
+	reviews, err := downloader.GetReviews(ctx, &base.PullRequest{Number: 3, ForeignIndex: 3})
 	assert.NoError(t, err)
 	assertReviewsEqual(t, []*base.Review{
 		{
@@ -370,7 +382,7 @@ func TestGitHubDownloadRepo(t *testing.T) {
 		},
 	}, reviews)
 
-	reviews, err = downloader.GetReviews(&base.PullRequest{Number: 4, ForeignIndex: 4})
+	reviews, err = downloader.GetReviews(ctx, &base.PullRequest{Number: 4, ForeignIndex: 4})
 	assert.NoError(t, err)
 	assertReviewsEqual(t, []*base.Review{
 		{
@@ -428,4 +440,59 @@ func TestGitHubDownloadRepo(t *testing.T) {
 			},
 		},
 	}, reviews)
+}
+
+func TestGithubMultiToken(t *testing.T) {
+	testCases := []struct {
+		desc             string
+		token            string
+		expectedCloneURL string
+	}{
+		{
+			desc:             "Single Token",
+			token:            "single_token",
+			expectedCloneURL: "https://oauth2:single_token@github.com",
+		},
+		{
+			desc:             "Multi Token",
+			token:            "token1,token2",
+			expectedCloneURL: "https://oauth2:token1@github.com",
+		},
+	}
+	factory := GithubDownloaderV3Factory{}
+
+	for _, tC := range testCases {
+		t.Run(tC.desc, func(t *testing.T) {
+			opts := base.MigrateOptions{CloneAddr: "https://github.com/go-gitea/gitea", AuthToken: tC.token}
+			client, err := factory.New(t.Context(), opts)
+			require.NoError(t, err)
+
+			cloneURL, err := client.FormatCloneURL(opts, "https://github.com")
+			require.NoError(t, err)
+
+			assert.Equal(t, tC.expectedCloneURL, cloneURL)
+		})
+	}
+}
+
+func TestGithubMultiTokenClientSelection(t *testing.T) {
+	downloader := &GithubDownloaderV3{
+		clients: make([]*github.Client, 3),
+		rates:   make([]*github.Rate, 3),
+	}
+
+	downloader.waitAndPickClient(t.Context())
+	assert.Equal(t, 0, downloader.curClientIdx)
+
+	downloader.rates[0] = &github.Rate{Remaining: 100}
+	downloader.waitAndPickClient(t.Context())
+	assert.Equal(t, 1, downloader.curClientIdx)
+
+	downloader.rates[1] = &github.Rate{Remaining: 200}
+	downloader.waitAndPickClient(t.Context())
+	assert.Equal(t, 2, downloader.curClientIdx)
+
+	downloader.rates[2] = &github.Rate{Remaining: 50}
+	downloader.waitAndPickClient(t.Context())
+	assert.Equal(t, 1, downloader.curClientIdx)
 }

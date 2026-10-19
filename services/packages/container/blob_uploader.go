@@ -9,17 +9,17 @@ import (
 	"io"
 	"os"
 
-	packages_model "code.gitea.io/gitea/models/packages"
-	packages_module "code.gitea.io/gitea/modules/packages"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
+	packages_model "gitea.dev/models/packages"
+	packages_module "gitea.dev/modules/packages"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/tempdir"
 )
 
 var (
 	// errWriteAfterRead occurs if Write is called after a read operation
 	errWriteAfterRead = errors.New("write is unsupported after a read operation")
-	// errOffsetMissmatch occurs if the file offset is different than the model
-	errOffsetMissmatch = errors.New("offset mismatch between file and model")
+	// errOffsetMismatch occurs if the file offset is different than the model
+	errOffsetMismatch = errors.New("offset mismatch between file and model")
 )
 
 // BlobUploader handles chunked blob uploads
@@ -30,8 +30,12 @@ type BlobUploader struct {
 	reading bool
 }
 
-func buildFilePath(id string) string {
-	return util.FilePathJoinAbs(setting.Packages.ChunkedUploadPath, id)
+func uploadPathTempDir() *tempdir.TempDir {
+	return setting.AppDataTempDir("package-upload")
+}
+
+func buildFilePath(uploadPath *tempdir.TempDir, id string) string {
+	return uploadPath.JoinPath(id)
 }
 
 // NewBlobUploader creates a new blob uploader for the given id
@@ -48,16 +52,21 @@ func NewBlobUploader(ctx context.Context, id string) (*BlobUploader, error) {
 		}
 	}
 
-	f, err := os.OpenFile(buildFilePath(model.ID), os.O_RDWR|os.O_CREATE, 0o666)
+	uploadPath := uploadPathTempDir()
+	_, err = uploadPath.MkdirAllSub("")
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(buildFilePath(uploadPath, model.ID), os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
 		return nil, err
 	}
 
 	return &BlobUploader{
-		model,
-		hash,
-		f,
-		false,
+		PackageBlobUpload: model,
+		MultiHasher:       hash,
+		file:              f,
+		reading:           false,
 	}, nil
 }
 
@@ -77,7 +86,7 @@ func (u *BlobUploader) Append(ctx context.Context, r io.Reader) error {
 		return err
 	}
 	if offset != u.BytesReceived {
-		return errOffsetMissmatch
+		return errOffsetMismatch
 	}
 
 	n, err := io.Copy(io.MultiWriter(u.file, u.MultiHasher), r)
@@ -118,13 +127,13 @@ func (u *BlobUploader) Read(p []byte) (int, error) {
 	return u.file.Read(p)
 }
 
-// Remove deletes the data and the model of a blob upload
+// RemoveBlobUploadByID Remove deletes the data and the model of a blob upload
 func RemoveBlobUploadByID(ctx context.Context, id string) error {
 	if err := packages_model.DeleteBlobUploadByID(ctx, id); err != nil {
 		return err
 	}
 
-	err := os.Remove(buildFilePath(id))
+	err := os.Remove(buildFilePath(uploadPathTempDir(), id))
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}

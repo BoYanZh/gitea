@@ -1,0 +1,690 @@
+// Copyright 2024 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"bytes"
+	"errors"
+	"maps"
+	"net/http"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	issue_indexer "gitea.dev/modules/indexer/issues"
+	db_indexer "gitea.dev/modules/indexer/issues/db"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers/common"
+	"gitea.dev/routers/web/shared/issue"
+	shared_user "gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	issue_service "gitea.dev/services/issue"
+	pull_service "gitea.dev/services/pull"
+)
+
+func retrieveProjectsForIssueList(ctx *context.Context, repo *repo_model.Repository) {
+	ctx.Data["OpenProjects"], ctx.Data["ClosedProjects"] = retrieveProjectsInternal(ctx, repo)
+}
+
+// parseProjectIDsFromQuery parses the comma-separated `project` (preferred) or `projects`
+// query parameter into a slice of int64 IDs.
+func parseProjectIDsFromQuery(ctx *context.Context) []int64 {
+	// FIXME: ISSUE-MULTIPLE-PROJECTS-FILTER: no multiple project filter support yet
+	// Although here parses the project parameter as a slice, the "search" logic is wrong
+	return ctx.FormStringInt64s("project")
+}
+
+// SearchIssues searches for issues across the repositories that the user has access to
+func SearchIssues(ctx *context.Context) {
+	before, since, err := context.GetQueryBeforeSince(ctx.Base)
+	if err != nil {
+		ctx.HTTPError(http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	isClosed := common.ParseIssueFilterStateIsClosed(ctx.FormString("state"))
+
+	repoIDs, allPublic, err := common.SearchIssuesRepoIDs(ctx, common.SearchIssuesRepoIDsOptions{
+		Doer:      ctx.Doer,
+		OwnerName: ctx.FormString("owner"),
+		TeamName:  ctx.FormString("team"),
+	})
+	if err != nil {
+		if errors.Is(err, util.ErrNotExist) || errors.Is(err, util.ErrInvalidArgument) {
+			ctx.HTTPError(http.StatusBadRequest, err.Error())
+		} else {
+			ctx.ServerError("SearchIssuesRepoIDs", err)
+		}
+		return
+	}
+
+	keyword := ctx.FormTrim("q")
+	isPull := common.ParseIssueFilterTypeIsPull(ctx.FormString("type"))
+
+	var includedAnyLabels []int64
+	{
+		labels := ctx.FormTrim("labels")
+		var includedLabelNames []string
+		if len(labels) > 0 {
+			includedLabelNames = strings.Split(labels, ",")
+		}
+		includedAnyLabels, err = issues_model.GetLabelIDsByNames(ctx, includedLabelNames)
+		if err != nil {
+			ctx.ServerError("GetLabelIDsByNames", err)
+			return
+		}
+	}
+
+	var includedMilestones []int64
+	{
+		milestones := ctx.FormTrim("milestones")
+		var includedMilestoneNames []string
+		if len(milestones) > 0 {
+			includedMilestoneNames = strings.Split(milestones, ",")
+		}
+		includedMilestones, err = issues_model.GetMilestoneIDsByNames(ctx, includedMilestoneNames)
+		if err != nil {
+			ctx.ServerError("GetMilestoneIDsByNames", err)
+			return
+		}
+	}
+
+	includedProjectIDs := parseProjectIDsFromQuery(ctx)
+
+	// this api is also used in UI,
+	// so the default limit is set to fit UI needs
+	limit := ctx.FormInt("limit")
+	if limit == 0 {
+		limit = setting.UI.IssuePagingNum
+	} else if limit > setting.API.MaxResponseItems {
+		limit = setting.API.MaxResponseItems
+	}
+
+	searchOpt := &issue_indexer.SearchOptions{
+		Paginator: &db.ListOptions{
+			Page:     ctx.FormInt("page"),
+			PageSize: limit,
+		},
+		Keyword:             keyword,
+		RepoIDs:             repoIDs,
+		AllPublic:           allPublic,
+		IsPull:              isPull,
+		IsClosed:            isClosed,
+		IncludedAnyLabelIDs: includedAnyLabels,
+		MilestoneIDs:        includedMilestones,
+		ProjectIDs:          includedProjectIDs,
+		SortBy:              issue_indexer.SortByCreatedDesc,
+	}
+
+	if since != 0 {
+		searchOpt.UpdatedAfterUnix = optional.Some(since)
+	}
+	if before != 0 {
+		searchOpt.UpdatedBeforeUnix = optional.Some(before)
+	}
+
+	if ctx.IsSigned {
+		ctxUserID := ctx.Doer.ID
+		if ctx.FormBool("created") {
+			searchOpt.PosterID = strconv.FormatInt(ctxUserID, 10)
+		}
+		if ctx.FormBool("assigned") {
+			searchOpt.AssigneeID = strconv.FormatInt(ctxUserID, 10)
+		}
+		if ctx.FormBool("mentioned") {
+			searchOpt.MentionID = optional.Some(ctxUserID)
+		}
+		if ctx.FormBool("review_requested") {
+			searchOpt.ReviewRequestedID = optional.Some(ctxUserID)
+		}
+		if ctx.FormBool("reviewed") {
+			searchOpt.ReviewedID = optional.Some(ctxUserID)
+		}
+	}
+
+	// FIXME: It's unsupported to sort by priority repo when searching by indexer,
+	//        it's indeed an regression, but I think it is worth to support filtering by indexer first.
+	_ = ctx.FormInt64("priority_repo_id")
+
+	ids, total, err := issue_indexer.SearchIssues(ctx, searchOpt)
+	if err != nil {
+		ctx.ServerError("SearchIssues", err)
+		return
+	}
+	issues, err := issues_model.GetIssuesByIDs(ctx, ids, true)
+	if err != nil {
+		ctx.ServerError("FindIssuesByIDs", err)
+		return
+	}
+
+	ctx.SetTotalCountHeader(total)
+	ctx.JSON(http.StatusOK, convert.ToIssueList(ctx, ctx.Doer, issues))
+}
+
+func getUserIDForFilter(ctx *context.Context, queryName string) int64 {
+	userName := ctx.FormString(queryName)
+	if len(userName) == 0 {
+		return 0
+	}
+
+	user, err := user_model.GetUserByName(ctx, userName)
+	if user_model.IsErrUserNotExist(err) {
+		ctx.NotFound(err)
+		return 0
+	}
+
+	if err != nil {
+		ctx.HTTPError(http.StatusInternalServerError, err.Error())
+		return 0
+	}
+
+	return user.ID
+}
+
+// SearchRepoIssuesJSON lists the issues of a repository
+// This function was copied from API (decouple the web and API routes),
+// it is only used by frontend to search some dependency or related issues
+func SearchRepoIssuesJSON(ctx *context.Context) {
+	before, since, err := context.GetQueryBeforeSince(ctx.Base)
+	if err != nil {
+		ctx.HTTPError(http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	isClosed := common.ParseIssueFilterStateIsClosed(ctx.FormString("state"))
+	keyword := ctx.FormTrim("q")
+
+	var mileIDs []int64
+	if part := strings.Split(ctx.FormString("milestones"), ","); len(part) > 0 {
+		for i := range part {
+			// uses names and fall back to ids
+			// non-existent milestones are discarded
+			mile, err := issues_model.GetMilestoneByRepoIDANDName(ctx, ctx.Repo.Repository.ID, part[i])
+			if err == nil {
+				mileIDs = append(mileIDs, mile.ID)
+				continue
+			}
+			if !issues_model.IsErrMilestoneNotExist(err) {
+				ctx.HTTPError(http.StatusInternalServerError, err.Error())
+				return
+			}
+			id, err := strconv.ParseInt(part[i], 10, 64)
+			if err != nil {
+				continue
+			}
+			mile, err = issues_model.GetMilestoneByRepoID(ctx, ctx.Repo.Repository.ID, id)
+			if err == nil {
+				mileIDs = append(mileIDs, mile.ID)
+				continue
+			}
+			if issues_model.IsErrMilestoneNotExist(err) {
+				continue
+			}
+			ctx.HTTPError(http.StatusInternalServerError, err.Error())
+		}
+	}
+
+	isPull := common.ParseIssueFilterTypeIsPull(ctx.FormString("type"))
+
+	// FIXME: we should be more efficient here
+	createdByID := getUserIDForFilter(ctx, "created_by")
+	if ctx.Written() {
+		return
+	}
+	assignedByID := getUserIDForFilter(ctx, "assigned_by")
+	if ctx.Written() {
+		return
+	}
+	mentionedByID := getUserIDForFilter(ctx, "mentioned_by")
+	if ctx.Written() {
+		return
+	}
+
+	searchOpt := &issue_indexer.SearchOptions{
+		Paginator: &db.ListOptions{
+			Page:     ctx.FormInt("page"),
+			PageSize: convert.ToCorrectPageSize(ctx.FormInt("limit")),
+		},
+		Keyword:  keyword,
+		RepoIDs:  []int64{ctx.Repo.Repository.ID},
+		IsPull:   isPull,
+		IsClosed: isClosed,
+		SortBy:   issue_indexer.SortByCreatedDesc,
+	}
+
+	projectIDs := parseProjectIDsFromQuery(ctx)
+	if len(projectIDs) == 1 && projectIDs[0] == -1 {
+		searchOpt.NoProjectOnly = true
+	} else if len(projectIDs) > 0 {
+		searchOpt.ProjectIDs = projectIDs
+	}
+
+	if since != 0 {
+		searchOpt.UpdatedAfterUnix = optional.Some(since)
+	}
+	if before != 0 {
+		searchOpt.UpdatedBeforeUnix = optional.Some(before)
+	}
+
+	// TODO: the "labels" query parameter is never used, so no need to handle it
+
+	if len(mileIDs) == 1 && mileIDs[0] == db.NoConditionID {
+		searchOpt.MilestoneIDs = []int64{0}
+	} else {
+		searchOpt.MilestoneIDs = mileIDs
+	}
+
+	if createdByID > 0 {
+		searchOpt.PosterID = strconv.FormatInt(createdByID, 10)
+	}
+	if assignedByID > 0 {
+		searchOpt.AssigneeID = strconv.FormatInt(assignedByID, 10)
+	}
+	if mentionedByID > 0 {
+		searchOpt.MentionID = optional.Some(mentionedByID)
+	}
+
+	ids, total, err := issue_indexer.SearchIssues(ctx, searchOpt)
+	if err != nil {
+		ctx.HTTPError(http.StatusInternalServerError, "SearchIssues", err.Error())
+		return
+	}
+	issues, err := issues_model.GetIssuesByIDs(ctx, ids, true)
+	if err != nil {
+		ctx.HTTPError(http.StatusInternalServerError, "FindIssuesByIDs", err.Error())
+		return
+	}
+
+	ctx.SetTotalCountHeader(total)
+	ctx.JSON(http.StatusOK, convert.ToIssueList(ctx, ctx.Doer, issues))
+}
+
+func BatchDeleteIssues(ctx *context.Context) {
+	issues := getActionIssues(ctx)
+	if ctx.Written() {
+		return
+	}
+	for _, issue := range issues {
+		if err := issue_service.DeleteIssue(ctx, ctx.Doer, issue); err != nil {
+			ctx.ServerError("DeleteIssue", err)
+			return
+		}
+	}
+	ctx.JSONOK()
+}
+
+// UpdateIssueStatus change issue's status
+func UpdateIssueStatus(ctx *context.Context) {
+	issues := getActionIssues(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	action := ctx.FormString("action")
+	if action != "open" && action != "close" {
+		ctx.JSONError("invalid action: " + action)
+		return
+	}
+
+	if _, err := issues.LoadRepositories(ctx); err != nil {
+		ctx.ServerError("LoadRepositories", err)
+		return
+	}
+	if err := issues.LoadPullRequests(ctx); err != nil {
+		ctx.ServerError("LoadPullRequests", err)
+		return
+	}
+
+	for _, issue := range issues {
+		if issue.IsPull && issue.PullRequest.HasMerged {
+			continue
+		}
+		if action == "close" && !issue.IsClosed {
+			if err := issue_service.CloseIssue(ctx, issue, ctx.Doer, ""); err != nil {
+				if issues_model.IsErrDependenciesLeft(err) {
+					ctx.JSONError(ctx.Tr("repo.issues.dependency.issue_batch_close_blocked", issue.Index))
+					return
+				}
+				ctx.ServerError("CloseIssue", err)
+				return
+			}
+		} else if action == "open" && issue.IsClosed {
+			if err := issue_service.ReopenIssue(ctx, issue, ctx.Doer, ""); err != nil {
+				ctx.ServerError("ReopenIssue", err)
+				return
+			}
+		}
+	}
+	ctx.JSONOK()
+}
+
+func prepareIssueFilterExclusiveOrderScopes(ctx *context.Context, allLabels []*issues_model.Label) {
+	scopeSet := make(map[string]bool)
+	for _, label := range allLabels {
+		scope := label.ExclusiveScope()
+		if len(scope) > 0 && label.ExclusiveOrder > 0 {
+			scopeSet[scope] = true
+		}
+	}
+	scopes := slices.Collect(maps.Keys(scopeSet))
+	sort.Strings(scopes)
+	ctx.Data["ExclusiveLabelScopes"] = scopes
+}
+
+func renderMilestones(ctx *context.Context) {
+	// Get milestones
+	milestones, err := db.Find[issues_model.Milestone](ctx, issues_model.FindMilestoneOptions{
+		RepoID: ctx.Repo.Repository.ID,
+	})
+	if err != nil {
+		ctx.ServerError("GetAllRepoMilestones", err)
+		return
+	}
+
+	openMilestones, closedMilestones := issues_model.MilestoneList(milestones).SplitByOpenClosed()
+	ctx.Data["OpenMilestones"] = openMilestones
+	ctx.Data["ClosedMilestones"] = closedMilestones
+}
+
+func prepareIssueFilterAndList(ctx *context.Context, milestoneID int64, projectIDs []int64, isPullOption optional.Option[bool]) {
+	var err error
+	viewType := ctx.FormString("type")
+	sortType := ctx.FormString("sort")
+	types := []string{"all", "your_repositories", "assigned", "created_by", "mentioned", "review_requested", "reviewed_by"}
+	if !util.SliceContainsString(types, viewType, true) {
+		viewType = "all"
+	}
+
+	assigneeID := ctx.FormString("assignee")
+	posterUsername := ctx.FormString("poster")
+	posterUserID := shared_user.GetFilterUserIDByName(ctx, posterUsername)
+	var mentionedID, reviewRequestedID, reviewedID int64
+
+	if ctx.IsSigned {
+		switch viewType {
+		case "created_by":
+			posterUserID = strconv.FormatInt(ctx.Doer.ID, 10)
+		case "mentioned":
+			mentionedID = ctx.Doer.ID
+		case "assigned":
+			assigneeID = strconv.FormatInt(ctx.Doer.ID, 10)
+		case "review_requested":
+			reviewRequestedID = ctx.Doer.ID
+		case "reviewed_by":
+			reviewedID = ctx.Doer.ID
+		}
+	}
+
+	repo := ctx.Repo.Repository
+	keyword := strings.Trim(ctx.FormString("q"), " ")
+	if bytes.Contains([]byte(keyword), []byte{0x00}) {
+		keyword = ""
+	}
+
+	var mileIDs []int64
+	if milestoneID > 0 || milestoneID == db.NoConditionID { // -1 to get those issues which have no any milestone assigned
+		mileIDs = []int64{milestoneID}
+	}
+
+	preparedLabelFilter := issue.PrepareFilterIssueLabels(ctx, repo.ID, ctx.Repo.Owner)
+	if ctx.Written() {
+		return
+	}
+
+	prepareIssueFilterExclusiveOrderScopes(ctx, preparedLabelFilter.AllLabels)
+
+	var keywordMatchedIssueIDs []int64
+	var issueStats *issues_model.IssueStats
+	statsOpts := &issues_model.IssuesOptions{
+		RepoIDs:           []int64{repo.ID},
+		LabelIDs:          preparedLabelFilter.SelectedLabelIDs,
+		MilestoneIDs:      mileIDs,
+		ProjectIDs:        projectIDs,
+		AssigneeID:        assigneeID,
+		MentionedID:       mentionedID,
+		PosterID:          posterUserID,
+		ReviewRequestedID: reviewRequestedID,
+		ReviewedID:        reviewedID,
+		IsPull:            isPullOption,
+		IssueIDs:          nil,
+	}
+
+	if keyword != "" {
+		keywordMatchedIssueIDs, _, err = issue_indexer.SearchIssues(ctx, issue_indexer.ToSearchOptions(keyword, statsOpts))
+		if err != nil {
+			if issue_indexer.IsAvailable(ctx) {
+				ctx.ServerError("issueIDsFromSearch", err)
+				return
+			}
+			ctx.Data["IssueIndexerUnavailable"] = true
+			return
+		}
+		if len(keywordMatchedIssueIDs) == 0 {
+			// It did search with the keyword, but no issue found, just set issueStats to empty, then no need to do query again.
+			issueStats = &issues_model.IssueStats{}
+			// set keywordMatchedIssueIDs to empty slice, so we can distinguish it from "nil"
+			keywordMatchedIssueIDs = []int64{}
+		}
+		statsOpts.IssueIDs = keywordMatchedIssueIDs
+	}
+
+	if issueStats == nil {
+		// Either it did search with the keyword, and found some issues, it needs to get issueStats of these issues.
+		// Or the keyword is empty, so it doesn't need issueIDs as filter, just get issueStats with statsOpts.
+		issueStats, err = issues_model.GetIssueStats(ctx, statsOpts)
+		if err != nil {
+			ctx.ServerError("GetIssueStats", err)
+			return
+		}
+	}
+
+	isShowClosed := common.ParseIssueFilterStateIsClosed(ctx.FormString("state"))
+
+	// if there are closed issues and no open issues, default to showing all issues
+	if ctx.FormString("state") == "" && issueStats.OpenCount == 0 && issueStats.ClosedCount != 0 {
+		isShowClosed = optional.None[bool]()
+	}
+
+	if repo.IsTimetrackerEnabled(ctx) {
+		totalTrackedTime, err := issues_model.GetIssueTotalTrackedTime(ctx, statsOpts, isShowClosed)
+		if err != nil {
+			ctx.ServerError("GetIssueTotalTrackedTime", err)
+			return
+		}
+		ctx.Data["TotalTrackedTime"] = totalTrackedTime
+	}
+
+	// prepare pager
+	total := issueStats.OpenCount + issueStats.ClosedCount
+	if isShowClosed.Has() {
+		total = util.Iif(isShowClosed.Value(), issueStats.ClosedCount, issueStats.OpenCount)
+	}
+	page := max(ctx.FormInt("page"), 1)
+	pager := context.NewPagerBuilder(ctx).TotalCount(total).PerPageLimit(setting.UI.IssuePagingNum).CurPage(page).Build()
+
+	// prepare real issue list:
+	var issues issues_model.IssueList
+	if keywordMatchedIssueIDs == nil || len(keywordMatchedIssueIDs) > 0 {
+		// Either it did search with the keyword, and found some issues, then keywordMatchedIssueIDs is not null, it needs to use db indexer.
+		// Or the keyword is empty, it also needs to usd db indexer.
+		// In either case, no need to use keyword anymore
+		searchResult, err := db_indexer.GetIndexer().FindWithIssueOptions(ctx, &issues_model.IssuesOptions{
+			Paginator: &db.ListOptions{
+				Page:     pager.Paginator.Current(),
+				PageSize: setting.UI.IssuePagingNum,
+			},
+			RepoIDs:           []int64{repo.ID},
+			AssigneeID:        assigneeID,
+			PosterID:          posterUserID,
+			MentionedID:       mentionedID,
+			ReviewRequestedID: reviewRequestedID,
+			ReviewedID:        reviewedID,
+			MilestoneIDs:      mileIDs,
+			ProjectIDs:        projectIDs,
+			IsClosed:          isShowClosed,
+			IsPull:            isPullOption,
+			LabelIDs:          preparedLabelFilter.SelectedLabelIDs,
+			SortType:          sortType,
+			IssueIDs:          keywordMatchedIssueIDs,
+		})
+		if err != nil {
+			ctx.ServerError("DBIndexer.Search", err)
+			return
+		}
+		issueIDs := issue_indexer.SearchResultToIDSlice(searchResult)
+		issues, err = issues_model.GetIssuesByIDs(ctx, issueIDs, true)
+		if err != nil {
+			ctx.ServerError("GetIssuesByIDs", err)
+			return
+		}
+	}
+
+	approvalCounts, err := issues.GetApprovalCounts(ctx)
+	if err != nil {
+		ctx.ServerError("ApprovalCounts", err)
+		return
+	}
+
+	if ctx.IsSigned {
+		if err := issues.LoadIsRead(ctx, ctx.Doer.ID); err != nil {
+			ctx.ServerError("LoadIsRead", err)
+			return
+		}
+	} else {
+		for i := range issues {
+			issues[i].IsRead = true
+		}
+	}
+
+	commitStatuses, lastStatus, err := pull_service.GetIssuesAllCommitStatus(ctx, ctx.Doer, issues)
+	if err != nil {
+		ctx.ServerError("GetIssuesAllCommitStatus", err)
+		return
+	}
+
+	if err := issues.LoadAttributes(ctx); err != nil {
+		ctx.ServerError("issues.LoadAttributes", err)
+		return
+	}
+
+	ctx.Data["Issues"] = issues
+	ctx.Data["CommitLastStatus"] = lastStatus
+	ctx.Data["CommitStatuses"] = commitStatuses
+
+	// Get assignees.
+	assigneeUsers, err := repo_model.GetRepoAssignees(ctx, repo)
+	if err != nil {
+		ctx.ServerError("GetRepoAssignees", err)
+		return
+	}
+	ctx.Data["Assignees"] = shared_user.MakeSelfOnTop(ctx.Doer, assigneeUsers)
+
+	ctx.Data["IssueRefEndNames"], ctx.Data["IssueRefURLs"] = issue_service.GetRefEndNamesAndURLs(issues, ctx.Repo.RepoLink)
+
+	ctx.Data["ApprovalCounts"] = func(issueID int64, typ string) int64 {
+		counts, ok := approvalCounts[issueID]
+		if !ok || len(counts) == 0 {
+			return 0
+		}
+		reviewTyp := issues_model.ReviewTypeApprove
+		switch typ {
+		case "reject":
+			reviewTyp = issues_model.ReviewTypeReject
+		case "waiting":
+			reviewTyp = issues_model.ReviewTypeRequest
+		}
+		for _, count := range counts {
+			if count.Type == reviewTyp {
+				return count.Count
+			}
+		}
+		return 0
+	}
+
+	retrieveProjectsForIssueList(ctx, repo)
+	if ctx.Written() {
+		return
+	}
+
+	pinned, err := issues_model.GetPinnedIssues(ctx, repo.ID, isPullOption.Value())
+	if err != nil {
+		ctx.ServerError("GetPinnedIssues", err)
+		return
+	}
+
+	showArchivedLabels := ctx.FormBool("archived_labels")
+	ctx.Data["ShowArchivedLabels"] = showArchivedLabels
+	ctx.Data["PinnedIssues"] = pinned
+	ctx.Data["IsRepoAdmin"] = ctx.Repo.Permission.IsAdmin()
+	ctx.Data["IssueStats"] = issueStats
+	ctx.Data["OpenCount"] = issueStats.OpenCount
+	ctx.Data["ClosedCount"] = issueStats.ClosedCount
+	ctx.Data["SelLabelIDs"] = preparedLabelFilter.SelectedLabelIDs
+	ctx.Data["ViewType"] = viewType
+	ctx.Data["SortType"] = sortType
+	ctx.Data["MilestoneID"] = milestoneID
+	ctx.Data["ProjectIDs"] = projectIDs
+	ctx.Data["AssigneeID"] = assigneeID
+	ctx.Data["PosterUsername"] = posterUsername
+	ctx.Data["Keyword"] = keyword
+	ctx.Data["IsShowClosed"] = isShowClosed
+	switch {
+	case isShowClosed.Value():
+		ctx.Data["State"] = "closed"
+	case !isShowClosed.Has():
+		ctx.Data["State"] = "all"
+	default:
+		ctx.Data["State"] = "open"
+	}
+	ctx.Data["Page"] = pager
+}
+
+// Issues render issues page
+func Issues(ctx *context.Context) {
+	isPullList := ctx.PathParam("type") == "pulls"
+	if isPullList {
+		MustAllowPulls(ctx)
+		if ctx.Written() {
+			return
+		}
+		ctx.Data["Title"] = ctx.Tr("repo.pulls")
+		ctx.Data["PageIsPullList"] = true
+		prepareRecentlyPushedNewBranches(ctx)
+		if ctx.Written() {
+			return
+		}
+	} else {
+		MustEnableIssues(ctx)
+		if ctx.Written() {
+			return
+		}
+		ctx.Data["Title"] = ctx.Tr("repo.issues")
+		ctx.Data["PageIsIssueList"] = true
+		ctx.Data["NewIssueChooseTemplate"] = issue_service.HasTemplatesOrContactLinks(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo)
+	}
+
+	projectIDs := parseProjectIDsFromQuery(ctx)
+
+	prepareIssueFilterAndList(ctx, ctx.FormInt64("milestone"), projectIDs, optional.Some(isPullList))
+	if ctx.Written() {
+		return
+	}
+
+	renderMilestones(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.Data["CanWriteIssuesOrPulls"] = ctx.Repo.Permission.CanWriteIssuesOrPulls(isPullList)
+
+	ctx.HTML(http.StatusOK, tplIssues)
+}

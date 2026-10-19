@@ -6,8 +6,7 @@ package validation
 import (
 	"testing"
 
-	"gitea.com/go-chi/binding"
-	"github.com/gobwas/glob"
+	"gitea.dev/modules/glob"
 )
 
 func getGlobPatternErrorString(pattern string) string {
@@ -19,39 +18,35 @@ func getGlobPatternErrorString(pattern string) string {
 	return ""
 }
 
-var globValidationTestCases = []validationTestCase{
-	{
-		description: "Empty glob pattern",
-		data: TestForm{
-			GlobPattern: "",
-		},
-		expectedErrors: binding.Errors{},
-	},
-	{
-		description: "Valid glob",
-		data: TestForm{
-			GlobPattern: "{master,release*}",
-		},
-		expectedErrors: binding.Errors{},
-	},
-
-	{
-		description: "Invalid glob",
-		data: TestForm{
-			GlobPattern: "[a-",
-		},
-		expectedErrors: binding.Errors{
-			binding.Error{
-				FieldNames:     []string{"GlobPattern"},
-				Classification: ErrGlobPattern,
-				Message:        getGlobPatternErrorString("[a-"),
+func Test_GlobPatternValidation(t *testing.T) {
+	globValidationTestCases := []validationTestCase{
+		{
+			description: "Empty glob pattern",
+			data: &TestForm{
+				GlobPattern: "",
 			},
 		},
-	},
-}
+		{
+			description: "Valid glob",
+			data: &TestForm{
+				GlobPattern: "{master,release*}",
+			},
+		},
 
-func Test_GlobPatternValidation(t *testing.T) {
-	AddBindingRules()
+		{
+			description: "Invalid glob",
+			data: &TestForm{
+				GlobPattern: "[a-",
+			},
+			expectedErrors: BindingErrors{
+				BindingError{
+					FieldNames:     []string{"GlobPattern"},
+					Classification: ErrGlobPattern,
+					Message:        getGlobPatternErrorString("[a-"),
+				},
+			},
+		},
+	}
 
 	for _, testCase := range globValidationTestCases {
 		t.Run(testCase.description, func(t *testing.T) {

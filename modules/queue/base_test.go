@@ -6,22 +6,29 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error), cfg *BaseConfig, isUnique bool) {
+type testQueueBasicOptions struct {
+	UniqueQueue     bool
+	NotifiableQueue bool
+}
+
+func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error), cfg *BaseConfig, opts testQueueBasicOptions) {
+	isUnique := opts.UniqueQueue
 	t.Run(fmt.Sprintf("testQueueBasic-%s-unique:%v", cfg.ManagedName, isUnique), func(t *testing.T) {
 		q, err := newFn(cfg)
 		assert.NoError(t, err)
 
-		ctx := context.Background()
+		ctx := t.Context()
 		_ = q.RemoveAll(ctx)
 		cnt, err := q.Len(ctx)
 		assert.NoError(t, err)
-		assert.EqualValues(t, 0, cnt)
+		assert.Equal(t, 0, cnt)
 
 		// push the first item
 		err = q.PushItem(ctx, []byte("foo"))
@@ -29,7 +36,7 @@ func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error)
 
 		cnt, err = q.Len(ctx)
 		assert.NoError(t, err)
-		assert.EqualValues(t, 1, cnt)
+		assert.Equal(t, 1, cnt)
 
 		// push a duplicate item
 		err = q.PushItem(ctx, []byte("foo"))
@@ -45,11 +52,11 @@ func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error)
 		has, err := q.HasItem(ctx, []byte("foo"))
 		assert.NoError(t, err)
 		if !isUnique {
-			assert.EqualValues(t, 2, cnt)
-			assert.EqualValues(t, false, has) // non-unique queues don't check for duplicates
+			assert.Equal(t, 2, cnt)
+			assert.False(t, has) // non-unique queues don't check for duplicates
 		} else {
-			assert.EqualValues(t, 1, cnt)
-			assert.EqualValues(t, true, has)
+			assert.Equal(t, 1, cnt)
+			assert.True(t, has)
 		}
 
 		// push another item
@@ -59,18 +66,18 @@ func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error)
 		// pop the first item (and the duplicate if non-unique)
 		it, err := q.PopItem(ctx)
 		assert.NoError(t, err)
-		assert.EqualValues(t, "foo", string(it))
+		assert.Equal(t, "foo", string(it))
 
 		if !isUnique {
 			it, err = q.PopItem(ctx)
 			assert.NoError(t, err)
-			assert.EqualValues(t, "foo", string(it))
+			assert.Equal(t, "foo", string(it))
 		}
 
 		// pop another item
 		it, err = q.PopItem(ctx)
 		assert.NoError(t, err)
-		assert.EqualValues(t, "bar", string(it))
+		assert.Equal(t, "bar", string(it))
 
 		// pop an empty queue (timeout, cancel)
 		ctxTimed, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
@@ -85,9 +92,31 @@ func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error)
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Nil(t, it)
 
+		t.Run("PushNotify", func(t *testing.T) {
+			defer mockBackoffDuration(5000 * time.Millisecond)()
+			// pop an empty queue, but it can be notified and pop the item immediately
+			wg := sync.WaitGroup{}
+			wg.Go(func() {
+				it, err := q.PopItem(ctx) // it should return immediately after PushItem, no "backoff" waiting
+				assert.NoError(t, err)
+				assert.Equal(t, "item-notify", string(it))
+			})
+			time.Sleep(10 * time.Millisecond)
+			err = q.PushItem(ctx, []byte("item-notify"))
+			wg.Wait()
+			if opts.NotifiableQueue {
+				v, _ := q.(baseQueueNotifiableInterface)
+				assert.Empty(t, v.getNotifySignalChan(), "notify signal should have been read")
+				assert.NoError(t, q.PushItem(ctx, []byte("item-dummy")))
+				assert.Len(t, v.getNotifySignalChan(), 1, "notify signal should exist for newly pushed item")
+				_, err = q.PopItem(ctx)
+				assert.NoError(t, err)
+			}
+		})
+
 		// test blocking push if queue is full
 		for i := 0; i < cfg.Length; i++ {
-			err = q.PushItem(ctx, []byte(fmt.Sprintf("item-%d", i)))
+			err = q.PushItem(ctx, fmt.Appendf(nil, "item-%d", i))
 			assert.NoError(t, err)
 		}
 		ctxTimed, cancel = context.WithTimeout(ctx, 10*time.Millisecond)
@@ -101,19 +130,19 @@ func testQueueBasic(t *testing.T, newFn func(cfg *BaseConfig) (baseQueue, error)
 		pushBlockTime = 30 * time.Millisecond
 		err = q.PushItem(ctx, []byte("item-full"))
 		assert.ErrorIs(t, err, context.DeadlineExceeded)
-		assert.True(t, time.Since(timeStart) >= pushBlockTime*2/3)
+		assert.GreaterOrEqual(t, time.Since(timeStart), pushBlockTime*2/3)
 		pushBlockTime = oldPushBlockTime
 
 		// remove all
 		cnt, err = q.Len(ctx)
 		assert.NoError(t, err)
-		assert.EqualValues(t, cfg.Length, cnt)
+		assert.Equal(t, cfg.Length, cnt)
 
 		_ = q.RemoveAll(ctx)
 
 		cnt, err = q.Len(ctx)
 		assert.NoError(t, err)
-		assert.EqualValues(t, 0, cnt)
+		assert.Equal(t, 0, cnt)
 	})
 }
 
@@ -121,12 +150,12 @@ func TestBaseDummy(t *testing.T) {
 	q, err := newBaseDummy(&BaseConfig{}, true)
 	assert.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	assert.NoError(t, q.PushItem(ctx, []byte("foo")))
 
 	cnt, err := q.Len(ctx)
 	assert.NoError(t, err)
-	assert.EqualValues(t, 0, cnt)
+	assert.Equal(t, 0, cnt)
 
 	has, err := q.HasItem(ctx, []byte("foo"))
 	assert.NoError(t, err)

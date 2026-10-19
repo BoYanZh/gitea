@@ -4,74 +4,88 @@
 package httpcache
 
 import (
-	"io"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
 )
 
+type CacheControlOptions struct {
+	IsPublic bool
+	MaxAge   time.Duration
+}
+
 // SetCacheControlInHeader sets suitable cache-control headers in the response
-func SetCacheControlInHeader(h http.Header, maxAge time.Duration, additionalDirectives ...string) {
-	directives := make([]string, 0, 2+len(additionalDirectives))
+func SetCacheControlInHeader(h http.Header, opts *CacheControlOptions) {
+	directives := make([]string, 0, 4)
 
 	// "max-age=0 + must-revalidate" (aka "no-cache") is preferred instead of "no-store"
 	// because browsers may restore some input fields after navigate-back / reload a page.
+	publicPrivate := util.Iif(opts.IsPublic, "public", "private")
 	if setting.IsProd {
-		if maxAge == 0 {
+		if opts.MaxAge == 0 {
 			directives = append(directives, "max-age=0", "private", "must-revalidate")
 		} else {
-			directives = append(directives, "private", "max-age="+strconv.Itoa(int(maxAge.Seconds())))
+			directives = append(directives, publicPrivate, "max-age="+strconv.Itoa(int(opts.MaxAge.Seconds())))
 		}
 	} else {
-		directives = append(directives, "max-age=0", "private", "must-revalidate")
-
-		// to remind users they are using non-prod setting.
-		h.Set("X-Gitea-Debug", "RUN_MODE="+setting.RunMode)
+		// use dev-related controls, and remind users they are using non-prod setting.
+		directives = append(directives, "max-age=0", publicPrivate, "must-revalidate")
+		h.Set("X-Gitea-Debug", fmt.Sprintf("RUN_MODE=%v, MaxAge=%s", setting.RunMode, opts.MaxAge))
 	}
-
-	h.Set("Cache-Control", strings.Join(append(directives, additionalDirectives...), ", "))
+	h.Set("Cache-Control", strings.Join(directives, ", "))
 }
 
-func ServeContentWithCacheControl(w http.ResponseWriter, req *http.Request, name string, modTime time.Time, content io.ReadSeeker) {
-	SetCacheControlInHeader(w.Header(), setting.StaticCacheTime)
-	http.ServeContent(w, req, name, modTime, content)
+func CacheControlForPublicStatic() *CacheControlOptions {
+	return &CacheControlOptions{
+		IsPublic: true,
+		MaxAge:   setting.StaticCacheTime,
+	}
 }
 
-// HandleGenericETagCache handles ETag-based caching for a HTTP request.
-// It returns true if the request was handled.
-func HandleGenericETagCache(req *http.Request, w http.ResponseWriter, etag string) (handled bool) {
-	if len(etag) > 0 {
-		w.Header().Set("Etag", etag)
-		if checkIfNoneMatchIsValid(req, etag) {
-			w.WriteHeader(http.StatusNotModified)
-			return true
-		}
+func CacheControlForPrivateStatic() *CacheControlOptions {
+	return &CacheControlOptions{
+		MaxAge: setting.StaticCacheTime,
 	}
-	SetCacheControlInHeader(w.Header(), setting.StaticCacheTime)
-	return false
 }
 
 // checkIfNoneMatchIsValid tests if the header If-None-Match matches the ETag
 func checkIfNoneMatchIsValid(req *http.Request, etag string) bool {
-	ifNoneMatch := req.Header.Get("If-None-Match")
-	if len(ifNoneMatch) > 0 {
-		for _, item := range strings.Split(ifNoneMatch, ",") {
-			item = strings.TrimPrefix(strings.TrimSpace(item), "W/") // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag#directives
-			if item == etag {
-				return true
-			}
+	ifNoneMatch := strings.TrimSpace(req.Header.Get("If-None-Match"))
+	if ifNoneMatch == "" {
+		return false
+	}
+	// https://www.rfc-editor.org/rfc/rfc9110#section-13.1.2
+	if ifNoneMatch == "*" {
+		return true
+	}
+	// https://www.rfc-editor.org/rfc/rfc9110#section-8.8.3.2
+	etag = strings.TrimPrefix(etag, "W/")
+	for item := range strings.SplitSeq(ifNoneMatch, ",") {
+		item = strings.TrimPrefix(strings.TrimSpace(item), "W/")
+		if item == etag {
+			return true
 		}
 	}
 	return false
 }
 
-// HandleGenericETagTimeCache handles ETag-based caching with Last-Modified caching for a HTTP request.
+func HandleGenericETagPublicCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time) bool {
+	return handleGenericETagTimeCache(req, w, etag, lastModified, CacheControlForPublicStatic())
+}
+
+func HandleGenericETagPrivateCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time) bool {
+	return handleGenericETagTimeCache(req, w, etag, lastModified, CacheControlForPrivateStatic())
+}
+
+// handleGenericETagTimeCache handles ETag-based caching with Last-Modified caching for the HTTP request.
 // It returns true if the request was handled.
-func HandleGenericETagTimeCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time) (handled bool) {
-	if len(etag) > 0 {
+func handleGenericETagTimeCache(req *http.Request, w http.ResponseWriter, etag string, lastModified *time.Time, cacheControlOpts *CacheControlOptions) (handled bool) {
+	if etag != "" {
 		w.Header().Set("Etag", etag)
 	}
 	if lastModified != nil && !lastModified.IsZero() {
@@ -79,13 +93,15 @@ func HandleGenericETagTimeCache(req *http.Request, w http.ResponseWriter, etag s
 		w.Header().Set("Last-Modified", lastModified.UTC().Format(http.TimeFormat))
 	}
 
-	if len(etag) > 0 {
+	if etag != "" {
 		if checkIfNoneMatchIsValid(req, etag) {
 			w.WriteHeader(http.StatusNotModified)
 			return true
 		}
 	}
-	if lastModified != nil && !lastModified.IsZero() {
+	// https://www.rfc-editor.org/rfc/rfc9110#section-13.1.3
+	// A recipient MUST ignore If-Modified-Since if the request contains an If-None-Match header field
+	if lastModified != nil && !lastModified.IsZero() && req.Header.Get("If-None-Match") == "" {
 		ifModifiedSince := req.Header.Get("If-Modified-Since")
 		if ifModifiedSince != "" {
 			t, err := time.Parse(http.TimeFormat, ifModifiedSince)
@@ -95,6 +111,7 @@ func HandleGenericETagTimeCache(req *http.Request, w http.ResponseWriter, etag s
 			}
 		}
 	}
-	SetCacheControlInHeader(w.Header(), setting.StaticCacheTime)
+
+	SetCacheControlInHeader(w.Header(), cacheControlOpts)
 	return false
 }
